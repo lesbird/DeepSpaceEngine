@@ -1,0 +1,20 @@
+<Project>
+  <!--
+    Shared MSBuild settings for all projects in MetalEngine3.
+
+    NOTE ON TARGET FRAMEWORK: We target net7.0 because that is the newest SDK
+    installed on this machine. The plan calls for net8.0 (LTS); moving up is a
+    one-line change to <TargetFramework> here once the .NET 8 SDK is installed.
+    Some Silk.NET extension packages pull in .NET 9 BCL assemblies that only
+    warn (not error) on net7.0 — SuppressTfmSupportBuildWarnings hides that
+    noise. They run fine.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <LangVersion>11</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+  </PropertyGroup>
+</Project>
