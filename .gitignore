@@ -421,6 +421,8 @@ test-results/
 # Mac bundle stuff
 *.dmg
 *.app
+# ...but not the Game.App project directory (the *.app rule above matches it by accident).
+!Game.App/
 
 # content below from: https://github.com/github/gitignore/blob/master/Global/macOS.gitignore
 # General

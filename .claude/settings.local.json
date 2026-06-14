@@ -8,7 +8,10 @@
       "Bash(dotnet run *)",
       "Bash(git init *)",
       "Bash(git config *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -q -m ' *)",
+      "Bash(perl -0pi -e 's/int chec_d = 0;/int count = 0;/; s/chec_d\\\\+\\\\+;/count++;/; s/Assert\\\\.True\\\\\\(chec_d > 0/Assert.True\\(count > 0/' Engine.Core.Tests/RingTests.cs)",
+      "Bash(git check-ignore *)"
     ]
   }
 }

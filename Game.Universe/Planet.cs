@@ -28,8 +28,20 @@ public sealed class Planet
     public double MassKg;
     public double AxialTilt;
     public Vector3D<float> Color;
-    public bool HasRings;
     public Moon[] Moons = Array.Empty<Moon>();
+
+    // Rings — a flat annulus in the planet's (tilted) equatorial plane. Only some giants
+    // have them; when <see cref="HasRings"/> is false the radii are zero. Radii are absolute
+    // metres from the planet centre; the plane is tilted by <see cref="RingTilt"/> about the
+    // axis at <see cref="RingTiltAzimuth"/>. <see cref="RingSeed"/> seeds the procedural banding.
+    public bool HasRings;
+    public double RingInnerRadius;       // metres
+    public double RingOuterRadius;       // metres
+    public Vector3D<float> RingColor;
+    public float RingOpacity;            // base alpha of the densest bands (0..1)
+    public float RingTilt;               // radians — inclination of the ring plane
+    public float RingTiltAzimuth;        // radians — node the tilt is taken about
+    public ulong RingSeed;
 
     // Atmosphere (rendered as a fresnel-glow shell).
     public bool HasAtmosphere;

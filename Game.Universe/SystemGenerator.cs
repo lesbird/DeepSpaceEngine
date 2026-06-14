@@ -52,6 +52,7 @@ public static class SystemGenerator
                 Color = ColorFor(type),
                 HasRings = (type is PlanetType.GasGiant or PlanetType.IceGiant) && rng.NextDouble() < 0.35,
             };
+            if (planet.HasRings) AssignRings(planet);
             AssignAtmosphere(ref rng, planet);
             planet.Moons = GenerateMoons(ref rng, planet, star.Designation, i + 1);
             planets[i] = planet;
@@ -94,6 +95,32 @@ public static class SystemGenerator
             };
         }
         return moons;
+    }
+
+    /// <summary>
+    /// Fill in the ring annulus from an independent, planet-seeded RNG so the main generation
+    /// stream (types, atmospheres, moons) is left byte-identical. The ring plane follows the
+    /// planet's axial tilt with a little jitter; ice giants get a cool blue-grey, gas giants a
+    /// warm tan.
+    /// </summary>
+    private static void AssignRings(Planet p)
+    {
+        var r = new DeterministicRng(Hashing.Combine(p.Seed, 0x21A6u));
+
+        double inner = p.RadiusMeters * r.Range(1.4, 1.9);
+        double outer = inner * r.Range(1.5, 2.4);
+        p.RingInnerRadius = inner;
+        p.RingOuterRadius = outer;
+
+        float shade = (float)r.Range(0.55, 0.9);
+        Vector3D<float> tint = p.Type == PlanetType.IceGiant
+            ? new Vector3D<float>(0.72f, 0.80f, 0.90f)
+            : new Vector3D<float>(0.86f, 0.78f, 0.60f);
+        p.RingColor = tint * shade;
+        p.RingOpacity = (float)r.Range(0.45, 0.8);
+        p.RingTilt = (float)(p.AxialTilt + r.Range(-0.12, 0.12));
+        p.RingTiltAzimuth = (float)r.Range(0, 2 * Math.PI);
+        p.RingSeed = r.NextULong();
     }
 
     private static void AssignAtmosphere(ref DeterministicRng rng, Planet p)

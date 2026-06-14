@@ -96,6 +96,33 @@ public static class Primitives
         return new Mesh(gl, v.ToArray(), PrimitiveType.Triangles);
     }
 
+    /// <summary>
+    /// A flat annulus in the XZ plane for planetary rings. Each vertex stores a *unit*
+    /// direction in <c>position</c> (cos θ, 0, sin θ) and the normalized radial parameter
+    /// <c>t</c> in the red channel (0 at the inner edge, 1 at the outer). The actual radius is
+    /// reconstructed in the vertex shader from per-planet inner/outer uniforms, so one mesh
+    /// serves every ring. Two radial rings suffice — the band detail is computed per-fragment
+    /// from the interpolated <c>t</c>.
+    /// </summary>
+    public static Mesh BuildRingAnnulus(GL gl, int segments)
+    {
+        var v = new List<float>();
+        void Vert(float dx, float dz, float t) => v.AddRange(new[] { dx, 0f, dz, t, 0f, 0f });
+
+        for (int i = 0; i < segments; i++)
+        {
+            float t0 = 2f * MathF.PI * (i / (float)segments);
+            float t1 = 2f * MathF.PI * ((i + 1) / (float)segments);
+            float c0 = MathF.Cos(t0), s0 = MathF.Sin(t0);
+            float c1 = MathF.Cos(t1), s1 = MathF.Sin(t1);
+
+            // Quad between inner (t=0) and outer (t=1) edges across this angular segment.
+            Vert(c0, s0, 0f); Vert(c0, s0, 1f); Vert(c1, s1, 1f);
+            Vert(c0, s0, 0f); Vert(c1, s1, 1f); Vert(c1, s1, 0f);
+        }
+        return new Mesh(gl, v.ToArray(), PrimitiveType.Triangles);
+    }
+
     /// <summary>A unit-radius circle (line loop) in the XZ plane — used for orbit rings.</summary>
     public static Mesh BuildCircleLine(GL gl, int segments)
     {
