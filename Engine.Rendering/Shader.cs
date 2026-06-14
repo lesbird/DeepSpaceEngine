@@ -61,6 +61,8 @@ public sealed class Shader : IDisposable
         _gl.UniformMatrix4(Location(name), 1, false, data);
     }
 
+    public void SetVector2(string name, Vector2D<float> v) => _gl.Uniform2(Location(name), v.X, v.Y);
+
     public void SetVector3(string name, Vector3D<float> v) => _gl.Uniform3(Location(name), v.X, v.Y, v.Z);
 
     public void SetVector4(string name, Vector4D<float> v) => _gl.Uniform4(Location(name), v.X, v.Y, v.Z, v.W);

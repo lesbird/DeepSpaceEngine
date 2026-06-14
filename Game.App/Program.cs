@@ -25,11 +25,16 @@ internal static class Program
     private static StarOverlay _overlay = null!;
     private static SolarSystemManager _systemManager = null!;
     private static SystemRenderer _systemRenderer = null!;
+    private static PlanetGlowRenderer _planetGlow = null!;
+    private static GalacticGridRenderer _galacticGrid = null!;
+    private static BlackHoleRenderer _blackHole = null!;
     private static AtmosphereRenderer _atmosphereRenderer = null!;
     private static PlanetTerrainRenderer _terrainRenderer = null!;
     private static RoverController _rover = null!;
     private static RoverRenderer _roverRenderer = null!;
     private static SceneFramebuffer _sceneFbo = null!;
+    private static ColorTarget _postFbo = null!;
+    private static BloomRenderer _bloom = null!;
     private static CelestialBody? _terrainTarget;
     private static bool _driving;
     private static bool _prevR;
@@ -51,9 +56,10 @@ internal static class Program
 
     private static bool _mouseCaptured = true;
     private static bool _prevTab;
-    private static bool _prevComma, _prevPeriod, _prevP;
+    private static bool _prevComma, _prevPeriod, _prevP, _prevSpace;
     private static bool _prevF;
     private static bool _scannerOpen;
+    private static bool _galacticGridVisible;
     private static bool _paused;
     private static double _savedTimeScale;
     private static double _fps;
@@ -72,6 +78,8 @@ internal static class Program
         {
             _camera.AspectRatio = size.Y == 0 ? 1f : (float)size.X / size.Y;
             _sceneFbo.Resize(size.X, size.Y);
+            _postFbo.Resize(size.X, size.Y);
+            _bloom.Resize(size.X, size.Y);
         };
         _window.Run();
         _window.Dispose();
@@ -97,19 +105,35 @@ internal static class Program
             SpeedExponent = 15f, // ~0.1 ly/s — roam between stars; wheel to adjust
         };
 
+        // Open on a framed, oblique view of the galactic-centre black hole rather than starting
+        // inside its event horizon (the origin). Pitch down a little, then back off along the
+        // resulting forward axis so the camera looks straight at the origin from above the disk.
+        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.5f);
+        Vector3D<float> fwd = _camera.Forward;
+        const double startDist = 1.4e15; // ~0.15 ly — frames the accretion disk
+        _camera.Position = UniversePosition.Origin.Translated(
+            new Vector3D<double>(-fwd.X * startDist, -fwd.Y * startDist, -fwd.Z * startDist));
+
         _starField = new StarField(new GalaxyModel(WorldSeed));
         _starRenderer = new StarRenderer(_gl);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
         _overlay = new StarOverlay();
         _systemManager = new SolarSystemManager();
         _systemRenderer = new SystemRenderer(_gl);
+        _planetGlow = new PlanetGlowRenderer(_gl);
+        _galacticGrid = new GalacticGridRenderer(_gl);
+        _blackHole = new BlackHoleRenderer(_gl);
         _atmosphereRenderer = new AtmosphereRenderer(_gl);
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse);
         _roverRenderer = new RoverRenderer(_gl);
         _sceneFbo = new SceneFramebuffer(_gl);
+        _postFbo = new ColorTarget(_gl);
+        _bloom = new BloomRenderer(_gl);
         var fb = _window.Window.FramebufferSize;
         _sceneFbo.Resize(fb.X, fb.Y);
+        _postFbo.Resize(fb.X, fb.Y);
+        _bloom.Resize(fb.X, fb.Y);
         _imgui = new ImGuiController(_gl, _window.Window, _window.Input);
 
         // Restore previously-saved tuning so the sliders persist across launches.
@@ -165,8 +189,13 @@ internal static class Program
         if (_window.Keyboard.IsKeyPressed(Key.Escape))
             _window.Window.Close();
 
-        // Orbit time controls: ',' slower, '.' faster, 'P' pause.
-        if (Edge(Key.P, ref _prevP))
+        // 'P' toggles the galactic-plane grid: a faint reference plane through the galaxy centre.
+        if (Edge(Key.P, ref _prevP)) _galacticGridVisible = !_galacticGridVisible;
+
+        // Orbit time controls: ',' slower, '.' faster, Space pause. (Edge is read every frame so the
+        // toggle stays in sync; the pause only fires in free-flight, since Space is the rover brake.)
+        bool spaceEdge = Edge(Key.Space, ref _prevSpace);
+        if (!_driving && spaceEdge)
         {
             _paused = !_paused;
             if (_paused) { _savedTimeScale = _systemManager.TimeScale; _systemManager.TimeScale = 0; }
@@ -249,8 +278,20 @@ internal static class Program
         _backdrop.Render(_camera);
         _starRenderer.Render(_camera, _starField.Visible, _systemManager.ActiveStarId);
 
+        // Galactic-centre features at the origin: the optional plane grid, then the supermassive
+        // black hole. Drawn now while the depth buffer is still clear; both use their own wide
+        // projections, so we clear depth again afterwards to leave the system/terrain passes — and
+        // the depth-aware atmosphere that linearises this buffer with their near/far — unaffected.
+        if (_galacticGridVisible) _galacticGrid.Render(_camera);
+        _blackHole.Render(_camera);
+        _gl.Clear((uint)ClearBufferMask.DepthBufferBit);
+
         if (_systemManager.HasActive)
+        {
             _systemRenderer.Render(_camera, _systemManager.Active!, _terrainTarget);
+            // Distance-scaled glow dots that mark each body from afar and fade as its sphere grows.
+            _planetGlow.Render(_camera, _systemManager.Active!, _sceneFbo.Height, _terrainTarget);
+        }
 
         if (_terrainTarget != null)
         {
@@ -277,16 +318,24 @@ internal static class Program
                     _terrainRenderer.LastNear, _terrainRenderer.LastFar);
         }
 
-        // Put the scene on screen, then composite the depth-aware atmosphere over it. Near/far come
-        // from whichever projection wrote the dominant geometry's depth (terrain when landed, else system).
-        _sceneFbo.BlitColorToScreen();
+        // Capture the finished scene into a sampleable colour buffer, then composite the depth-aware
+        // atmosphere over it there. The atmosphere samples the scene DEPTH (from _sceneFbo), which is
+        // not attached to _postFbo, so there's no read/write feedback. Near/far come from whichever
+        // projection wrote the dominant geometry's depth (terrain when landed, else system).
+        _sceneFbo.BlitColorTo(_postFbo.Fbo);
         if (_systemManager.HasActive)
         {
+            _postFbo.Bind();
             float near = _terrainTarget != null ? _terrainRenderer.LastNear : _systemRenderer.LastNear;
             float far = _terrainTarget != null ? _terrainRenderer.LastFar : _systemRenderer.LastFar;
             _atmosphereRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
                 _terrainTarget, _terrainRenderer.ActiveAmplitude);
         }
+
+        // Post-process bloom: bright-pass + blur off _postFbo (scene + atmosphere), then composite
+        // scene + bloom to the screen. When disabled the composite is a straight copy (intensity 0).
+        uint bloomTex = _bloom.Enabled ? _bloom.Render(_postFbo.ColorTexture) : _postFbo.ColorTexture;
+        _bloom.Composite(_postFbo.ColorTexture, bloomTex);
 
         _overlay.Draw(_camera, _starField, _systemManager);
         DrawHud();
@@ -351,7 +400,7 @@ internal static class Program
                 $"SYSTEM ACTIVE — {sys.Sun.ClassLetter}-class, {sys.Planets.Length} planet(s)");
             double appScale = _paused ? _savedTimeScale : _systemManager.TimeScale;
             double fastestC = sys.MaxOrbitalSpeedMps * _systemManager.TimeScale / MathUtil.SpeedOfLight;
-            ImGui.Text($"Time x{appScale:0} {(_paused ? "(PAUSED)" : "")} — fastest orbit {fastestC:0.000} c  [',' '.' 'P']");
+            ImGui.Text($"Time x{appScale:0} {(_paused ? "(PAUSED)" : "")} — fastest orbit {fastestC:0.000} c  [',' '.' Space]");
             ImGui.Text($"Sim time: {_systemManager.SimTime / 86400.0:0.0} days");
             foreach (Planet pl in sys.Planets)
             {
@@ -390,7 +439,7 @@ internal static class Program
         ImGui.Text(_mouseCaptured ? "Mouse: captured (Tab to release)" : "Mouse: free (Tab to capture)");
         ImGui.Text(_driving
             ? "DRIVE: W/S throttle | A/D steer | Space brake | R exit | Esc quit"
-            : "WASD move | Q/E roll | wheel speed/throttle | R drive | F scan | Esc quit");
+            : "WASD move | Q/E roll | wheel speed | R drive | F scan | P grid | Space pause | Esc quit");
         ImGui.End();
     }
 
@@ -431,6 +480,21 @@ internal static class Program
             if (ImGui.Button("Reset backdrop"))
             {
                 b.Enabled = true; b.BandBrightness = 0.6f; b.StarBrightness = 1.0f;
+            }
+        }
+
+        if (ImGui.CollapsingHeader("Bloom", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            BloomRenderer bl = _bloom;
+            ImGui.Checkbox("Enable bloom", ref bl.Enabled);
+            ImGui.SliderFloat("Threshold", ref bl.Threshold, 0f, 1f);
+            ImGui.SliderFloat("Knee (soft)", ref bl.Knee, 0f, 1f);
+            ImGui.SliderFloat("Intensity", ref bl.Intensity, 0f, 3f);
+            ImGui.SliderInt("Iterations", ref bl.Iterations, 1, 12);
+            if (ImGui.Button("Reset bloom"))
+            {
+                bl.Enabled = true; bl.Threshold = 0.75f; bl.Knee = 0.5f;
+                bl.Intensity = 0.6f; bl.Iterations = 5;
             }
         }
 

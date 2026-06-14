@@ -64,10 +64,13 @@ public sealed class SceneFramebuffer : IDisposable
     }
 
     /// <summary>Copy the rendered colour to the default framebuffer (screen) so it's displayed.</summary>
-    public void BlitColorToScreen()
+    public void BlitColorToScreen() => BlitColorTo(0);
+
+    /// <summary>Copy the rendered colour into another framebuffer (or 0 for the screen), 1:1 sizes.</summary>
+    public void BlitColorTo(uint targetFbo)
     {
         _gl.BindFramebuffer(FramebufferTarget.ReadFramebuffer, _fbo);
-        _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, 0);
+        _gl.BindFramebuffer(FramebufferTarget.DrawFramebuffer, targetFbo);
         _gl.BlitFramebuffer(0, 0, Width, Height, 0, 0, Width, Height,
             (uint)ClearBufferMask.ColorBufferBit, BlitFramebufferFilter.Nearest);
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);

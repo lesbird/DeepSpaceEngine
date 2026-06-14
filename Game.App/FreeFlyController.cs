@@ -120,9 +120,15 @@ public sealed class FreeFlyController
             var worldDir = Vector3D.Transform(move, _camera.Orientation);
             double dist = CurrentSpeed * dt;
             // Anti-tunnelling: never cross more than a fraction of the gap to the nearest surface in one
-            // frame, so a fast approach (or a stalled frame) can't jump straight through a body.
+            // frame, so a fast approach (or a stalled frame) can't jump straight through a body. But keep
+            // a floor of the surface-creep speed: right at a surface the gap is ~0, so without this you'd
+            // freeze solid and couldn't pull away. That floor is metres-per-frame — far too small to
+            // tunnel — and it reopens the moment you start moving off the surface.
             if (!double.IsInfinity(_approachGap))
-                dist = Math.Min(dist, AntiTunnelFraction * _approachGap);
+            {
+                double maxStep = Math.Max(AntiTunnelFraction * _approachGap, SpeedPolicy.MinApproachSpeed * dt);
+                dist = Math.Min(dist, maxStep);
+            }
             _camera.Position.Translate(new Vector3D<double>(worldDir.X * dist, worldDir.Y * dist, worldDir.Z * dist));
         }
     }
