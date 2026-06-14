@@ -26,7 +26,7 @@ public sealed class RoverController
     private readonly IKeyboard _keyboard;
     private readonly IMouse _mouse;
 
-    private Planet _planet = null!;
+    private CelestialBody _planet = null!;
     private PlanetTerrain _terrain = null!;
     private Rover _rover = null!;
 
@@ -52,20 +52,20 @@ public sealed class RoverController
     public double SpeedKph => _rover.SpeedMps * 3.6;
 
     /// <summary>
-    /// Begin driving on <paramref name="planet"/>, seeding the rover on the ground directly below
-    /// the camera and the heading from where the camera was looking. The height field is rebuilt
-    /// from the planet (deterministic, so it matches the renderer's terrain exactly).
+    /// Begin driving on <paramref name="body"/> (a planet or a moon), seeding the rover on the
+    /// ground directly below the camera and the heading from where the camera was looking. The
+    /// height field is rebuilt from the body (deterministic, so it matches the renderer's terrain).
     /// </summary>
-    public void Enter(Planet planet)
+    public void Enter(CelestialBody body)
     {
-        _planet = planet;
-        _terrain = new PlanetTerrain(planet);
+        _planet = body;
+        _terrain = new PlanetTerrain(body);
 
-        double g = Math.Clamp(G * planet.MassKg / (planet.RadiusMeters * planet.RadiusMeters), 0.5, 30.0);
-        _rover = new Rover(planet.RadiusMeters, g, _terrain.HeightAt);
+        double g = Math.Clamp(G * body.MassKg / (body.RadiusMeters * body.RadiusMeters), 0.5, 30.0);
+        _rover = new Rover(body.RadiusMeters, g, _terrain.HeightAt);
 
-        // Direction from planet centre to the camera = the ground point to drop onto.
-        Vector3D<double> groundDir = _camera.Position.DeltaMeters(planet.CurrentPosition);
+        // Direction from the body centre to the camera = the ground point to drop onto.
+        Vector3D<double> groundDir = _camera.Position.DeltaMeters(body.CurrentPosition);
         Vector3D<double> heading = ToD(_camera.Forward);
         _rover.Seed(groundDir, heading);
 

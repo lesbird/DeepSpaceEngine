@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Engine.Core;
 using Engine.Rendering;
 using Game.Universe;
@@ -210,10 +211,13 @@ void main() {
         UniversePosition cam = camera.Position;
         Vector3D<float> sunRel = system.Sun.Position.ToCameraRelative(cam);
 
-        // Painter's order: far planets first, so a nearer planet's sky composites on top.
-        Planet[] atmo = Array.FindAll(system.Planets, p => p.HasAtmosphere);
-        if (atmo.Length == 0) return;
-        Array.Sort(atmo, (x, y) =>
+        // Painter's order: far bodies first, so a nearer body's sky composites on top. Planets and
+        // moons are gathered together — a moon with a thin atmosphere haloes just like a planet.
+        var atmo = new List<CelestialBody>();
+        foreach (CelestialBody b in system.AllBodies())
+            if (b.HasAtmosphere) atmo.Add(b);
+        if (atmo.Count == 0) return;
+        atmo.Sort((x, y) =>
             cam.DistanceTo(y.CurrentPosition).CompareTo(cam.DistanceTo(x.CurrentPosition)));
 
         // No depth TEST — the pass blends over the (blitted) scene everywhere; instead each ray's
@@ -247,7 +251,7 @@ void main() {
         _shader.SetFloat("uDebug", DebugTransmittance ? 1f : 0f);
 
         _gl.BindVertexArray(_vao);
-        foreach (Planet p in atmo)
+        foreach (CelestialBody p in atmo)
             DrawAtmosphere(p, cam, sunRel);
         _gl.BindVertexArray(0);
         _gl.BindTexture(TextureTarget.Texture2D, 0);
@@ -256,7 +260,7 @@ void main() {
         _gl.DepthMask(true);
     }
 
-    private void DrawAtmosphere(Planet p, in UniversePosition cam, Vector3D<float> sunRel)
+    private void DrawAtmosphere(CelestialBody p, in UniversePosition cam, Vector3D<float> sunRel)
     {
         // Everything below is in PLANET-RADIUS UNITS (divide metres by rp). At planetary scale
         // (rp ~ 6e6) float32 squared is ~4e13 and loses all sub-km precision, which made the

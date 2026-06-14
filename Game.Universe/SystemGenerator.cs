@@ -54,14 +54,17 @@ public static class SystemGenerator
             };
             if (planet.HasRings) AssignRings(planet);
             AssignAtmosphere(ref rng, planet);
-            planet.Moons = GenerateMoons(ref rng, planet, star.Designation, i + 1);
+            planet.SurfaceTempK = (float)EquilibriumTempK(star.Luminosity, aAu);
+            ApplyScanData(planet);
+            // Moons share the parent's distance from the star, so they inherit its temperature.
+            planet.Moons = GenerateMoons(ref rng, planet, star.Designation, i + 1, planet.SurfaceTempK);
             planets[i] = planet;
         }
 
         return new SolarSystem(star, planets);
     }
 
-    private static Moon[] GenerateMoons(ref DeterministicRng rng, Planet planet, string starDesignation, int planetIndex)
+    private static Moon[] GenerateMoons(ref DeterministicRng rng, Planet planet, string starDesignation, int planetIndex, double tempK)
     {
         double lambda = planet.Type switch
         {
@@ -73,28 +76,102 @@ public static class SystemGenerator
         int count = Math.Min(rng.Poisson(lambda), 6);
         if (count == 0) return Array.Empty<Moon>();
 
+        // Moons of a giant form cold and icy out past the snow line; moons of an inner world
+        // are mostly bare rock. Both get procedural terrain (they're never gas/ice giants).
+        bool outer = planet.Type is PlanetType.GasGiant or PlanetType.IceGiant;
+
         var moons = new Moon[count];
         double a = planet.RadiusMeters * rng.Range(2.5, 5.0);
         for (int j = 0; j < count; j++)
         {
             if (j > 0) a *= rng.Range(1.5, 2.2);
             double n = Math.Sqrt(MathUtil.GravitationalConstant * planet.MassKg / (a * a * a));
-            float gray = (float)rng.Range(0.45, 0.7);
 
-            moons[j] = new Moon
+            double radius = planet.RadiusMeters * rng.Range(0.08, 0.28);
+            PlanetType type = ChooseMoonType(ref rng, outer, tempK, radius);
+            double mass = DensityFor(type) * (4.0 / 3.0 * Math.PI * radius * radius * radius);
+
+            // An ocean moon out by a cold giant is kept liquid by tidal heating (think Europa),
+            // so warm it into the habitable band rather than leaving it frozen at orbit temperature.
+            double moonTemp = type == PlanetType.Ocean && tempK is < 255 or > 320 ? 288.0 : tempK;
+
+            var moon = new Moon
             {
                 Seed = Hashing.Combine(planet.Seed, (ulong)(j + 1)),
+                Type = type,
                 Designation = $"{starDesignation}-{planetIndex}-{j + 1}",
                 SemiMajorAxis = a,
                 Inclination = rng.Range(-0.08, 0.08),
                 AscendingNode = rng.Range(0, 2 * Math.PI),
                 Phase = rng.Range(0, 2 * Math.PI),
                 MeanMotion = n,
-                RadiusMeters = planet.RadiusMeters * rng.Range(0.08, 0.28),
-                Color = new Vector3D<float>(gray, gray * 0.98f, gray * 0.95f),
+                RadiusMeters = radius,
+                MassKg = mass,
+                Color = MoonColor(type),
+                SurfaceTempK = (float)moonTemp,
             };
+            AssignMoonAtmosphere(ref rng, moon);
+            ApplyScanData(moon);
+            moons[j] = moon;
         }
         return moons;
+    }
+
+    /// <summary>Moons are rock/ice worlds (never gas/ice giants): icy around the cold giants, mostly
+    /// bare rock around the inner planets, with the occasional tidally-heated lava world (Io) or
+    /// dusty desert. A sizable moon in the temperate zone can rarely be a habitable ocean world.</summary>
+    private static PlanetType ChooseMoonType(ref DeterministicRng rng, bool outer, double tempK, double radius)
+    {
+        // Habitable ocean moons: a sizable moon that's either in the star's temperate zone or warmed
+        // by tidal heating around a giant. Rare, but every system has a chance at one.
+        bool temperate = tempK is >= 255 and <= 320;
+        bool oceanEligible = radius > 0.12 * MathUtil.EarthRadiusM && (temperate || outer);
+        if (oceanEligible && rng.NextDouble() < 0.15)
+            return PlanetType.Ocean;
+
+        double u = rng.NextDouble();
+        return outer
+            ? (u < 0.55 ? PlanetType.Ice : u < 0.90 ? PlanetType.Rocky : PlanetType.Lava)
+            : (u < 0.60 ? PlanetType.Rocky : u < 0.82 ? PlanetType.Desert : u < 0.94 ? PlanetType.Ice : PlanetType.Lava);
+    }
+
+    /// <summary>A muted, greyed-down version of the type's planet colour — moons read as dusty
+    /// and washed-out rather than as vivid full-size worlds.</summary>
+    private static Vector3D<float> MoonColor(PlanetType type)
+    {
+        Vector3D<float> c = ColorFor(type);
+        var grey = new Vector3D<float>(0.58f, 0.58f, 0.56f);
+        return c * 0.6f + grey * 0.4f;
+    }
+
+    /// <summary>Most moons are airless. Only the larger ones have a chance at a thin atmosphere
+    /// (think Titan), scaling with size and capped well below a planet's.</summary>
+    private static void AssignMoonAtmosphere(ref DeterministicRng rng, Moon m)
+    {
+        // Habitable ocean moons always carry a breathable, ocean-blue atmosphere.
+        if (m.Type == PlanetType.Ocean)
+        {
+            m.HasAtmosphere = true;
+            m.AtmosphereColor = new Vector3D<float>(0.35f, 0.55f, 1.0f);
+            m.AtmosphereHeight = (float)rng.Range(0.020, 0.030);
+            m.AtmosphereDensity = (float)rng.Range(0.9, 1.2);
+            return;
+        }
+
+        double earthFrac = m.RadiusMeters / MathUtil.EarthRadiusM;
+        double chance = earthFrac < 0.25 ? 0.0 : Math.Min(0.5, (earthFrac - 0.25) * 1.2);
+        if (rng.NextDouble() >= chance) { m.HasAtmosphere = false; return; }
+
+        m.HasAtmosphere = true;
+        m.AtmosphereColor = m.Type switch
+        {
+            PlanetType.Lava => new Vector3D<float>(0.80f, 0.35f, 0.18f),
+            PlanetType.Desert => new Vector3D<float>(0.80f, 0.62f, 0.42f),
+            PlanetType.Ice => new Vector3D<float>(0.70f, 0.80f, 0.92f),
+            _ => new Vector3D<float>(0.62f, 0.66f, 0.74f), // rocky: a pale Titan-like haze
+        };
+        m.AtmosphereHeight = (float)rng.Range(0.012, 0.022); // thinner shell than a planet's
+        m.AtmosphereDensity = (float)rng.Range(0.4, 0.8);
     }
 
     /// <summary>
@@ -158,6 +235,66 @@ public static class SystemGenerator
 
     private static Vector3D<float> Brighten(Vector3D<float> c) => new(
         Math.Min(1f, c.X * 1.2f + 0.1f), Math.Min(1f, c.Y * 1.2f + 0.1f), Math.Min(1f, c.Z * 1.2f + 0.1f));
+
+    /// <summary>Black-body equilibrium temperature (K) at <paramref name="aAu"/> AU from a star of
+    /// the given luminosity (≈ 278 K at 1 AU around a Sun-like star), used for the scanner readout
+    /// and to decide which worlds sit in the temperate, potentially-habitable band.</summary>
+    private static double EquilibriumTempK(double luminosity, double aAu)
+        => 278.3 * Math.Pow(Math.Max(luminosity, 1e-4), 0.25) / Math.Sqrt(Math.Max(aAu, 1e-3));
+
+    /// <summary>
+    /// Fill in the scanner detail (atmosphere/surface composition + habitability) from an
+    /// independent, body-seeded RNG, so it never disturbs the main generation stream. Habitability
+    /// is an ocean world with breathable air sitting in the liquid-water temperature band.
+    /// </summary>
+    private static void ApplyScanData(CelestialBody body)
+    {
+        var r = new DeterministicRng(Hashing.Combine(body.Seed, 0x5CA17EDu));
+        body.AtmosphereComposition = body.HasAtmosphere ? Composition(AtmosphereBasis(body.Type), ref r) : Array.Empty<Constituent>();
+        body.SurfaceComposition = body.HasSurface ? Composition(SurfaceBasis(body.Type), ref r) : Array.Empty<Constituent>();
+        body.Habitable = body.Type == PlanetType.Ocean && body.HasAtmosphere
+                         && body.SurfaceTempK is >= 255f and <= 320f;
+    }
+
+    /// <summary>Jitter the per-type base weights, renormalise to sum 1, and sort most-abundant first.</summary>
+    private static Constituent[] Composition((string name, double weight)[] basis, ref DeterministicRng r)
+    {
+        var items = new (string name, double w)[basis.Length];
+        double sum = 0;
+        for (int i = 0; i < basis.Length; i++)
+        {
+            double w = basis[i].weight * r.Range(0.7, 1.3);
+            items[i] = (basis[i].name, w);
+            sum += w;
+        }
+        Array.Sort(items, (x, y) => y.w.CompareTo(x.w));
+        var result = new Constituent[items.Length];
+        for (int i = 0; i < items.Length; i++)
+            result[i] = new Constituent(items[i].name, (float)(items[i].w / sum));
+        return result;
+    }
+
+    private static (string, double)[] AtmosphereBasis(PlanetType t) => t switch
+    {
+        PlanetType.Ocean => new[] { ("Nitrogen", 0.77), ("Oxygen", 0.205), ("Argon", 0.009), ("Water vapour", 0.012), ("Carbon dioxide", 0.004) },
+        PlanetType.Desert => new[] { ("Carbon dioxide", 0.95), ("Nitrogen", 0.027), ("Argon", 0.016), ("Oxygen", 0.002) },
+        PlanetType.Rocky => new[] { ("Carbon dioxide", 0.6), ("Nitrogen", 0.3), ("Argon", 0.06), ("Oxygen", 0.04) },
+        PlanetType.Ice => new[] { ("Nitrogen", 0.90), ("Methane", 0.06), ("Hydrogen", 0.02), ("Argon", 0.02) },
+        PlanetType.Lava => new[] { ("Carbon dioxide", 0.55), ("Sulphur dioxide", 0.35), ("Nitrogen", 0.08), ("Water vapour", 0.02) },
+        PlanetType.GasGiant => new[] { ("Hydrogen", 0.90), ("Helium", 0.098), ("Methane", 0.002) },
+        PlanetType.IceGiant => new[] { ("Hydrogen", 0.80), ("Helium", 0.15), ("Methane", 0.05) },
+        _ => new[] { ("Nitrogen", 1.0) },
+    };
+
+    private static (string, double)[] SurfaceBasis(PlanetType t) => t switch
+    {
+        PlanetType.Ocean => new[] { ("Liquid water", 0.65), ("Silicate rock", 0.2), ("Sand", 0.1), ("Clay", 0.05) },
+        PlanetType.Desert => new[] { ("Silica sand", 0.5), ("Iron oxide", 0.25), ("Basalt", 0.2), ("Gypsum", 0.05) },
+        PlanetType.Rocky => new[] { ("Basalt", 0.4), ("Granite", 0.3), ("Iron", 0.2), ("Regolith", 0.1) },
+        PlanetType.Ice => new[] { ("Water ice", 0.6), ("Carbon-dioxide ice", 0.2), ("Ammonia ice", 0.1), ("Silicate rock", 0.1) },
+        PlanetType.Lava => new[] { ("Basalt", 0.45), ("Sulphur", 0.25), ("Obsidian", 0.2), ("Iron", 0.1) },
+        _ => new[] { ("Rock", 1.0) },
+    };
 
     /// <summary>Bulk density (kg/m^3) used to estimate planet mass for moon orbits.</summary>
     private static double DensityFor(PlanetType type) => type switch

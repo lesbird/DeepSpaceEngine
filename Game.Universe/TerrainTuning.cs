@@ -20,4 +20,10 @@ public static class TerrainTuning
 
     /// <summary>Scales feature frequency; &gt;1 = smaller, busier features.</summary>
     public static float FrequencyScale = 1.0f;
+
+    /// <summary>Scales impact-crater depth/strength on worlds that have craters; 0 removes them.</summary>
+    public static float CraterScale = 1.0f;
+
+    /// <summary>Scales how many craters appear (the fraction of cells that bear one); 0 = none.</summary>
+    public static float CraterDensity = 1.0f;
 }

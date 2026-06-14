@@ -129,7 +129,7 @@ void main() { FragColor = uColor; }";
         _ring = Primitives.BuildRingAnnulus(gl, segments: 256);
     }
 
-    public void Render(Camera camera, SolarSystem system, Planet? terrainPlanet = null)
+    public void Render(Camera camera, SolarSystem system, CelestialBody? terrainBody = null)
     {
         UniversePosition cam = camera.Position;
         Vector3D<float> sunRel = system.Sun.Position.ToCameraRelative(cam);
@@ -148,8 +148,9 @@ void main() { FragColor = uColor; }";
         // --- Planets + moons (lit) ---
         foreach (Planet p in system.Planets)
         {
-            // The terrain renderer draws this planet as a detailed cube-sphere instead.
-            if (!ReferenceEquals(p, terrainPlanet))
+            // The terrain renderer draws the active body as a detailed cube-sphere instead — skip
+            // it here whether it's this planet or one of its moons.
+            if (!ReferenceEquals(p, terrainBody))
             {
                 Vector3D<float> rel = p.CurrentPosition.ToCameraRelative(cam);
                 DrawBody(viewProj, rel, p.RadiusMeters, p.Color, sunRel, emissive: 0f);
@@ -157,6 +158,7 @@ void main() { FragColor = uColor; }";
 
             foreach (Moon mn in p.Moons)
             {
+                if (ReferenceEquals(mn, terrainBody)) continue;
                 Vector3D<float> mrel = mn.CurrentPosition.ToCameraRelative(cam);
                 DrawBody(viewProj, mrel, mn.RadiusMeters, mn.Color, sunRel, emissive: 0f);
             }

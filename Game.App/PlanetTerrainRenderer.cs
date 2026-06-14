@@ -97,13 +97,13 @@ void main() {
     private readonly Shader _waterShader;
     private readonly List<(TerrainPatch patch, Vector3D<float> rel)> _waterFrame = new();
 
-    private Planet? _planet;
+    private CelestialBody? _body;
     private PlanetTerrain? _terrain;
     private QuadNode[]? _roots;
 
     public int LeafCount { get; private set; }
     public int PatchCount { get; private set; }
-    public Planet? Active => _planet;
+    public CelestialBody? Active => _body;
 
     /// <summary>
     /// Optional extra LOD focus (e.g. the rover) — patches refine toward whichever is closer, the
@@ -119,15 +119,15 @@ void main() {
         _waterShader = new Shader(gl, WaterVertexSource, WaterFragmentSource);
     }
 
-    /// <summary>Switch the terrain target (null = none). No-op if it's already this planet.</summary>
-    public void SetPlanet(Planet? planet)
+    /// <summary>Switch the terrain target (null = none). No-op if it's already this body.</summary>
+    public void SetBody(CelestialBody? body)
     {
-        if (ReferenceEquals(planet, _planet)) return;
+        if (ReferenceEquals(body, _body)) return;
         DisposeTree();
-        _planet = planet;
-        if (planet == null) { _terrain = null; _roots = null; return; }
+        _body = body;
+        if (body == null) { _terrain = null; _roots = null; return; }
 
-        _terrain = new PlanetTerrain(planet);
+        _terrain = new PlanetTerrain(body);
         _roots = new QuadNode[6];
         for (int f = 0; f < 6; f++)
         {
@@ -143,7 +143,7 @@ void main() {
     /// </summary>
     public void Rebuild()
     {
-        if (_planet == null || _terrain == null) return;
+        if (_body == null || _terrain == null) return;
         DisposeTree();
         _roots = new QuadNode[6];
         for (int f = 0; f < 6; f++)
@@ -155,7 +155,7 @@ void main() {
 
     public void Render(Camera camera, Vector3D<float> sunDir)
     {
-        if (_planet == null || _roots == null) return;
+        if (_body == null || _roots == null) return;
 
         Matrix4X4<float> proj = FitProjection(camera);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
@@ -198,7 +198,7 @@ void main() {
 
     private void Process(QuadNode node, Camera camera, in Matrix4X4<float> viewProj, ref int budget)
     {
-        UniversePosition center = _planet!.CurrentPosition.Translated(node.CenterLocal);
+        UniversePosition center = _body!.CurrentPosition.Translated(node.CenterLocal);
 
         // Visibility cull: a node outside the view frustum or beyond the planet's horizon can't be
         // seen. We skip drawing it and skip refining its subtree (so the per-frame budget goes to
@@ -302,7 +302,7 @@ void main() {
         // horizon angle. Pad by the patch's angular half-size and a height allowance so mountains
         // poking over the limb (and partially-visible patches) are never wrongly culled.
         double R = _terrain!.Radius;
-        Vector3D<double> camVec = camera.Position.DeltaMeters(_planet!.CurrentPosition); // centre → camera
+        Vector3D<double> camVec = camera.Position.DeltaMeters(_body!.CurrentPosition); // centre → camera
         double Dc = camVec.Length;
         if (Dc <= R) return true; // at/under the surface — nothing is over the horizon
         double cosA = Vector3D.Dot(Vector3D.Normalize(node.CenterLocal), Vector3D.Normalize(camVec));
@@ -533,12 +533,12 @@ void main() {
     /// <summary>Near/far fit to the camera's altitude and horizon for usable depth precision.</summary>
     private Matrix4X4<float> FitProjection(Camera camera)
     {
-        double camToCenter = camera.Position.DistanceTo(_planet!.CurrentPosition);
+        double camToCenter = camera.Position.DistanceTo(_body!.CurrentPosition);
 
         // Altitude above the LOCAL terrain under the camera, not the base radius — otherwise
         // standing on high ground (a mountain / raised continent) inflates the altitude by that
         // elevation and pushes the near plane far out, clipping the rover and nearby surface.
-        Vector3D<double> camDir = camera.Position.DeltaMeters(_planet.CurrentPosition);
+        Vector3D<double> camDir = camera.Position.DeltaMeters(_body.CurrentPosition);
         double surfaceR = _terrain!.Radius;
         if (camDir.LengthSquared > 0)
             surfaceR += _terrain.HeightAt(Vector3D.Normalize(camDir));

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Engine.Core;
 using Game.Systems;
 using Game.Universe;
@@ -84,10 +85,94 @@ public class SolarSystemTests
             Assert.Equal(a.Planets[i].Moons.Length, b.Planets[i].Moons.Length);
             for (int j = 0; j < a.Planets[i].Moons.Length; j++)
             {
-                Assert.Equal(a.Planets[i].Moons[j].Designation, b.Planets[i].Moons[j].Designation);
-                Assert.Equal(a.Planets[i].Moons[j].SemiMajorAxis, b.Planets[i].Moons[j].SemiMajorAxis);
+                Moon ma = a.Planets[i].Moons[j], mb = b.Planets[i].Moons[j];
+                Assert.Equal(ma.Designation, mb.Designation);
+                Assert.Equal(ma.SemiMajorAxis, mb.SemiMajorAxis);
+                Assert.Equal(ma.Type, mb.Type);
+                Assert.Equal(ma.MassKg, mb.MassKg);
+                Assert.Equal(ma.HasAtmosphere, mb.HasAtmosphere);
             }
         }
+    }
+
+    [Fact]
+    public void Moons_AreSolidWorldsWithMass()
+    {
+        // Sweep many systems so we see a representative spread of moons.
+        bool sawMoon = false, sawAtmosphere = false, sawHabitableOcean = false;
+        var types = new HashSet<PlanetType>();
+        for (ulong seed = 1; seed <= 200; seed++)
+        {
+            var field = new StarField(new GalaxyModel(seed));
+            field.Update(UniversePosition.Origin, radiusCells: 8);
+            if (!field.HasNearest) continue;
+
+            foreach (Planet p in SystemGenerator.Generate(field.Nearest).Planets)
+            foreach (Moon m in p.Moons)
+            {
+                sawMoon = true;
+                types.Add(m.Type);
+                // Moons are always landable rock/ice/ocean worlds — never gas/ice giants.
+                Assert.True(m.HasSurface);
+                Assert.NotEqual(PlanetType.GasGiant, m.Type);
+                Assert.NotEqual(PlanetType.IceGiant, m.Type);
+                Assert.True(m.MassKg > 0, "moon needs mass for surface gravity");
+                if (m.HasAtmosphere)
+                {
+                    sawAtmosphere = true;
+                    Assert.True(m.AtmosphereHeight > 0 && m.AtmosphereDensity > 0);
+                }
+                if (m.Habitable)
+                {
+                    sawHabitableOcean = true;
+                    // Habitable means a breathable, ocean-blue world with liquid water.
+                    Assert.Equal(PlanetType.Ocean, m.Type);
+                    Assert.True(m.HasAtmosphere && m.HasLiquidWater);
+                }
+            }
+        }
+
+        Assert.True(sawMoon, "expected at least one moon across the sample");
+        Assert.True(types.Count > 1, "expected a variety of moon surface types");
+        Assert.True(sawAtmosphere, "expected at least one moon with a thin atmosphere across the sample");
+        Assert.True(sawHabitableOcean, "expected at least one habitable ocean moon across the sample");
+    }
+
+    [Fact]
+    public void ScanData_IsPopulatedAndConsistent()
+    {
+        var bodies = new List<CelestialBody>();
+        for (ulong seed = 1; seed <= 60; seed++)
+        {
+            var field = new StarField(new GalaxyModel(seed));
+            field.Update(UniversePosition.Origin, radiusCells: 8);
+            if (field.HasNearest) bodies.AddRange(SystemGenerator.Generate(field.Nearest).AllBodies());
+        }
+        Assert.NotEmpty(bodies);
+
+        foreach (CelestialBody b in bodies)
+        {
+            Assert.True(b.SurfaceTempK > 0, "every body gets a temperature");
+
+            // Composition is present exactly when the body has the relevant feature, and sums to ~1.
+            Assert.Equal(b.HasAtmosphere, b.AtmosphereComposition.Length > 0);
+            Assert.Equal(b.HasSurface, b.SurfaceComposition.Length > 0);
+            AssertNormalised(b.AtmosphereComposition);
+            AssertNormalised(b.SurfaceComposition);
+        }
+    }
+
+    private static void AssertNormalised(Constituent[] parts)
+    {
+        if (parts.Length == 0) return;
+        float sum = 0;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            Assert.True(parts[i].Fraction > 0);
+            if (i > 0) Assert.True(parts[i - 1].Fraction >= parts[i].Fraction, "sorted most-abundant first");
+            sum += parts[i].Fraction;
+        }
+        Assert.True(Math.Abs(sum - 1f) < 1e-3f, $"fractions should sum to 1, got {sum}");
     }
 
     [Fact]

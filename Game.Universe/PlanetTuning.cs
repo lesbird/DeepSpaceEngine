@@ -20,6 +20,8 @@ public static class PlanetTuning
         public float ReliefScale = 1f;
         public float MountainScale = 1f;
         public float FrequencyScale = 1f;
+        public float CraterScale = 1f;
+        public float CraterDensity = 1f;
         public float SnowLine = 0.55f;
         public float CliffThreshold = 0.685f;
         public float CliffStrength = 0.85f;
@@ -52,6 +54,8 @@ public static class PlanetTuning
     public static float EffectiveRelief(PlanetType t)    { var p = Profiles[(int)t]; return p.Enabled ? p.ReliefScale : TerrainTuning.ReliefScale; }
     public static float EffectiveMountain(PlanetType t)  { var p = Profiles[(int)t]; return p.Enabled ? p.MountainScale : TerrainTuning.MountainScale; }
     public static float EffectiveFrequency(PlanetType t) { var p = Profiles[(int)t]; return p.Enabled ? p.FrequencyScale : TerrainTuning.FrequencyScale; }
+    public static float EffectiveCraterScale(PlanetType t)   { var p = Profiles[(int)t]; return p.Enabled ? p.CraterScale : TerrainTuning.CraterScale; }
+    public static float EffectiveCraterDensity(PlanetType t) { var p = Profiles[(int)t]; return p.Enabled ? p.CraterDensity : TerrainTuning.CraterDensity; }
     public static float EffectiveSnowLine(PlanetType t)  { var p = Profiles[(int)t]; return p.Enabled ? p.SnowLine : BiomeTuning.SnowLine; }
     public static float EffectiveCliffThreshold(PlanetType t) { var p = Profiles[(int)t]; return p.Enabled ? p.CliffThreshold : BiomeTuning.CliffThreshold; }
     public static float EffectiveCliffStrength(PlanetType t)  { var p = Profiles[(int)t]; return p.Enabled ? p.CliffStrength : BiomeTuning.CliffStrength; }

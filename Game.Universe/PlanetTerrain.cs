@@ -13,6 +13,12 @@ namespace Game.Universe;
 /// read as dramatic ranges and canyons rather than gentle rolling noise. Per-type tuning
 /// gives each world class a distinct silhouette (jagged lava, big rocky ranges, smoother ice).
 ///
+/// On top of that, each body picks a seeded <b>terrain style</b> (tectonic, mountainous, plains
+/// or cratered) so worlds differ from one another, and a low-frequency <b>regional ruggedness
+/// mask</b> modulates the mountains and detail so a <i>single</i> world has both flat plains and
+/// rugged highlands instead of uniform hills. Airless worlds also get a Worley-based <b>crater
+/// field</b> (bowl + raised rim); worlds with weather erode their craters away.
+///
 /// Every term is a FIXED-parameter pure function of direction, so neighbouring LOD patches
 /// sampling a shared edge get identical heights — no vertical cracks (the renderer adds
 /// skirts for the remaining T-junction gaps). <see cref="Amplitude"/> stays a true upper
@@ -32,6 +38,16 @@ public sealed class PlanetTerrain
     private readonly double _warpFreq;
     private readonly double _warpStrength;
     private readonly double _mountainWeight;    // seeded mountain weight (scaled by MountainScale)
+
+    // Per-body style: a regional ruggedness mask (flat plains vs rugged highlands) and an optional
+    // impact-crater field. See ChooseStyle / StyleParamsFor.
+    private readonly double _ruggedFreq;        // low frequency of the regional ruggedness field
+    private readonly double _ruggedLo, _ruggedHi; // smoothstep edges turning that field into [0,1]
+    private readonly double _detailFloor;       // min high-frequency roughness in the flattest regions
+    private readonly double _craterWeight;      // 0 = no craters; else crater layer weight in the blend
+    private readonly double _craterDensity;     // fraction of cells [0,1] that actually bear a crater
+    private readonly double _craterFreqA, _craterFreqB; // large basins / smaller craters
+
     private readonly bool _hasOcean;
     private readonly double _seaLevelFrac;      // sea level as a fraction of Amplitude
     private readonly Vector3D<float> _baseColor;
@@ -53,25 +69,27 @@ public sealed class PlanetTerrain
     private const double ContinentGain = 0.50;
     private const double MountainGain = 0.58; // > 0.5 keeps amplitude in the high octaves → rugged
     private const double DetailGain = 0.55;
+    private const double CraterRimFrac = 0.28; // raised rim height as a fraction of crater depth
 
     // Analytic upper bound on |height|: the three layers are bounded by their weights, and the
     // mountain term is ≥ 0. Resolved per type so an enabled override wins over the global knobs.
     public double Amplitude =>
         _baseAmplitude * PlanetTuning.EffectiveRelief(Type) *
-        (ContinentWeight + _mountainWeight * PlanetTuning.EffectiveMountain(Type) + DetailWeight);
+        (ContinentWeight + _mountainWeight * PlanetTuning.EffectiveMountain(Type) + DetailWeight
+         + _craterWeight * PlanetTuning.EffectiveCraterScale(Type));
 
-    public PlanetTerrain(Planet planet)
+    public PlanetTerrain(CelestialBody body)
     {
-        Radius = planet.RadiusMeters;
-        Type = planet.Type;
-        HasSurface = planet.Type is not (PlanetType.GasGiant or PlanetType.IceGiant);
-        _baseColor = planet.Color;
+        Radius = body.RadiusMeters;
+        Type = body.Type;
+        HasSurface = body.HasSurface;
+        _baseColor = body.Color;
 
-        var rng = new DeterministicRng(Hashing.Combine(planet.Seed, 0x7E44A1u));
-        _noise = new Noise(planet.Seed);
+        var rng = new DeterministicRng(Hashing.Combine(body.Seed, 0x7E44A1u));
+        _noise = new Noise(body.Seed);
 
         // Per-type silhouette: relief height and how mountainous (ridge weight) the world is.
-        (double relief, double ridge) = planet.Type switch
+        (double relief, double ridge) = body.Type switch
         {
             PlanetType.Lava => (0.022, 0.70),   // jagged, fractured crust
             PlanetType.Rocky => (0.020, 0.65),  // tall ranges, deep valleys
@@ -81,8 +99,12 @@ public sealed class PlanetTerrain
             _ => (0.016, 0.55),
         };
 
-        _baseAmplitude = Radius * relief * rng.Range(0.85, 1.25);
-        _mountainWeight = ridge * rng.Range(0.9, 1.1);
+        // A seeded style (biased by type and whether the world has weather) makes worlds differ from
+        // one another: some are mountainous, some flat plains, airless ones are crater-scarred.
+        StyleParams sp = StyleParamsFor(ChooseStyle(ref rng, body));
+
+        _baseAmplitude = Radius * relief * sp.Relief * rng.Range(0.85, 1.25);
+        _mountainWeight = ridge * sp.MountainProminence * rng.Range(0.9, 1.1);
 
         _continentFreq = rng.Range(1.1, 2.2);
         _mountainFreq = _continentFreq * rng.Range(2.5, 4.0);
@@ -90,7 +112,16 @@ public sealed class PlanetTerrain
         _warpFreq = _continentFreq * rng.Range(0.8, 1.6);
         _warpStrength = rng.Range(0.10, 0.22);
 
-        _hasOcean = planet.Type == PlanetType.Ocean;
+        _ruggedFreq = _continentFreq * rng.Range(0.4, 0.8); // regional, below continent scale
+        _ruggedLo = sp.RuggedLo;
+        _ruggedHi = sp.RuggedHi;
+        _detailFloor = sp.DetailFloor;
+        _craterWeight = sp.CraterWeight;
+        _craterDensity = sp.CraterDensity;
+        _craterFreqA = rng.Range(28.0, 55.0);              // large basins, visible from orbit
+        _craterFreqB = _craterFreqA * rng.Range(3.0, 4.5); // smaller craters, fade in up close
+
+        _hasOcean = body.Type == PlanetType.Ocean;
         _seaLevelFrac = _hasOcean ? rng.Range(-0.15, 0.05) : double.NegativeInfinity;
     }
 
@@ -117,23 +148,141 @@ public sealed class PlanetTerrain
         // Broad continents / ocean basins.
         double continents = _noise.Fbm(unitDir, contOct, _continentFreq * fs, 2.0, ContinentGain); // [-1,1]
 
-        // Ridged mountains, domain-warped, rising on the highlands. Added on top of continents
-        // (not blended) so dialling up "Mountains" makes ranges taller without flattening land.
+        // Regional ruggedness: a low-frequency mask saying how rough THIS area is, so the same world
+        // has calm plains in some regions and rugged highlands in others rather than uniform hills.
+        double rugged = Ruggedness(unitDir, fs); // [0,1]
+
+        // Ridged mountains, domain-warped, rising on the highlands — only where the region is rugged.
         double mask = Smoothstep(-0.2, 0.4, continents); // [0,1]
         Vector3D<double> warped = unitDir + DomainWarp(unitDir, fs);
         double mountains = _noise.Ridged(warped, mtnOct, _mountainFreq * fs, 2.0, MountainGain); // [0,1]
 
-        // High-frequency roughness everywhere — this is what makes a patch you stand on look
-        // rugged rather than a flat tilted plane.
+        // High-frequency roughness, also damped in the flat regions (but never fully — _detailFloor
+        // keeps a little texture even on plains so they don't read as glass).
         double detail = _noise.Fbm(unitDir, detOct, _detailFreq * fs, 2.0, DetailGain); // [-1,1]
+        double detailGate = _detailFloor + (1.0 - _detailFloor) * rugged; // [_detailFloor, 1]
 
-        // |shape| ≤ ContinentWeight + mWeight + DetailWeight, matching Amplitude → bound holds.
-        double shape = ContinentWeight * continents + mWeight * mountains * mask + DetailWeight * detail;
+        // Impact craters (airless worlds): a depressed bowl with a raised rim, in [-1, CraterRimFrac].
+        // Depth and density are live-tunable (TerrainTuning.Crater*), scaling the seeded per-world amount.
+        double craterW = _craterWeight * PlanetTuning.EffectiveCraterScale(Type);
+        double crater = craterW > 0.0 ? CraterField(unitDir, fs, sampleSpacing) : 0.0;
+
+        // Each term is bounded by its weight (rugged/mask/gate ∈ [0,1], crater ∈ [-1, rim]), so
+        // |shape| ≤ ContinentWeight + mWeight + DetailWeight + craterW, matching Amplitude.
+        double shape = ContinentWeight * continents
+                     + mWeight * mountains * mask * rugged
+                     + DetailWeight * detail * detailGate
+                     + craterW * crater;
         // The solid surface keeps its full relief even below the waterline — that *is* the sea
         // floor. A separate translucent water surface (PlanetTerrainRenderer) sits at SeaLevel,
         // and coastlines emerge naturally where the rugged land crosses it.
         return _baseAmplitude * PlanetTuning.EffectiveRelief(Type) * shape;
     }
+
+    // --- terrain style ---
+
+    private enum TerrainStyle { Tectonic, Mountainous, Plains, Cratered }
+
+    private readonly record struct StyleParams(
+        double Relief, double MountainProminence, double RuggedLo, double RuggedHi,
+        double DetailFloor, double CraterWeight, double CraterDensity);
+
+    /// <summary>Pick a style from the seed, biased by world class and weathering. Airless worlds keep
+    /// their impact scars (cratered); worlds with an atmosphere erode them into plains/hills/ranges.</summary>
+    private static TerrainStyle ChooseStyle(ref DeterministicRng rng, CelestialBody body)
+    {
+        double u = rng.NextDouble();
+        if (body.Type == PlanetType.Lava)
+            return u < 0.65 ? TerrainStyle.Mountainous : body.HasAtmosphere ? TerrainStyle.Tectonic : TerrainStyle.Cratered;
+
+        if (!body.HasAtmosphere) // no weather → craters survive
+            return u < 0.60 ? TerrainStyle.Cratered : u < 0.80 ? TerrainStyle.Plains : TerrainStyle.Mountainous;
+
+        return u < 0.40 ? TerrainStyle.Plains : u < 0.75 ? TerrainStyle.Tectonic : TerrainStyle.Mountainous;
+    }
+
+    private static StyleParams StyleParamsFor(TerrainStyle s) => s switch
+    {
+        //                              relief  mtn   rLo   rHi  detFloor craterW craterDensity
+        TerrainStyle.Mountainous => new(1.30, 1.55, 0.10, 0.55, 0.50, 0.00, 0.00),
+        TerrainStyle.Plains      => new(0.85, 0.70, 0.50, 0.82, 0.18, 0.06, 0.45),
+        TerrainStyle.Cratered    => new(1.00, 0.40, 0.45, 0.85, 0.22, 0.50, 0.75),
+        _ /* Tectonic */         => new(1.00, 1.00, 0.25, 0.62, 0.45, 0.00, 0.00),
+    };
+
+    /// <summary>Low-frequency regional roughness in [0,1]: 0 = flat plains here, 1 = rugged highlands.</summary>
+    private double Ruggedness(Vector3D<double> unitDir, double freqScale)
+    {
+        // Offset so the regional field is decorrelated from the continents it modulates.
+        var p = unitDir + new Vector3D<double>(53.1, 12.7, 91.3);
+        double r = _noise.Fbm(p, 4, _ruggedFreq * freqScale, 2.0, 0.5); // [-1,1]
+        return Smoothstep(_ruggedLo, _ruggedHi, 0.5 + 0.5 * r);
+    }
+
+    // --- impact craters ---
+
+    /// <summary>Two crater size classes (large basins + smaller craters), normalised to [-1, rim].</summary>
+    private double CraterField(Vector3D<double> unitDir, double freqScale, double sampleSpacing)
+    {
+        double density = Math.Clamp(_craterDensity * PlanetTuning.EffectiveCraterDensity(Type), 0.0, 1.0);
+        double a = CraterLayer(unitDir, _craterFreqA * freqScale, 0x1111u, sampleSpacing, density);
+        double b = CraterLayer(unitDir, _craterFreqB * freqScale, 0x2222u, sampleSpacing, density);
+        return (a + 0.6 * b) / 1.6;
+    }
+
+    /// <summary>
+    /// One crater size class. Accumulates every crater in the surrounding 3×3×3 cells (one per cell)
+    /// rather than only the nearest, combining bowls by minimum (deepest wins) and rims by maximum.
+    /// Each crater's footprint falls smoothly to zero at its edge, so the field is continuous across
+    /// cell borders — no vertical "zipper" where the dominant crater switches. Faded in by LOD so far
+    /// patches don't alias sub-pixel craters. Returns [-1, CraterRimFrac].
+    /// </summary>
+    private double CraterLayer(Vector3D<double> unitDir, double freq, ulong salt, double sampleSpacing, double density)
+    {
+        double gate = LayerGate(freq, sampleSpacing);
+        if (gate <= 0.0) return 0.0;
+
+        Vector3D<double> p = unitDir * freq;
+        long xi = (long)Math.Floor(p.X), yi = (long)Math.Floor(p.Y), zi = (long)Math.Floor(p.Z);
+
+        double minBowl = 0.0, maxRim = 0.0;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            (double fx, double fy, double fz, double rand) = _noise.CellFeature(xi + dx, yi + dy, zi + dz, salt);
+
+            // Only some cells bear a crater; decorrelate the radius from the existence test. Radius is
+            // kept ≤ 0.5 cell so a crater's full footprint stays within the 3×3×3 search window.
+            if (rand > density) continue;
+            double radius = 0.22 + 0.28 * Frac(rand * 7.3 + 0.19); // [0.22, 0.50] in cell units
+
+            double ex = p.X - fx, ey = p.Y - fy, ez = p.Z - fz;
+            double t = Math.Sqrt(ex * ex + ey * ey + ez * ez) / radius;
+            if (t >= 1.5) continue;
+
+            // Depressed bowl rising to the rim, plus a gaussian rim ring just outside it.
+            double bowl = -(1.0 - Smoothstep(0.0, 0.85, Math.Min(t, 1.0))); // [-1, 0]
+            double e = (t - 0.95) / 0.12;
+            double rim = CraterRimFrac * Math.Exp(-0.5 * e * e);            // [0, CraterRimFrac]
+
+            if (bowl < minBowl) minBowl = bowl;
+            if (rim > maxRim) maxRim = rim;
+        }
+        return (minBowl + maxRim) * gate;
+    }
+
+    /// <summary>Smoothly fade a feature class in as the patch resolves it: 0 until a feature spans a
+    /// few samples, 1 once it spans many. Continuous in spacing, so LOD never pops the craters in.</summary>
+    private double LayerGate(double freq, double sampleSpacing)
+    {
+        if (sampleSpacing <= 0.0) return 1.0;
+        double wavelength = 2.0 * Math.PI * Radius / freq; // size of one cellular feature (m)
+        double samples = wavelength / sampleSpacing;       // samples across that feature
+        return Smoothstep(4.0, 64.0, samples);
+    }
+
+    private static double Frac(double x) => x - Math.Floor(x);
 
     /// <summary>
     /// How many fBm octaves a patch with the given vertex spacing can show without aliasing:

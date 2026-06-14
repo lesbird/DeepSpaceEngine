@@ -75,6 +75,73 @@ public class TerrainTests
     }
 
     [Fact]
+    public void AllStyles_StayBoundedAndContinuous()
+    {
+        // Sweep every surfaced body across many systems so the new terrain styles — including the
+        // crater fields — are all exercised, and confirm the two invariants the renderer relies on:
+        // heights stay within Amplitude (horizon culling / skirts) and never pop across an LOD step.
+        var dirs = new[]
+        {
+            Vector3D.Normalize(new Vector3D<double>(0.2, 0.9, -0.3)),
+            Vector3D.Normalize(new Vector3D<double>(-0.7, 0.1, 0.6)),
+            Vector3D.Normalize(new Vector3D<double>(0.5, -0.5, 0.5)),
+        };
+
+        int bodies = 0;
+        for (ulong seed = 1; seed <= 60; seed++)
+        {
+            var field = new StarField(new GalaxyModel(seed));
+            field.Update(UniversePosition.Origin, 8);
+            if (!field.HasNearest) continue;
+
+            foreach (CelestialBody b in SystemGenerator.Generate(field.Nearest).AllBodies())
+            {
+                if (!b.HasSurface) continue;
+                bodies++;
+                var t = new PlanetTerrain(b);
+                foreach (var dir in dirs)
+                {
+                    Assert.True(Math.Abs(t.HeightAt(dir)) <= t.Amplitude + 1e-6, "height exceeded amplitude");
+
+                    double prev = t.HeightAt(dir, 5000.0), s = 5000.0;
+                    for (int i = 0; i < 400; i++)
+                    {
+                        s *= 0.97;
+                        double h = t.HeightAt(dir, s);
+                        Assert.True(Math.Abs(h - prev) < 0.01 * t.Amplitude, "LOD height step popped");
+                        prev = h;
+                    }
+                }
+            }
+        }
+        Assert.True(bodies > 50, "expected to sweep many surfaced bodies");
+    }
+
+    [Fact]
+    public void Terrain_StylesProduceDiverseRelief()
+    {
+        // Guard against the "every world is the same hills" regression: across many worlds the
+        // overall relief (Amplitude) should span a wide range, reflecting the different styles.
+        double min = double.MaxValue, max = 0;
+        for (ulong seed = 1; seed <= 60; seed++)
+        {
+            var field = new StarField(new GalaxyModel(seed));
+            field.Update(UniversePosition.Origin, 8);
+            if (!field.HasNearest) continue;
+
+            foreach (CelestialBody b in SystemGenerator.Generate(field.Nearest).AllBodies())
+            {
+                if (!b.HasSurface) continue;
+                double reliefFrac = new PlanetTerrain(b).Amplitude / b.RadiusMeters;
+                min = Math.Min(min, reliefFrac);
+                max = Math.Max(max, reliefFrac);
+            }
+        }
+        // Flattest worlds should be markedly flatter than the most rugged ones (≥ 2× spread).
+        Assert.True(max > min * 2.0, $"relief spread too narrow: {min:0.0000}..{max:0.0000}");
+    }
+
+    [Fact]
     public void GasGiants_HaveNoSurface()
     {
         var field = new StarField(new GalaxyModel(555));

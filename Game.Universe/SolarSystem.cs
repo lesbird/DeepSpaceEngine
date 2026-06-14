@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Engine.Core;
 
 namespace Game.Universe;
@@ -35,6 +36,17 @@ public sealed class SolarSystem
         MaxOrbitRadius = maxOrbit;
         MaxPlanetRadius = maxRadius;
         MaxOrbitalSpeedMps = maxSpeed;
+    }
+
+    /// <summary>Every body in the system — each planet followed by its moons — for the surface and
+    /// atmosphere passes that treat planets and moons identically.</summary>
+    public IEnumerable<CelestialBody> AllBodies()
+    {
+        foreach (Planet p in Planets)
+        {
+            yield return p;
+            foreach (Moon m in p.Moons) yield return m;
+        }
     }
 
     /// <summary>Advance all planet (and moon) positions to simulation time <paramref name="t"/> (seconds).</summary>

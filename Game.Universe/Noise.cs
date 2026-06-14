@@ -118,4 +118,24 @@ public sealed class Noise
         }
         return norm > 0 ? Math.Clamp(sum / norm, 0.0, 1.0) : 0;
     }
+
+    /// <summary>
+    /// One jittered cellular feature: the feature point inside lattice cell (cx,cy,cz) plus a stable
+    /// [0,1) random for that cell. Used to scatter impact craters — the feature point is the crater
+    /// centre and the random drives its size/existence. Callers iterate the 3×3×3 neighbourhood and
+    /// accumulate each crater's smooth footprint, so the field stays continuous across cell borders
+    /// (a plain nearest-feature lookup jumps there when the winning crater's radius changes).
+    /// </summary>
+    public (double fx, double fy, double fz, double rand) CellFeature(long cx, long cy, long cz, ulong salt)
+    {
+        ulong h = Hashing.Combine(_seed, salt);
+        h = Hashing.Combine(h, unchecked((ulong)cx));
+        h = Hashing.Combine(h, unchecked((ulong)cy));
+        h = Hashing.Combine(h, unchecked((ulong)cz));
+        double fx = cx + Hashing.ToUnitDouble(h);
+        double fy = cy + Hashing.ToUnitDouble(Hashing.Combine(h, 0x9E3779B9u));
+        double fz = cz + Hashing.ToUnitDouble(Hashing.Combine(h, 0x85EBCA6Bu));
+        double rand = Hashing.ToUnitDouble(Hashing.Combine(h, 0xC2B2AE35u));
+        return (fx, fy, fz, rand);
+    }
 }

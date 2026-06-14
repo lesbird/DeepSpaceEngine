@@ -30,12 +30,13 @@ internal static class Program
     private static RoverController _rover = null!;
     private static RoverRenderer _roverRenderer = null!;
     private static SceneFramebuffer _sceneFbo = null!;
-    private static Planet? _terrainTarget;
+    private static CelestialBody? _terrainTarget;
     private static bool _driving;
     private static bool _prevR;
     private static ImGuiController _imgui = null!;
 
     private const double TerrainActivateRadii = 8.0; // switch to terrain LOD within N planet radii
+    private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
     private const string TuningPath = "tuning.json";
     private static string _tuningStatus = "";
 
@@ -44,13 +45,15 @@ internal static class Program
         { PlanetType.Lava, PlanetType.Rocky, PlanetType.Desert, PlanetType.Ocean, PlanetType.Ice };
     private static readonly string[] EditableTypeNames = { "Lava", "Rocky", "Desert", "Ocean", "Ice" };
     private static PlanetType _editType = PlanetType.Rocky;
-    private static Planet? _prevEditTarget;
+    private static CelestialBody? _prevEditTarget;
 
     private static GameWindow _window = null!;
 
     private static bool _mouseCaptured = true;
     private static bool _prevTab;
     private static bool _prevComma, _prevPeriod, _prevP;
+    private static bool _prevF;
+    private static bool _scannerOpen;
     private static bool _paused;
     private static double _savedTimeScale;
     private static double _fps;
@@ -128,13 +131,16 @@ internal static class Program
         }
         if (_smoke && _smokeFrames == 1 && _systemManager.HasActive)
         {
-            // Then drop in near a surfaced planet to exercise the terrain path.
-            Planet? p = NearestSurfacedPlanet();
+            // Then drop in near a surfaced body to exercise the terrain path.
+            CelestialBody? p = NearestSurfacedBody();
             if (p != null)
                 _camera.Position = p.CurrentPosition.Translated(new Vector3D<double>(p.RadiusMeters * 3, 0, 0));
         }
 
         if (Edge(Key.Tab, ref _prevTab)) SetMouseCaptured(!_mouseCaptured);
+
+        // 'F' toggles the scanner panel (detailed readout for the nearest body in range).
+        if (Edge(Key.F, ref _prevF)) _scannerOpen = !_scannerOpen;
 
         // 'R' toggles the surface rover. Enter only when a terrain planet is active and we're low
         // enough to be effectively at the surface; exit lifts back into free-fly from the chase cam.
@@ -200,7 +206,7 @@ internal static class Program
         _controller.SetSpeedContext(false, 0);
 
         _terrainTarget = PickTerrainTarget();
-        _terrainRenderer.SetPlanet(_terrainTarget);
+        _terrainRenderer.SetBody(_terrainTarget);
         // Keep the terrain finely refined under the rover so the drawn mesh matches the height it
         // rides on (no sinking through coarse, chord-flattened triangles while driving).
         _terrainRenderer.FocusPoint = _driving ? _rover.BodyPosition : null;
@@ -277,6 +283,7 @@ internal static class Program
         _overlay.Draw(_camera, _starField, _systemManager);
         DrawHud();
         DrawTuning();
+        DrawScanner();
         _imgui.Render();
 
         if (_smoke && ++_smokeFrames > 24)
@@ -374,7 +381,7 @@ internal static class Program
         ImGui.Text(_mouseCaptured ? "Mouse: captured (Tab to release)" : "Mouse: free (Tab to capture)");
         ImGui.Text(_driving
             ? "DRIVE: W/S throttle | A/D steer | Space brake | R exit | Esc quit"
-            : "WASD move | Q/E roll | wheel speed/throttle | R drive | Esc quit");
+            : "WASD move | Q/E roll | wheel speed/throttle | R drive | F scan | Esc quit");
         ImGui.End();
     }
 
@@ -435,12 +442,17 @@ internal static class Program
             ref float relief = ref (ov ? ref prof.ReliefScale : ref TerrainTuning.ReliefScale);
             ref float mountain = ref (ov ? ref prof.MountainScale : ref TerrainTuning.MountainScale);
             ref float freq = ref (ov ? ref prof.FrequencyScale : ref TerrainTuning.FrequencyScale);
+            ref float craterDepth = ref (ov ? ref prof.CraterScale : ref TerrainTuning.CraterScale);
+            ref float craterDensity = ref (ov ? ref prof.CraterDensity : ref TerrainTuning.CraterDensity);
             terrainDirty |= ImGui.SliderFloat("Relief scale", ref relief, 0.1f, 5f);
             terrainDirty |= ImGui.SliderFloat("Mountains", ref mountain, 0f, 2f);
             terrainDirty |= ImGui.SliderFloat("Frequency", ref freq, 0.3f, 3f);
+            terrainDirty |= ImGui.SliderFloat("Crater depth", ref craterDepth, 0f, 3f);
+            terrainDirty |= ImGui.SliderFloat("Crater density", ref craterDensity, 0f, 3f);
+            ImGui.TextDisabled("(craters only on airless/cratered worlds)");
             if (ImGui.Button("Reset terrain"))
             {
-                relief = 1f; mountain = 1f; freq = 1f;
+                relief = 1f; mountain = 1f; freq = 1f; craterDepth = 1f; craterDensity = 1f;
                 terrainDirty = true;
             }
         }
@@ -493,6 +505,106 @@ internal static class Program
         ImGui.End();
     }
 
+    /// <summary>
+    /// The scanner panel (toggled with F): a detailed readout — class, gravity, temperature,
+    /// hydrosphere, and atmosphere/surface composition — for the nearest body once we're close
+    /// enough to scan it. Works for planets and moons alike (both now carry the same scan data).
+    /// </summary>
+    private static void DrawScanner()
+    {
+        if (!_scannerOpen) return;
+
+        ImGui.SetNextWindowPos(new System.Numerics.Vector2(10, 470), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(330, 0), ImGuiCond.FirstUseEver);
+        ImGui.Begin("Scanner  [F]", ImGuiWindowFlags.NoNav);
+
+        if (!_systemManager.HasActive)
+        {
+            ImGui.TextDisabled("No system in range. Approach a star.");
+            ImGui.End();
+            return;
+        }
+
+        CelestialBody? target = NearestBody(out double dist);
+        if (target == null)
+        {
+            ImGui.TextDisabled("No bodies detected.");
+            ImGui.End();
+            return;
+        }
+
+        double alt = dist - target.RadiusMeters;
+        double range = target.RadiusMeters * ScanRangeRadii;
+        ImGui.Text($"Nearest: {target.Designation}");
+        if (dist > range)
+        {
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.7f, 0.4f, 1f),
+                $"OUT OF SCAN RANGE - {FormatDistance(Math.Max(0, alt))}");
+            ImGui.TextDisabled($"Approach to within {FormatDistance(range)} to scan.");
+            ImGui.End();
+            return;
+        }
+
+        ImGui.Separator();
+        ImGui.Text($"Class: {target.Type}");
+        if (target.Habitable)
+            ImGui.TextColored(new System.Numerics.Vector4(0.4f, 1f, 0.5f, 1f),
+                "HABITABLE - liquid water & breathable air");
+        ImGui.Spacing();
+
+        double earthR = target.RadiusMeters / MathUtil.EarthRadiusM;
+        ImGui.Text($"Radius: {target.RadiusMeters / 1000:0} km  ({earthR:0.00} Earth radii)");
+        ImGui.Text($"Surface gravity: {target.SurfaceGravity:0.00} m/s^2  ({target.SurfaceGravity / 9.80665:0.00} g)");
+        ImGui.Text($"Surface temp: {target.SurfaceTempK:0} K  ({target.SurfaceTempK - 273.15:0} C)");
+        ImGui.Text($"Hydrosphere: {(target.HasLiquidWater ? "liquid water oceans" : "none")}");
+        ImGui.Spacing();
+
+        if (target.AtmosphereComposition.Length > 0)
+        {
+            ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.85f, 1f, 1f), "Atmosphere");
+            foreach (Constituent c in target.AtmosphereComposition)
+                ImGui.Text($"  {c.Name,-18} {c.Fraction * 100:0.0}%");
+        }
+        else
+        {
+            ImGui.TextDisabled("Atmosphere: none (vacuum)");
+        }
+        ImGui.Spacing();
+
+        if (target.SurfaceComposition.Length > 0)
+        {
+            ImGui.TextColored(new System.Numerics.Vector4(0.9f, 0.8f, 0.6f, 1f), "Surface composition");
+            foreach (Constituent c in target.SurfaceComposition)
+                ImGui.Text($"  {c.Name,-18} {c.Fraction * 100:0.0}%");
+        }
+        else
+        {
+            ImGui.TextDisabled("Surface: no solid surface");
+        }
+
+        if (target is Planet pl && pl.Moons.Length > 0)
+        {
+            ImGui.Spacing();
+            ImGui.TextDisabled($"Satellites: {pl.Moons.Length}");
+        }
+
+        ImGui.End();
+    }
+
+    /// <summary>Nearest body (planet or moon) to the camera, with its centre distance.</summary>
+    private static CelestialBody? NearestBody(out double dist)
+    {
+        CelestialBody? best = null;
+        double bestD = double.MaxValue;
+        foreach (CelestialBody b in _systemManager.Active!.AllBodies())
+        {
+            double d = b.CurrentPosition.DistanceTo(_camera.Position);
+            if (d < bestD) { bestD = d; best = b; }
+        }
+        dist = bestD;
+        return best;
+    }
+
     /// <summary>ImGui colour swatch bound to a Silk <see cref="Vector3D{T}"/>. Returns true on edit.</summary>
     private static bool ColorEdit3(string label, ref Vector3D<float> c)
     {
@@ -522,26 +634,27 @@ internal static class Program
         return $"{meters:0} m";
     }
 
-    private static Planet? NearestSurfacedPlanet()
+    private static CelestialBody? NearestSurfacedBody()
     {
         if (!_systemManager.HasActive) return null;
-        Planet? best = null;
+        CelestialBody? best = null;
         double bestD = double.MaxValue;
-        foreach (Planet p in _systemManager.Active!.Planets)
+        // Planets and moons both land — moons are never gas/ice giants, so they always have a surface.
+        foreach (CelestialBody b in _systemManager.Active!.AllBodies())
         {
-            if (p.Type is PlanetType.GasGiant or PlanetType.IceGiant) continue;
-            double d = p.CurrentPosition.DistanceTo(_camera.Position);
-            if (d < bestD) { bestD = d; best = p; }
+            if (!b.HasSurface) continue;
+            double d = b.CurrentPosition.DistanceTo(_camera.Position);
+            if (d < bestD) { bestD = d; best = b; }
         }
         return best;
     }
 
-    private static Planet? PickTerrainTarget()
+    private static CelestialBody? PickTerrainTarget()
     {
-        Planet? p = NearestSurfacedPlanet();
-        if (p == null) return null;
-        double d = p.CurrentPosition.DistanceTo(_camera.Position);
-        return d < p.RadiusMeters * TerrainActivateRadii ? p : null;
+        CelestialBody? b = NearestSurfacedBody();
+        if (b == null) return null;
+        double d = b.CurrentPosition.DistanceTo(_camera.Position);
+        return d < b.RadiusMeters * TerrainActivateRadii ? b : null;
     }
 
     private static bool Edge(Key key, ref bool prev)

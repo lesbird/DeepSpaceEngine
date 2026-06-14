@@ -31,6 +31,8 @@ public sealed class TuningConfig
     public float ReliefScale { get; set; } = 1.0f;
     public float MountainScale { get; set; } = 1.0f;
     public float FrequencyScale { get; set; } = 1.0f;
+    public float CraterScale { get; set; } = 1.0f;
+    public float CraterDensity { get; set; } = 1.0f;
 
     // Biome / colour.
     public float SnowLine { get; set; } = 0.55f;
@@ -51,6 +53,8 @@ public sealed class TuningConfig
         public float ReliefScale { get; set; } = 1f;
         public float MountainScale { get; set; } = 1f;
         public float FrequencyScale { get; set; } = 1f;
+        public float CraterScale { get; set; } = 1f;
+        public float CraterDensity { get; set; } = 1f;
         public float SnowLine { get; set; } = 0.55f;
         public float CliffThreshold { get; set; } = 0.685f;
         public float CliffStrength { get; set; } = 0.85f;
@@ -83,6 +87,8 @@ public sealed class TuningConfig
         ReliefScale = TerrainTuning.ReliefScale,
         MountainScale = TerrainTuning.MountainScale,
         FrequencyScale = TerrainTuning.FrequencyScale,
+        CraterScale = TerrainTuning.CraterScale,
+        CraterDensity = TerrainTuning.CraterDensity,
         SnowLine = BiomeTuning.SnowLine,
         CliffThreshold = BiomeTuning.CliffThreshold,
         CliffStrength = BiomeTuning.CliffStrength,
@@ -106,6 +112,8 @@ public sealed class TuningConfig
                 ReliefScale = p.ReliefScale,
                 MountainScale = p.MountainScale,
                 FrequencyScale = p.FrequencyScale,
+                CraterScale = p.CraterScale,
+                CraterDensity = p.CraterDensity,
                 SnowLine = p.SnowLine,
                 CliffThreshold = p.CliffThreshold,
                 CliffStrength = p.CliffStrength,
@@ -134,6 +142,8 @@ public sealed class TuningConfig
         TerrainTuning.ReliefScale = ReliefScale;
         TerrainTuning.MountainScale = MountainScale;
         TerrainTuning.FrequencyScale = FrequencyScale;
+        TerrainTuning.CraterScale = CraterScale;
+        TerrainTuning.CraterDensity = CraterDensity;
         BiomeTuning.SnowLine = SnowLine;
         BiomeTuning.CliffThreshold = CliffThreshold;
         BiomeTuning.CliffStrength = CliffStrength;
@@ -152,6 +162,8 @@ public sealed class TuningConfig
             p.ReliefScale = d.ReliefScale;
             p.MountainScale = d.MountainScale;
             p.FrequencyScale = d.FrequencyScale;
+            p.CraterScale = d.CraterScale;
+            p.CraterDensity = d.CraterDensity;
             p.SnowLine = d.SnowLine;
             p.CliffThreshold = d.CliffThreshold;
             p.CliffStrength = d.CliffStrength;
