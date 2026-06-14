@@ -11,16 +11,13 @@ namespace Game.App;
 /// there is no world "up", no pitch clamp, and no pole, so you can rotate freely in any
 /// direction (loop, roll, point straight up) with no gimbal lock. WASD translate.
 ///
-/// Speed has two regimes (see <see cref="SetSpeedContext"/> / <see cref="SpeedPolicy"/>):
-/// <list type="bullet">
-/// <item>Open galaxy — unlimited. The wheel sets a logarithmic absolute speed from 1 m/s up
-///   to interstellar velocities (<see cref="SpeedExponent"/>).</item>
-/// <item>Inside a system — an auto cap kicks in (up to 1,000,000 c, falling toward 1,000 km/s near a
-///   planet). The wheel instead scales a <see cref="ThrottleFraction"/> percentage of that cap,
-///   so you can ease below the auto value for a fine approach.</item>
-/// </list>
-/// Entering a system resets the throttle to 100% so the speed auto-drops to the cap; leaving it
-/// resumes log control from whatever speed you were doing.
+/// The wheel always sets a single logarithmic <i>desired</i> speed (<see cref="SpeedExponent"/>),
+/// from 1 m/s up to interstellar velocities. The actual speed is that desired value clamped to a
+/// <see cref="MaxSpeed"/> cap supplied each frame by <see cref="SetSpeedContext"/> / <see cref="SpeedPolicy"/>:
+/// far from every body the cap is infinite (you fly at the full desired speed); as you near a star,
+/// planet or moon it shrinks, automatically decelerating you into the approach. A per-frame
+/// anti-tunnelling clamp also bounds how much of the remaining distance to the nearest surface you
+/// may cross in one step, so even at extreme speed (or a low frame-rate) you can never skip past a body.
 /// </summary>
 public sealed class FreeFlyController
 {
@@ -31,7 +28,7 @@ public sealed class FreeFlyController
     private Vector2D<float> _lookDelta;
     private Vector2D<float>? _lastMousePos;
 
-    /// <summary>Open-galaxy speed = 10^Exponent metres/second.</summary>
+    /// <summary>Desired speed = 10^Exponent metres/second (wheel-controlled).</summary>
     public float SpeedExponent = 1.0f;
     public float Sensitivity = 0.0025f;
     public float RollSpeed = 1.5f; // radians/sec
@@ -40,22 +37,25 @@ public sealed class FreeFlyController
     private const float MinSpeedExp = 0f;   // 1 m/s
     private const float MaxSpeedExp = 18f;  // 1e18 m/s (~100 ly/s)
 
-    private const double ThrottleStep = 1.15;   // per wheel notch (~15%)
-    private const double MinThrottle = 0.001;   // floor so you can creep in for a landing
+    // Never advance more than this fraction of the distance to the nearest engaged surface in a single
+    // frame. Keeps a fast approach from tunnelling through a body before the cap can react, regardless
+    // of frame-rate; in normal flight the proportional cap is far below this, so it rarely engages.
+    private const double AntiTunnelFraction = 0.5;
 
-    /// <summary>Auto max-speed cap (m/s). +Infinity in open galaxy (unlimited).</summary>
+    /// <summary>Proximity speed cap (m/s) for this frame; +Infinity when nothing is near (unlimited).</summary>
     public double MaxSpeed { get; private set; } = double.PositiveInfinity;
 
-    /// <summary>Wheel-controlled fraction [MinThrottle, 1] of <see cref="MaxSpeed"/> when capped.</summary>
-    public double ThrottleFraction { get; private set; } = 1.0;
+    /// <summary>Distance (m) to the nearest body surface currently limiting us; +Infinity if none.</summary>
+    private double _approachGap = double.PositiveInfinity;
 
-    /// <summary>True when an auto cap is in force (inside a system).</summary>
-    public bool SpeedCapped => !double.IsInfinity(MaxSpeed);
+    /// <summary>The wheel-commanded speed (m/s) before any proximity cap.</summary>
+    public double DesiredSpeed => Math.Pow(10, SpeedExponent);
 
-    /// <summary>Throttle as a percentage for the HUD.</summary>
-    public double ThrottlePercent => ThrottleFraction * 100.0;
+    /// <summary>True when the proximity cap is actually holding the speed below what the wheel commands.</summary>
+    public bool SpeedCapped => MaxSpeed < DesiredSpeed;
 
-    public double CurrentSpeed => SpeedCapped ? ThrottleFraction * MaxSpeed : Math.Pow(10, SpeedExponent);
+    /// <summary>Actual speed this frame: the desired speed clamped to the proximity cap.</summary>
+    public double CurrentSpeed => Math.Min(DesiredSpeed, MaxSpeed);
 
     public FreeFlyController(Camera camera, IKeyboard keyboard, IMouse mouse)
     {
@@ -67,35 +67,18 @@ public sealed class FreeFlyController
     }
 
     /// <summary>
-    /// Refresh the auto speed cap from the flight context. Call each frame after the system and
-    /// planet positions are up to date.
+    /// Supply this frame's proximity limit: <paramref name="maxSpeed"/> is the speed cap (m/s,
+    /// +Infinity when unlimited) and <paramref name="approachGap"/> is the distance to the nearest
+    /// limiting surface (m, +Infinity if none). Call each frame after body positions are up to date.
     /// </summary>
-    public void SetSpeedContext(bool inSystem, double nearestSurfaceMeters)
+    public void SetSpeedContext(double maxSpeed, double approachGap)
     {
-        double cap = SpeedPolicy.MaxSpeed(inSystem, nearestSurfaceMeters);
-        bool wasCapped = SpeedCapped;
-        bool nowCapped = !double.IsInfinity(cap);
-
-        if (nowCapped && !wasCapped)
-        {
-            ThrottleFraction = 1.0; // entering a system: auto-drop to the cap
-        }
-        else if (wasCapped && !nowCapped)
-        {
-            // Leaving: resume logarithmic control from the speed we were actually doing.
-            double resume = ThrottleFraction * MaxSpeed;
-            SpeedExponent = (float)Math.Clamp(Math.Log10(Math.Max(1.0, resume)), MinSpeedExp, MaxSpeedExp);
-        }
-        MaxSpeed = cap;
+        MaxSpeed = maxSpeed;
+        _approachGap = approachGap;
     }
 
     private void OnScroll(IMouse mouse, ScrollWheel wheel)
-    {
-        if (SpeedCapped)
-            ThrottleFraction = Math.Clamp(ThrottleFraction * Math.Pow(ThrottleStep, wheel.Y), MinThrottle, 1.0);
-        else
-            SpeedExponent = Math.Clamp(SpeedExponent + wheel.Y * 0.25f, MinSpeedExp, MaxSpeedExp);
-    }
+        => SpeedExponent = Math.Clamp(SpeedExponent + wheel.Y * 0.25f, MinSpeedExp, MaxSpeedExp);
 
     private void OnMouseMove(IMouse mouse, System.Numerics.Vector2 position)
     {
@@ -136,6 +119,10 @@ public sealed class FreeFlyController
             move = Vector3D.Normalize(move);
             var worldDir = Vector3D.Transform(move, _camera.Orientation);
             double dist = CurrentSpeed * dt;
+            // Anti-tunnelling: never cross more than a fraction of the gap to the nearest surface in one
+            // frame, so a fast approach (or a stalled frame) can't jump straight through a body.
+            if (!double.IsInfinity(_approachGap))
+                dist = Math.Min(dist, AntiTunnelFraction * _approachGap);
             _camera.Position.Translate(new Vector3D<double>(worldDir.X * dist, worldDir.Y * dist, worldDir.Z * dist));
         }
     }

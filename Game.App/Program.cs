@@ -200,10 +200,7 @@ internal static class Program
             _camera.Position.Translate(_terrainTarget.CurrentPosition.DeltaMeters(prev));
         }
 
-        // Auto speed cap disabled for now: speed is always wheel-controlled (logarithmic), with no
-        // automatic drop inside a system. Restore the SpeedPolicy-based cap by passing the nearest
-        // planet surface here (see git history / SetSpeedContext).
-        _controller.SetSpeedContext(false, 0);
+        UpdateSpeedLimit();
 
         _terrainTarget = PickTerrainTarget();
         _terrainRenderer.SetBody(_terrainTarget);
@@ -307,11 +304,12 @@ internal static class Program
         double distLy = p.DistanceTo(UniversePosition.Origin) / MathUtil.LightYear;
         ImGui.Text($"Sector: {p.Sector.X}, {p.Sector.Y}, {p.Sector.Z}");
         ImGui.Text($"From origin: {distLy:0.000} ly");
+        ImGui.Text($"Speed: {FormatSpeed(_controller.CurrentSpeed)}");
         if (_controller.SpeedCapped)
-            ImGui.Text($"Speed: {FormatSpeed(_controller.CurrentSpeed)}  " +
-                $"({_controller.ThrottlePercent:0}% of {FormatSpeed(_controller.MaxSpeed)} cap)");
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.8f, 0.4f, 1f),
+                $"  approach limit — set {FormatSpeed(_controller.DesiredSpeed)} (wheel)");
         else
-            ImGui.Text($"Speed: {FormatSpeed(_controller.CurrentSpeed)}  (exp {_controller.SpeedExponent:0.0})");
+            ImGui.Text($"  set {FormatSpeed(_controller.DesiredSpeed)}  (exp {_controller.SpeedExponent:0.0})");
         ImGui.Separator();
 
         ImGui.Text($"Stars rendered: {_starRenderer.LastDrawn}");
@@ -647,6 +645,38 @@ internal static class Program
             if (d < bestD) { bestD = d; best = b; }
         }
         return best;
+    }
+
+    /// <summary>
+    /// Recompute the free-fly proximity speed limit for this frame. The cap is the minimum over the
+    /// nearest star and every body in the active system; far from all of them it stays infinite
+    /// (unlimited). <see cref="SpeedPolicy"/> shapes each body's contribution and the gap feeds the
+    /// controller's anti-tunnelling clamp.
+    /// </summary>
+    private static void UpdateSpeedLimit()
+    {
+        double cap = double.PositiveInfinity;
+        double gap = double.PositiveInfinity;
+
+        void Consider(double centerDistance, double radius, bool isStar)
+        {
+            double surface = centerDistance - radius;
+            double engage = SpeedPolicy.EngageDistance(radius, isStar);
+            cap = Math.Min(cap, SpeedPolicy.Cap(surface, engage));
+            if (surface < engage) gap = Math.Min(gap, Math.Max(0.0, surface));
+        }
+
+        // The nearest catalog star — present even before its system spawns, so the slowdown begins as
+        // you approach the star itself, not only once planets appear.
+        if (_starField.HasNearest)
+            Consider(_starField.NearestDistanceMeters, _starField.Nearest.RadiusMeters, isStar: true);
+
+        // Planets and moons tighten the limit further the closer you get to one.
+        if (_systemManager.HasActive)
+            foreach (CelestialBody b in _systemManager.Active!.AllBodies())
+                Consider(b.CurrentPosition.DistanceTo(_camera.Position), b.RadiusMeters, isStar: false);
+
+        _controller.SetSpeedContext(cap, gap);
     }
 
     private static CelestialBody? PickTerrainTarget()
