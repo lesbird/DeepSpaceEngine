@@ -11,8 +11,8 @@ namespace Game.Systems;
 /// </summary>
 public sealed class SolarSystemManager
 {
-    public double SpawnLightYears = 0.5;
-    public double DespawnLightYears = 0.6;
+    public double SpawnLightYears = 0.01;
+    public double DespawnLightYears = 0.012;
 
     /// <summary>
     /// Simulation seconds elapsed per real second. Orbital motion you see is time-lapse, so

@@ -97,18 +97,19 @@ public class SolarSystemTests
         field.Update(UniversePosition.Origin, 8);
         Star n = field.Nearest;
 
-        var mgr = new SolarSystemManager(); // spawn 0.5 ly, despawn 0.6 ly
+        var mgr = new SolarSystemManager();
+        double spawn = mgr.SpawnLightYears, despawn = mgr.DespawnLightYears;
 
-        // Approach to 0.3 ly → spawns.
-        UniversePosition near = n.Position.Translated(new Vector3D<double>(0.3 * Ly, 0, 0));
+        // Approach to just inside the spawn radius → spawns.
+        UniversePosition near = n.Position.Translated(new Vector3D<double>(spawn * 0.5 * Ly, 0, 0));
         field.Update(near, 8);
         mgr.Update(0.0, near, field);
         Assert.True(mgr.HasActive);
         ulong activeId = mgr.ActiveStarId!.Value;
         UniversePosition activePos = mgr.Active!.Sun.Position;
 
-        // Retreat to 0.55 ly (between thresholds) → STAYS active (hysteresis), same star.
-        UniversePosition mid = activePos.Translated(new Vector3D<double>(0.55 * Ly, 0, 0));
+        // Retreat between the thresholds → STAYS active (hysteresis), same star.
+        UniversePosition mid = activePos.Translated(new Vector3D<double>((spawn + despawn) * 0.5 * Ly, 0, 0));
         field.Update(mid, 8);
         mgr.Update(0.0, mid, field);
         Assert.True(mgr.HasActive);

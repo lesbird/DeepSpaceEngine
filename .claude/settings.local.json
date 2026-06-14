@@ -11,7 +11,10 @@
       "Bash(git add *)",
       "Bash(git commit -q -m ' *)",
       "Bash(perl -0pi -e 's/int chec_d = 0;/int count = 0;/; s/chec_d\\\\+\\\\+;/count++;/; s/Assert\\\\.True\\\\\\(chec_d > 0/Assert.True\\(count > 0/' Engine.Core.Tests/RingTests.cs)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(git checkout *)",
+      "Bash(git commit *)",
+      "Bash(grep -n \"class QuadNode\\\\|QuadNode$\\\\|sealed class QuadNode\\\\|public.*WorldSize\\\\|public.*CenterLocal\\\\|public.*Level\\\\|public.*Patch\\\\|public.*Children\\\\|double Radius\\\\|double Amplitude\\\\|public double\" Game.App/PlanetTerrainRenderer.cs Game.Universe/PlanetTerrain.cs)"
     ]
   }
 }

@@ -6,10 +6,10 @@ using Silk.NET.Maths;
 namespace Game.App;
 
 /// <summary>
-/// True 6-DOF free-fly camera. Mouse pitch/yaw and Z/C roll are applied as incremental
+/// True 6-DOF free-fly camera. Mouse pitch/yaw and Q/E roll are applied as incremental
 /// rotations in the camera's LOCAL frame and composed onto the orientation quaternion —
 /// there is no world "up", no pitch clamp, and no pole, so you can rotate freely in any
-/// direction (loop, roll, point straight up) with no gimbal lock. WASD + QE translate.
+/// direction (loop, roll, point straight up) with no gimbal lock. WASD translate.
 ///
 /// Speed has two regimes (see <see cref="SetSpeedContext"/> / <see cref="SpeedPolicy"/>):
 /// <list type="bullet">
@@ -113,8 +113,8 @@ public sealed class FreeFlyController
         _lookDelta = default;
 
         float rollAngle = 0f;
-        if (_keyboard.IsKeyPressed(Key.Z)) rollAngle += RollSpeed * (float)dt;
-        if (_keyboard.IsKeyPressed(Key.C)) rollAngle -= RollSpeed * (float)dt;
+        if (_keyboard.IsKeyPressed(Key.Q)) rollAngle += RollSpeed * (float)dt; // roll left
+        if (_keyboard.IsKeyPressed(Key.E)) rollAngle -= RollSpeed * (float)dt; // roll right
 
         // Increments are about the LOCAL axes (X = right, Y = up, Z = forward); composing on
         // the right (orientation * delta) applies them in the camera's own frame.
@@ -124,14 +124,12 @@ public sealed class FreeFlyController
             Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitZ, rollAngle);
         _camera.Orientation = Quaternion<float>.Normalize(_camera.Orientation * delta);
 
-        // --- Translation from WASD/QE in camera-local space ---
+        // --- Translation from WASD in camera-local space ---
         var move = Vector3D<float>.Zero;
         if (_keyboard.IsKeyPressed(Key.W)) move.Z -= 1f;
         if (_keyboard.IsKeyPressed(Key.S)) move.Z += 1f;
         if (_keyboard.IsKeyPressed(Key.A)) move.X -= 1f;
         if (_keyboard.IsKeyPressed(Key.D)) move.X += 1f;
-        if (_keyboard.IsKeyPressed(Key.E)) move.Y += 1f;
-        if (_keyboard.IsKeyPressed(Key.Q)) move.Y -= 1f;
 
         if (move != Vector3D<float>.Zero)
         {

@@ -318,9 +318,9 @@ internal static class Program
             ImGui.Text($"Nearest star: {s.ClassLetter}  #{s.Id:X}");
             ImGui.Text($"  {s.Temperature:0} K   lum {s.Luminosity:0.00} Lsun");
             ImGui.Text($"  Distance: {nLy:0.0000} ly");
-            if (nLy < 0.5)
+            if (nLy < _systemManager.SpawnLightYears)
                 ImGui.TextColored(new System.Numerics.Vector4(0.4f, 1f, 0.5f, 1f),
-                    "  >> within 0.5 ly (solar system range)");
+                    $"  >> within {_systemManager.SpawnLightYears:0.###} ly (solar system range)");
         }
         else
         {
@@ -367,14 +367,14 @@ internal static class Program
         }
         else
         {
-            ImGui.Text("System: none (fly within 0.5 ly of a star)");
+            ImGui.Text($"System: none (fly within {_systemManager.SpawnLightYears:0.###} ly of a star)");
         }
 
         ImGui.Separator();
         ImGui.Text(_mouseCaptured ? "Mouse: captured (Tab to release)" : "Mouse: free (Tab to capture)");
         ImGui.Text(_driving
             ? "DRIVE: W/S throttle | A/D steer | Space brake | R exit | Esc quit"
-            : "WASD move | Q/E down/up | Z/C roll | wheel speed/throttle | R drive | Esc quit");
+            : "WASD move | Q/E roll | wheel speed/throttle | R drive | Esc quit");
         ImGui.End();
     }
 

@@ -159,6 +159,7 @@ void main() {
 
         Matrix4X4<float> proj = FitProjection(camera);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
+        ExtractFrustum(viewProj);
 
         _gl.Enable(EnableCap.DepthTest);
         _gl.DepthMask(true);
@@ -198,11 +199,20 @@ void main() {
     private void Process(QuadNode node, Camera camera, in Matrix4X4<float> viewProj, ref int budget)
     {
         UniversePosition center = _planet!.CurrentPosition.Translated(node.CenterLocal);
+
+        // Visibility cull: a node outside the view frustum or beyond the planet's horizon can't be
+        // seen. We skip drawing it and skip refining its subtree (so the per-frame budget goes to
+        // detail the camera can actually see — the bulk of the work when hugging the surface), but
+        // still let the distance-based merge below collapse it, so off-screen detail doesn't leak.
+        Vector3D<float> rel = center.ToCameraRelative(camera.Position);
+        float boundR = (float)(node.WorldSize * 0.75 + _terrain!.Amplitude + 50.0);
+        bool visible = IsNodeVisible(node, rel, boundR, camera);
+
         double dist = camera.Position.DistanceTo(center);
         if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
 
         double splitDist = LodFactor * node.WorldSize;
-        bool wantSplit = node.Level < MaxLevel && dist < splitDist;
+        bool wantSplit = visible && node.Level < MaxLevel && dist < splitDist;
 
         if (wantSplit && budget > 0)
         {
@@ -231,18 +241,19 @@ void main() {
             DisposeChildren(node); // merged back up (with hysteresis so we don't thrash at the line)
         }
 
+        if (!visible) return; // off-screen: kept cached (instant when it swings back) but not drawn
+
         // Geomorph factor: 0 just after this node stops subdividing (full detail), ramping to 1 as
         // it nears its parent's split distance (2× its own), where it equals the parent's surface —
         // so the eventual merge is seamless.
         float morph = (float)Smoothstep(splitDist, 2.0 * splitDist, dist);
-        RenderPatch(node, center, camera, viewProj, morph);
+        RenderPatch(node, rel, in viewProj, morph);
         LeafCount++;
     }
 
-    private void RenderPatch(QuadNode node, in UniversePosition center, Camera camera, in Matrix4X4<float> viewProj, float morph)
+    private void RenderPatch(QuadNode node, Vector3D<float> rel, in Matrix4X4<float> viewProj, float morph)
     {
         if (node.Patch == null) return;
-        Vector3D<float> rel = center.ToCameraRelative(camera.Position);
         Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
         _shader.SetMatrix("uMVP", model * viewProj);
         _shader.SetFloat("uMorph", morph);
@@ -254,6 +265,52 @@ void main() {
     {
         double t = Math.Clamp((x - lo) / (hi - lo), 0.0, 1.0);
         return t * t * (3.0 - 2.0 * t);
+    }
+
+    // --- visibility culling ---
+
+    private readonly Vector4D<float>[] _frustum = new Vector4D<float>[6];
+
+    /// <summary>Gribb–Hartmann frustum planes from the (camera-relative) view-projection. Column j
+    /// of the row-vector matrix yields clip coordinate j, so each plane is columns 4±j. Stored
+    /// normalized so the plane equation gives a true signed distance for the sphere test.</summary>
+    private void ExtractFrustum(in Matrix4X4<float> m)
+    {
+        _frustum[0] = NormPlane(m.M11 + m.M14, m.M21 + m.M24, m.M31 + m.M34, m.M41 + m.M44); // left
+        _frustum[1] = NormPlane(m.M14 - m.M11, m.M24 - m.M21, m.M34 - m.M31, m.M44 - m.M41); // right
+        _frustum[2] = NormPlane(m.M12 + m.M14, m.M22 + m.M24, m.M32 + m.M34, m.M42 + m.M44); // bottom
+        _frustum[3] = NormPlane(m.M14 - m.M12, m.M24 - m.M22, m.M34 - m.M32, m.M44 - m.M42); // top
+        _frustum[4] = NormPlane(m.M13 + m.M14, m.M23 + m.M24, m.M33 + m.M34, m.M43 + m.M44); // near
+        _frustum[5] = NormPlane(m.M14 - m.M13, m.M24 - m.M23, m.M34 - m.M33, m.M44 - m.M43); // far
+    }
+
+    private static Vector4D<float> NormPlane(float a, float b, float c, float d)
+    {
+        float inv = 1f / MathF.Sqrt(a * a + b * b + c * c);
+        return new Vector4D<float>(a * inv, b * inv, c * inv, d * inv);
+    }
+
+    /// <summary>True unless the node's bounding sphere is wholly outside the frustum, or its whole
+    /// extent lies beyond the planet's curved horizon.</summary>
+    private bool IsNodeVisible(QuadNode node, Vector3D<float> rel, float boundR, Camera camera)
+    {
+        foreach (Vector4D<float> p in _frustum)
+            if (p.X * rel.X + p.Y * rel.Y + p.Z * rel.Z + p.W < -boundR)
+                return false;
+
+        // Horizon cull: a point at angle a from the sub-camera point is hidden once a exceeds the
+        // horizon angle. Pad by the patch's angular half-size and a height allowance so mountains
+        // poking over the limb (and partially-visible patches) are never wrongly culled.
+        double R = _terrain!.Radius;
+        Vector3D<double> camVec = camera.Position.DeltaMeters(_planet!.CurrentPosition); // centre → camera
+        double Dc = camVec.Length;
+        if (Dc <= R) return true; // at/under the surface — nothing is over the horizon
+        double cosA = Vector3D.Dot(Vector3D.Normalize(node.CenterLocal), Vector3D.Normalize(camVec));
+        double a = Math.Acos(Math.Clamp(cosA, -1.0, 1.0));
+        double aHorizon = Math.Acos(Math.Clamp(R / Dc, -1.0, 1.0));
+        double patchAng = node.WorldSize * 0.75 / R;
+        double heightAng = Math.Sqrt(2.0 * Math.Max(0.0, _terrain.Amplitude) / R);
+        return a <= aHorizon + patchAng + heightAng + 0.01;
     }
 
     // --- quadtree ---
@@ -443,29 +500,13 @@ void main() {
             EmitW(i, j); EmitW(i + 1, j + 1); EmitW(i, j + 1);
         }
 
-        // Downward skirts along submerged patch edges hide the arc-vs-chord gap at LOD seams,
-        // just like the terrain skirts (water has no detail of its own to crack, but the flat
-        // surface still steps between levels).
-        double skirt = node.WorldSize * 0.08 + 100.0;
-        void EmitWVert(Vector3D<double> p, Vector3D<double> nrm, int hi, int hj)
-        {
-            float f = (float)Math.Clamp((seaLevel - hgt[hi, hj]) / (amp * 0.12 + 1.0), 0f, 1f);
-            Vector3D<float> c = shallow + (deep - shallow) * f;
-            w.Add((float)(p.X - centerLocal.X)); w.Add((float)(p.Y - centerLocal.Y)); w.Add((float)(p.Z - centerLocal.Z));
-            w.Add((float)nrm.X); w.Add((float)nrm.Y); w.Add((float)nrm.Z);
-            w.Add(c.X); w.Add(c.Y); w.Add(c.Z);
-        }
-        void Seg(int ia, int ja, int ib, int jb)
-        {
-            if (hgt[ia, ja] >= seaLevel || hgt[ib, jb] >= seaLevel) return; // only under water
-            Vector3D<double> ta = dir[ia, ja] * waterR, tb = dir[ib, jb] * waterR;
-            Vector3D<double> ba = dir[ia, ja] * (waterR - skirt), bb = dir[ib, jb] * (waterR - skirt);
-            EmitWVert(ta, dir[ia, ja], ia, ja); EmitWVert(tb, dir[ib, jb], ib, jb); EmitWVert(bb, dir[ib, jb], ib, jb);
-            EmitWVert(ta, dir[ia, ja], ia, ja); EmitWVert(bb, dir[ib, jb], ib, jb); EmitWVert(ba, dir[ia, ja], ia, ja);
-        }
-        for (int j = 0; j < n; j++) { Seg(0, j, 0, j + 1); Seg(n, j, n, j + 1); }
-        for (int i = 0; i < n; i++) { Seg(i, 0, i + 1, 0); Seg(i, n, i + 1, n); }
-
+        // NOTE: no water skirts. The ocean pass is translucent and writes no depth, so a downward
+        // skirt at every patch edge blends as pure overdraw — and because same-level neighbours
+        // share their edge vertices (the flat surface is already watertight there), those skirts
+        // only darkened the seams, painting a visible grid over the whole sea. Same-level edges
+        // need no skirt; at the rarer LOD-level seams the opaque sea floor / land skirts drawn
+        // behind (with depth) fill any arc-vs-chord gap, so the worst case is a faint line at a
+        // level change rather than a grid on every edge.
         return w.ToArray();
     }
 
