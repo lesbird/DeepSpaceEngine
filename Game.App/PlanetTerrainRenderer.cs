@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Engine.Core;
 using Engine.Rendering;
 using Game.Universe;
@@ -20,7 +21,10 @@ public sealed class PlanetTerrainRenderer : IDisposable
     private const int MaxLevel = 22;       // deepest subdivision (≈ sub-metre on an Earth-sized world)
     private const double LodFactor = 2.5;  // split when distance < LodFactor × patch size
     private const double MergeHysteresis = 1.3; // keep children cached until 1.3× the split distance (anti-thrash)
-    private const int GenBudgetPerFrame = 8;
+    // The expensive part of a patch — sampling the height field and building its vertex arrays — runs
+    // on a background worker pool (see WorkerLoop). Only the cheap GPU upload happens on the render
+    // thread, capped at this many finished patches per frame so a burst of bakes can't stall a frame.
+    private const int UploadsPerFrame = 8;
     private const int LandFloatsPerVertex = 15; // finePos(3) + coarsePos(3) + fineNrm(3) + coarseNrm(3) + color(3)
 
     // Geomorphing: each vertex carries both a FINE position/normal (this patch's resolution) and a
@@ -97,6 +101,16 @@ void main() {
     private readonly Shader _waterShader;
     private readonly List<(TerrainPatch patch, Vector3D<float> rel)> _waterFrame = new();
 
+    // Background patch baking. Worker threads pull jobs, sample the (immutable) height field and build
+    // the vertex arrays — all pure CPU work with no GL calls — then post the float arrays back here.
+    // The render thread drains finished arrays and does the actual GPU upload (the only part that must
+    // touch the single-threaded GL context). _epoch is bumped whenever the terrain target changes so
+    // bakes still in flight for the old planet are discarded instead of uploaded against a stale tree.
+    private readonly BlockingCollection<BuildJob> _jobQueue = new();
+    private readonly ConcurrentQueue<BuildResult> _ready = new();
+    private readonly Task[] _workers;
+    private int _epoch;
+
     private CelestialBody? _body;
     private PlanetTerrain? _terrain;
     private QuadNode[]? _roots;
@@ -117,6 +131,48 @@ void main() {
         _gl = gl;
         _shader = new Shader(gl, VertexSource, FragmentSource);
         _waterShader = new Shader(gl, WaterVertexSource, WaterFragmentSource);
+
+        // Leave a core for the render/main thread; the rest bake patches. At least one worker always.
+        int workerCount = Math.Max(1, Environment.ProcessorCount - 1);
+        _workers = new Task[workerCount];
+        for (int i = 0; i < workerCount; i++)
+            _workers[i] = Task.Run(WorkerLoop);
+    }
+
+    /// <summary>Background bake loop: build a patch's vertex arrays off the render thread. Jobs whose
+    /// epoch no longer matches (the terrain target changed) are dropped — the result is also re-checked
+    /// on the render thread before any GPU upload, so a stale bake can never reach a swapped-out tree.</summary>
+    private void WorkerLoop()
+    {
+        foreach (BuildJob job in _jobQueue.GetConsumingEnumerable())
+        {
+            if (job.Epoch != Volatile.Read(ref _epoch)) continue;
+            (float[] land, float[] water) = BuildPatchVertices(job.Node, job.Terrain);
+            _ready.Enqueue(new BuildResult(job.Epoch, job.Node, land, water));
+        }
+    }
+
+    /// <summary>Queue a node to be baked on a worker. Called once per node (guarded by GenPending).</summary>
+    private void RequestGenerate(QuadNode node)
+    {
+        node.GenPending = true;
+        _jobQueue.Add(new BuildJob(_epoch, node, _terrain!));
+    }
+
+    /// <summary>Upload finished bakes to the GPU (render thread only). Stale results — for a swapped
+    /// terrain (epoch) or a node merged away while baking (Disposed) — are dropped rather than uploaded,
+    /// so no orphaned GPU buffer leaks. Bounded per frame so a backlog can't stall one.</summary>
+    private void DrainReadyPatches()
+    {
+        int uploads = 0;
+        while (uploads < UploadsPerFrame && _ready.TryDequeue(out BuildResult r))
+        {
+            if (r.Epoch != _epoch || r.Node.Disposed || !r.Node.GenPending) continue;
+            r.Node.Patch = new TerrainPatch(_gl, r.Land, r.Water);
+            r.Node.GenPending = false;
+            PatchCount++;
+            uploads++;
+        }
     }
 
     /// <summary>Switch the terrain target (null = none). No-op if it's already this body.</summary>
@@ -132,7 +188,7 @@ void main() {
         for (int f = 0; f < 6; f++)
         {
             _roots[f] = MakeNode(f, 0, 0, 0, 1, 1);
-            _roots[f].Patch = Generate(_roots[f]); // roots eager so render never has a hole
+            _roots[f].Patch = GenerateSync(_roots[f]); // roots eager so render never has a hole
         }
     }
 
@@ -149,7 +205,7 @@ void main() {
         for (int f = 0; f < 6; f++)
         {
             _roots[f] = MakeNode(f, 0, 0, 0, 1, 1);
-            _roots[f].Patch = Generate(_roots[f]);
+            _roots[f].Patch = GenerateSync(_roots[f]);
         }
     }
 
@@ -166,11 +222,11 @@ void main() {
         _shader.Use();
         _shader.SetVector3("uSunDir", sunDir);
 
-        int budget = GenBudgetPerFrame;
+        DrainReadyPatches(); // upload any patches baked since last frame before we traverse
         LeafCount = 0;
         _waterFrame.Clear();
         foreach (QuadNode root in _roots)
-            Process(root, camera, viewProj, ref budget);
+            Process(root, camera, viewProj);
 
         // Translucent ocean pass over the opaque sea floor. Depth-tested (so land/terrain in
         // front occludes it) but not depth-writing (so it blends and the atmosphere reads behind it).
@@ -196,7 +252,7 @@ void main() {
         _gl.Disable(EnableCap.DepthTest);
     }
 
-    private void Process(QuadNode node, Camera camera, in Matrix4X4<float> viewProj, ref int budget)
+    private void Process(QuadNode node, Camera camera, in Matrix4X4<float> viewProj)
     {
         UniversePosition center = _body!.CurrentPosition.Translated(node.CenterLocal);
 
@@ -214,27 +270,29 @@ void main() {
         double splitDist = LodFactor * node.WorldSize;
         bool wantSplit = visible && node.Level < MaxLevel && dist < splitDist;
 
-        if (wantSplit && budget > 0)
+        if (wantSplit)
         {
             node.Children ??= Split(node);
 
+            // Request a background bake for any child not yet baked (once — GenPending guards repeats).
+            // We only descend once all four are ready; until then this node draws as the coarse stand-in.
             bool allReady = true;
             foreach (QuadNode c in node.Children)
             {
                 if (c.Patch == null)
                 {
-                    if (budget > 0) { c.Patch = Generate(c); budget--; }
-                    else allReady = false;
+                    allReady = false;
+                    if (!c.GenPending) RequestGenerate(c);
                 }
             }
 
             if (allReady)
             {
                 foreach (QuadNode c in node.Children)
-                    Process(c, camera, viewProj, ref budget);
+                    Process(c, camera, viewProj);
                 return;
             }
-            // Children not all ready this frame — draw this node, refine next frame.
+            // Children still baking — draw this node, refine once they upload.
         }
         else if (node.Children != null && dist > splitDist * MergeHysteresis)
         {
@@ -342,17 +400,21 @@ void main() {
 
     // --- patch mesh generation (CPU) ---
 
-    private TerrainPatch Generate(QuadNode node)
+    /// <summary>Bake and upload a patch on the calling (render) thread. Used only for the 6 roots,
+    /// which must exist before the first frame; all other patches bake on the worker pool.</summary>
+    private TerrainPatch GenerateSync(QuadNode node)
     {
-        (float[] land, float[] water) = BuildPatchVertices(node);
+        (float[] land, float[] water) = BuildPatchVertices(node, _terrain!);
         PatchCount++;
         return new TerrainPatch(_gl, land, water);
     }
 
-    private (float[] land, float[] water) BuildPatchVertices(QuadNode node)
+    // Static + terrain-by-parameter: this runs on worker threads, so it must touch no mutable renderer
+    // state. PlanetTerrain.HeightAt and Noise are immutable pure reads, safe to call from many threads.
+    private static (float[] land, float[] water) BuildPatchVertices(QuadNode node, PlanetTerrain terrain)
     {
         int n = GridN;
-        double radius = _terrain!.Radius;
+        double radius = terrain.Radius;
         Vector3D<double> centerLocal = node.CenterLocal;
 
         // Two band-limits per patch for geomorphing: the patch's own fine spacing, and the COARSE
@@ -379,9 +441,9 @@ void main() {
             double u = node.U0 + (node.U1 - node.U0) * (gi / (double)n);
             double v = node.V0 + (node.V1 - node.V0) * (gj / (double)n);
             Vector3D<double> d = FacePoint(node.Face, u, v);
-            double hF = _terrain.HeightAt(d, spacing);
+            double hF = terrain.HeightAt(d, spacing);
             Vector3D<double> pF = d * (radius + hF);
-            Vector3D<double> pC = d * (radius + _terrain.HeightAt(d, coarseSpacing));
+            Vector3D<double> pC = d * (radius + terrain.HeightAt(d, coarseSpacing));
             exF[gi + 1, gj + 1] = pF;
             exC[gi + 1, gj + 1] = pC;
             if (gi >= 0 && gi <= n && gj >= 0 && gj <= n)
@@ -405,7 +467,7 @@ void main() {
 
             // Slope = cos(angle from vertical): 1 on flats, → 0 on cliffs. Drives rock vs snow.
             double slope = Vector3D.Dot(nrmF[i, j], outward);
-            col[i, j] = _terrain.ColorAt(hgt[i, j], slope);
+            col[i, j] = terrain.ColorAt(hgt[i, j], slope);
         }
 
         var v3 = new List<float>((n * n * 6 + n * 16) * LandFloatsPerVertex);
@@ -444,7 +506,7 @@ void main() {
         for (int j = 0; j < n; j++) { SkirtQuad(0, j, 0, j + 1); SkirtQuad(n, j + 1, n, j); }
         for (int i = 0; i < n; i++) { SkirtQuad(i + 1, 0, i, 0); SkirtQuad(i, n, i + 1, n); }
 
-        return (v3.ToArray(), BuildWaterVertices(node, dir, hgt, centerLocal, radius));
+        return (v3.ToArray(), BuildWaterVertices(node, terrain, dir, hgt, centerLocal, radius));
     }
 
     /// <summary>Outward-oriented vertex normal from a centred difference on the extended position
@@ -465,14 +527,14 @@ void main() {
     /// coastline is simply where the rugged terrain pierces this flat surface. Returns an empty
     /// array for dry worlds / fully-dry patches.
     /// </summary>
-    private float[] BuildWaterVertices(QuadNode node, Vector3D<double>[,] dir, double[,] hgt,
+    private static float[] BuildWaterVertices(QuadNode node, PlanetTerrain terrain, Vector3D<double>[,] dir, double[,] hgt,
         Vector3D<double> centerLocal, double radius)
     {
-        if (_terrain is not { HasOcean: true }) return Array.Empty<float>();
+        if (terrain is not { HasOcean: true }) return Array.Empty<float>();
 
         int n = GridN;
-        double seaLevel = _terrain.SeaLevelMeters;
-        double amp = _terrain.Amplitude;
+        double seaLevel = terrain.SeaLevelMeters;
+        double amp = terrain.Amplitude;
         // Sit the water a touch below sea level so the shoreline doesn't z-fight the land.
         double waterR = radius + seaLevel - (node.WorldSize * 0.0004 + 0.3);
         var shallow = new Vector3D<float>(0.20f, 0.55f, 0.62f);
@@ -563,12 +625,16 @@ void main() {
 
     private void DisposeNode(QuadNode node)
     {
+        // Mark first so a bake still in flight for this node is dropped (not uploaded) when it lands.
+        node.Disposed = true;
         if (node.Children != null) { foreach (QuadNode c in node.Children) DisposeNode(c); node.Children = null; }
         if (node.Patch != null) { node.Patch.Dispose(_gl); node.Patch = null; PatchCount--; }
     }
 
     private void DisposeTree()
     {
+        // New epoch: in-flight bakes for the outgoing tree are now stale and will be discarded.
+        Interlocked.Increment(ref _epoch);
         if (_roots == null) return;
         foreach (QuadNode r in _roots) DisposeNode(r);
         _roots = null;
@@ -577,6 +643,9 @@ void main() {
 
     public void Dispose()
     {
+        _jobQueue.CompleteAdding();
+        try { Task.WaitAll(_workers); } catch { /* a faulted worker must not block teardown */ }
+        _jobQueue.Dispose();
         DisposeTree();
         _shader.Dispose();
         _waterShader.Dispose();
@@ -590,7 +659,13 @@ void main() {
         public double WorldSize;
         public TerrainPatch? Patch;
         public QuadNode[]? Children;
+        public bool GenPending; // a background bake for this node is queued or running
+        public bool Disposed;   // node removed from the tree — discard any bake that lands afterwards
     }
+
+    // Geometry-only inputs handed to a worker (immutable once created), and the float arrays it returns.
+    private readonly record struct BuildJob(int Epoch, QuadNode Node, PlanetTerrain Terrain);
+    private readonly record struct BuildResult(int Epoch, QuadNode Node, float[] Land, float[] Water);
 
     private sealed class TerrainPatch
     {
