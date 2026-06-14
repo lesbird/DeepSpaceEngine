@@ -1,4 +1,4 @@
-# MetalEngine3
+# DeepSpaceEngine
 
 A C# / OpenGL space-exploration engine built for **true-scale distances** — billions of
 procedurally-generated star systems, light-years apart, with seamless transitions from

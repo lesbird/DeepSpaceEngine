@@ -119,6 +119,10 @@ void main() {
     public int PatchCount { get; private set; }
     public CelestialBody? Active => _body;
 
+    /// <summary>Max relief (metres) of the active terrain — how far below the base radius a valley can
+    /// sit. The atmosphere uses this to drop its ground/clip radius so low terrain still gets hazed.</summary>
+    public double ActiveAmplitude => _terrain?.Amplitude ?? 0.0;
+
     /// <summary>
     /// Optional extra LOD focus (e.g. the rover) — patches refine toward whichever is closer, the
     /// camera or this point, so the ground directly under the vehicle stays at fine vertex spacing

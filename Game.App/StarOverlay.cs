@@ -32,6 +32,7 @@ public sealed class StarOverlay
         if (vp.X < 2 || vp.Y < 2) return;
 
         var dl = ImGui.GetForegroundDrawList();
+        DrawCenterReticle(dl, vp);
         Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
         var invOrientation = Quaternion<float>.Inverse(camera.Orientation);
         UniversePosition cam = camera.Position;
@@ -193,6 +194,21 @@ public sealed class StarOverlay
     }
 
     // --- helpers ---
+
+    /// <summary>A fixed aiming reticle at the centre of the screen: line a star or planet up inside
+    /// it and thrust forward to fly straight at it. A gap is left in the middle so the crosshair never
+    /// hides the tiny disc of a distant target you're trying to centre.</summary>
+    private static void DrawCenterReticle(ImDrawListPtr dl, Vector2 vp)
+    {
+        Vector2 c = vp * 0.5f;
+        uint col = Col(140, 235, 180, 200); // soft green, semi-transparent, matching the nav highlights
+        const float gap = 6f, len = 12f, thick = 1.5f;
+        dl.AddLine(c - new Vector2(0, gap), c - new Vector2(0, gap + len), col, thick); // up tick
+        dl.AddLine(c + new Vector2(0, gap), c + new Vector2(0, gap + len), col, thick); // down tick
+        dl.AddLine(c - new Vector2(gap, 0), c - new Vector2(gap + len, 0), col, thick); // left tick
+        dl.AddLine(c + new Vector2(gap, 0), c + new Vector2(gap + len, 0), col, thick); // right tick
+        dl.AddCircleFilled(c, 1.5f, col, 6);                                            // centre dot
+    }
 
     private static bool Project(Vector3D<float> p, in Matrix4X4<float> m, Vector2 vp, out Vector2 screen)
     {

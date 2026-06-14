@@ -23,12 +23,21 @@ public sealed class GameWindow : IDisposable
     public event Action<double>? Render;
     public event Action<Vector2D<int>>? Resize;
 
-    public GameWindow(string title, int width, int height)
+    public GameWindow(string title, int width, int height, bool fullscreen = false)
     {
         var options = WindowOptions.Default;
         options.Title = title;
         options.Size = new Vector2D<int>(width, height);
         options.VSync = true;
+        if (fullscreen)
+        {
+            // Borderless/exclusive fullscreen at the requested resolution. GLFW selects the closest
+            // video mode the display supports; the viewport and offscreen buffer follow the actual
+            // framebuffer size reported on load/resize, so a different native size still renders right
+            // (on a macOS Retina display the framebuffer comes back in native pixels).
+            options.WindowState = WindowState.Fullscreen;
+            options.VideoMode = new VideoMode(new Vector2D<int>(width, height));
+        }
         // 4.1 core + forward-compatible is mandatory for modern GL on macOS.
         options.API = new GraphicsAPI(
             ContextAPI.OpenGL,

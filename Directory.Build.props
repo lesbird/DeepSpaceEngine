@@ -1,6 +1,6 @@
 <Project>
   <!--
-    Shared MSBuild settings for all projects in MetalEngine3.
+    Shared MSBuild settings for all projects in DeepSpaceEngine.
 
     NOTE ON TARGET FRAMEWORK: We target net7.0 because that is the newest SDK
     installed on this machine. The plan calls for net8.0 (LTS); moving up is a

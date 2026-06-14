@@ -144,6 +144,12 @@ public static class SystemGenerator
         return c * 0.6f + grey * 0.4f;
     }
 
+    /// <summary>Multiplies every generated atmosphere shell's thickness — a pure visual-size knob.
+    /// Because the renderer derives the scattering coefficient as optical-depth ÷ scale-height, a
+    /// taller shell stays the same vertical optical depth (a bigger halo, not a denser haze). Applied
+    /// after the RNG draws, so it never perturbs the deterministic generation stream.</summary>
+    private const float AtmosphereShellScale = 2.0f;
+
     /// <summary>Most moons are airless. Only the larger ones have a chance at a thin atmosphere
     /// (think Titan), scaling with size and capped well below a planet's.</summary>
     private static void AssignMoonAtmosphere(ref DeterministicRng rng, Moon m)
@@ -153,7 +159,7 @@ public static class SystemGenerator
         {
             m.HasAtmosphere = true;
             m.AtmosphereColor = new Vector3D<float>(0.35f, 0.55f, 1.0f);
-            m.AtmosphereHeight = (float)rng.Range(0.020, 0.030);
+            m.AtmosphereHeight = (float)rng.Range(0.020, 0.030) * AtmosphereShellScale;
             m.AtmosphereDensity = (float)rng.Range(0.9, 1.2);
             return;
         }
@@ -170,7 +176,7 @@ public static class SystemGenerator
             PlanetType.Ice => new Vector3D<float>(0.70f, 0.80f, 0.92f),
             _ => new Vector3D<float>(0.62f, 0.66f, 0.74f), // rocky: a pale Titan-like haze
         };
-        m.AtmosphereHeight = (float)rng.Range(0.012, 0.022); // thinner shell than a planet's
+        m.AtmosphereHeight = (float)rng.Range(0.012, 0.022) * AtmosphereShellScale; // thinner shell than a planet's
         m.AtmosphereDensity = (float)rng.Range(0.4, 0.8);
     }
 
@@ -229,7 +235,7 @@ public static class SystemGenerator
                 p.HasAtmosphere = true; p.AtmosphereColor = new Vector3D<float>(0.45f, 0.65f, 0.92f);
                 p.AtmosphereHeight = 0.050f; p.AtmosphereDensity = 1.4f; break;
         }
-        p.AtmosphereHeight *= jitterH;
+        p.AtmosphereHeight *= jitterH * AtmosphereShellScale;
         p.AtmosphereDensity *= jitterD;
     }
 

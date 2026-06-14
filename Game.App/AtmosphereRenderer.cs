@@ -59,7 +59,8 @@ uniform vec3  uForward, uRight, uUp;  // camera basis in render space
 uniform float uTanHalfFov, uAspect;
 uniform vec3  uPlanet;                // planet centre, camera-relative (m)
 uniform vec3  uSunDir;                // normalized, planet -> sun
-uniform float uRp, uRa;               // planet & atmosphere-top radius (m)
+uniform float uRp, uRa;               // planet (mean-surface, for density) & atmosphere-top radius
+uniform float uRg;                    // ground/clip radius = lowest terrain (≤ uRp); march reaches here
 uniform vec3  uBetaR;                 // Rayleigh scattering coeff per channel (1/m)
 uniform float uBetaM;                 // Mie scattering coeff (1/m)
 uniform float uHr, uHm;               // Rayleigh / Mie scale heights (m)
@@ -102,9 +103,12 @@ void main() {
     float tStart = max(a0, 0.0);
     float tEnd = a1;
 
-    // Stop the march at the planet body if the ray hits it (the surface occludes the far sky).
+    // Stop the march at the planet body if the ray hits it (the surface occludes the far sky). Clip
+    // against the LOWEST terrain (uRg), not the mean surface — otherwise the march halts at the base
+    // radius and terrain sitting in valleys below it gets no scattering (a dark, un-hazed band). The
+    // depth clip below stops the march at the real surface where terrain is actually drawn.
     float p0, p1;
-    bool planetHit = raySphere(ro, rd, uPlanet, uRp, p0, p1) && p0 > 0.0;
+    bool planetHit = raySphere(ro, rd, uPlanet, uRg, p0, p1) && p0 > 0.0;
     if (planetHit) tEnd = min(tEnd, p0);
 
     // Clamp the march to the ACTUAL rendered geometry (terrain relief, bodies) via the scene
@@ -141,15 +145,18 @@ void main() {
     float odR = 0.0, odM = 0.0; // optical depth accumulated along the view ray
     for (int i = 0; i < PRIMARY; i++) {
         vec3 P = ro + rd * (tStart + seg * (float(i) + 0.5));
-        float h = length(P - uPlanet) - uRp;
-        if (h < 0.0) continue;
+        float r = length(P - uPlanet);
+        if (r < uRg) continue;          // below the lowest terrain — genuinely underground
+        // Density is referenced to the MEAN surface (uRp); valleys (uRg..uRp) clamp to ground density
+        // rather than skipping, so terrain below the base radius is still bathed in atmosphere.
+        float h = max(r - uRp, 0.0);
         float hr = exp(-h / uHr) * seg;
         float hm = exp(-h / uHm) * seg;
         odR += hr; odM += hm;
 
         // Light ray from this sample toward the sun. Skip if the planet shadows it (terminator).
         float ps0, ps1;
-        if (raySphere(P, uSunDir, uPlanet, uRp, ps0, ps1) && ps1 > 0.0 && ps0 > 0.0) continue;
+        if (raySphere(P, uSunDir, uPlanet, uRg, ps0, ps1) && ps1 > 0.0 && ps0 > 0.0) continue;
 
         float l0, l1;
         raySphere(P, uSunDir, uPlanet, uRa, l0, l1);
@@ -157,8 +164,9 @@ void main() {
         float lodR = 0.0, lodM = 0.0;
         bool ground = false;
         for (int j = 0; j < LIGHT; j++) {
-            float hl = length(P + uSunDir * (lseg * (float(j) + 0.5)) - uPlanet) - uRp;
-            if (hl < 0.0) { ground = true; break; }
+            float rl = length(P + uSunDir * (lseg * (float(j) + 0.5)) - uPlanet);
+            if (rl < uRg) { ground = true; break; } // light ray dips below the lowest terrain
+            float hl = max(rl - uRp, 0.0);
             lodR += exp(-hl / uHr) * lseg;
             lodM += exp(-hl / uHm) * lseg;
         }
@@ -189,6 +197,11 @@ void main() {
     private uint _depthTexture;
     private float _depthNear = 1f, _depthFar = 1f;
 
+    // The body the camera is landed on, and its terrain relief (m). Only this body drops its ground
+    // radius so low terrain gets hazed; distant bodies stay smooth spheres at their base radius.
+    private CelestialBody? _groundBody;
+    private double _groundAmplitude;
+
     public AtmosphereRenderer(GL gl)
     {
         _gl = gl;
@@ -202,12 +215,15 @@ void main() {
     /// screen; <paramref name="depthTexture"/> is that buffer's depth, and <paramref name="near"/>/
     /// <paramref name="far"/> are the projection planes that wrote it (the dominant geometry's).
     /// </summary>
-    public void Render(Camera camera, SolarSystem system, uint depthTexture, float near, float far)
+    public void Render(Camera camera, SolarSystem system, uint depthTexture, float near, float far,
+        CelestialBody? groundBody = null, double groundAmplitudeMeters = 0.0)
     {
         if (!Enabled || system.Planets.Length == 0) return;
         _depthTexture = depthTexture;
         _depthNear = near;
         _depthFar = far;
+        _groundBody = groundBody;
+        _groundAmplitude = groundAmplitudeMeters;
         UniversePosition cam = camera.Position;
         Vector3D<float> sunRel = system.Sun.Position.ToCameraRelative(cam);
 
@@ -285,8 +301,15 @@ void main() {
 
         _shader.SetVector3("uPlanet", planetScaled);
         _shader.SetVector3("uSunDir", sunDir);
+        // Ground/clip radius: for the body we're landed on, drop it by the terrain relief so valleys
+        // below the base radius still get scattering; other bodies stay smooth spheres (uRg = uRp).
+        float groundFrac = ReferenceEquals(p, _groundBody) && _groundAmplitude > 0.0
+            ? (float)Math.Clamp(_groundAmplitude / rp, 0.0, 0.5)
+            : 0.0f;
+
         _shader.SetFloat("uRpMeters", (float)rp);
         _shader.SetFloat("uRp", 1.0f);
+        _shader.SetFloat("uRg", 1.0f - groundFrac);
         _shader.SetFloat("uRa", 1.0f + height);
         _shader.SetVector3("uBetaR", betaR);
         _shader.SetFloat("uBetaM", betaM);

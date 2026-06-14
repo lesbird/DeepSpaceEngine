@@ -123,7 +123,7 @@ and draw as points.
 ## Project structure (.NET solution)
 
 ```
-MetalEngine3.sln
+DeepSpaceEngine.sln
   Engine.Core/        UniversePosition, Vec3d math, time, hashing/noise, input, logging
   Engine.Rendering/   GL abstraction: Shader, Buffer, Texture, Mesh, Material, Camera, passes
   Engine.Platform/    Silk.NET window/context/input bootstrap, main-loop host

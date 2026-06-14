@@ -64,7 +64,7 @@ internal static class Program
     {
         _smoke = Array.IndexOf(args, "--smoke") >= 0;
 
-        _window = new GameWindow("MetalEngine3 — M1: Star Field", 1280, 720);
+        _window = new GameWindow("DeepSpaceEngine", 1920, 1080, fullscreen: true);
         _window.Load += OnLoad;
         _window.Update += OnUpdate;
         _window.Render += OnRender;
@@ -258,6 +258,16 @@ internal static class Program
             Vector3D<float> sunRel = sys.Sun.Position.ToCameraRelative(_camera.Position);
             Vector3D<float> planetRel = _terrainTarget.CurrentPosition.ToCameraRelative(_camera.Position);
             Vector3D<float> sunDir = Vector3D.Normalize(sunRel - planetRel);
+
+            // Reset depth before the terrain pass: the sun/planets/moons SystemRenderer just drew keep
+            // their colour but drop back to the cleared far-depth. They were rendered with the system
+            // projection, but the depth-aware atmosphere linearises the buffer with the TERRAIN near/far
+            // when landed — reading those system-depths directly would mis-place a sky body (e.g. a moon
+            // overhead) right at the atmosphere shell and clip the haze off it. Clearing here makes the
+            // atmosphere treat them as background and draw the full air column over them (correct haze),
+            // while the terrain writes fresh, correctly-linearisable depth. Their depth was only needed
+            // to self-occlude during their own pass; when landed they never sit in front of the terrain.
+            _gl.Clear((uint)ClearBufferMask.DepthBufferBit);
             _terrainRenderer.Render(_camera, sunDir);
 
             // Rover over the terrain it just drew — same near/far so it shares the depth buffer and
@@ -274,7 +284,8 @@ internal static class Program
         {
             float near = _terrainTarget != null ? _terrainRenderer.LastNear : _systemRenderer.LastNear;
             float far = _terrainTarget != null ? _terrainRenderer.LastFar : _systemRenderer.LastFar;
-            _atmosphereRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far);
+            _atmosphereRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
+                _terrainTarget, _terrainRenderer.ActiveAmplitude);
         }
 
         _overlay.Draw(_camera, _starField, _systemManager);
