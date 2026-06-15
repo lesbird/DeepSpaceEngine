@@ -31,6 +31,43 @@ public class TerrainTests
     }
 
     [Fact]
+    public void ValueD_GradientMatchesFiniteDifference()
+    {
+        var n = new Noise(7);
+        double x = 0.31, y = -0.42, z = 1.17, e = 1e-5;
+        (double v, Vector3D<double> g) = n.ValueD(x, y, z);
+
+        Assert.InRange(v, -1.0, 1.0);
+        double gx = (n.Value(x + e, y, z) - n.Value(x - e, y, z)) / (2 * e);
+        double gy = (n.Value(x, y + e, z) - n.Value(x, y - e, z)) / (2 * e);
+        double gz = (n.Value(x, y, z + e) - n.Value(x, y, z - e)) / (2 * e);
+        Assert.True(Math.Abs(gx - g.X) < 1e-3, $"∂x mismatch {gx} vs {g.X}");
+        Assert.True(Math.Abs(gy - g.Y) < 1e-3, $"∂y mismatch {gy} vs {g.Y}");
+        Assert.True(Math.Abs(gz - g.Z) < 1e-3, $"∂z mismatch {gz} vs {g.Z}");
+    }
+
+    [Fact]
+    public void ErodedFbm_IsBoundedAndDeterministic()
+    {
+        var a = new Noise(99);
+        var b = new Noise(99);
+        foreach (var p in new[]
+        {
+            new Vector3D<double>(0.2, 0.9, -0.3),
+            new Vector3D<double>(-1.1, 0.4, 2.3),
+            new Vector3D<double>(5.0, -3.2, 0.7),
+        })
+        {
+            double va = a.ErodedFbm(p, 8.0, 3.0, 2.0, 0.5);
+            double vb = b.ErodedFbm(p, 8.0, 3.0, 2.0, 0.5);
+            Assert.Equal(va, vb);                 // deterministic
+            Assert.InRange(va, -1.0, 1.0);        // normalised → preserves amplitude bounds
+            // Fractional octave count stays bounded too (LOD fade).
+            Assert.InRange(a.ErodedFbm(p, 5.4, 3.0, 2.0, 0.5), -1.0, 1.0);
+        }
+    }
+
+    [Fact]
     public void Terrain_HeightIsDeterministicAndWithinAmplitude()
     {
         Planet planet = RockyPlanet();

@@ -53,6 +53,19 @@ public sealed class PlanetTerrain
     private readonly double _seaLevelFrac;      // sea level as a fraction of Amplitude
     private readonly Vector3D<float> _baseColor;
 
+    // Climate inputs for the Whittaker biome colouring (temperature × moisture).
+    private readonly float _surfaceTempK;       // representative planet temperature
+    private readonly bool _hasLife;             // can support vegetation: liquid water + atmosphere
+    private readonly double _moistureFreq;      // moisture-field frequency
+    private readonly double _moistureBias;      // per-type wet/dry shift
+
+    // Sedimentary stratification: a terraced term on a low-frequency, LOD-stable shape (so it never
+    // pops as patches subdivide). 0 weight on worlds that don't get strata (ice/ocean).
+    private readonly double _strataWeight;
+    private readonly double _strataFreq;
+    private readonly int _strataSteps;
+    private readonly double _strataSharp;
+
     // Three additive layers: broad continents, ridged mountains on the highlands, and
     // high-frequency detail roughness. Octave counts are clamped per-patch to the resolution
     // it can actually show (see OctavesFor), so strong fine detail appears close up without
@@ -85,7 +98,8 @@ public sealed class PlanetTerrain
         _baseAmplitude * PlanetTuning.EffectiveRelief(Type) *
         (ContinentWeight + _mountainWeight * PlanetTuning.EffectiveMountain(Type) + DetailWeight
          + MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale)
-         + _craterWeight * PlanetTuning.EffectiveCraterScale(Type));
+         + _craterWeight * PlanetTuning.EffectiveCraterScale(Type)
+         + _strataWeight);
 
     public PlanetTerrain(CelestialBody body)
     {
@@ -133,6 +147,30 @@ public sealed class PlanetTerrain
 
         _hasOcean = body.Type == PlanetType.Ocean;
         _seaLevelFrac = _hasOcean ? rng.Range(-0.15, 0.05) : double.NegativeInfinity;
+
+        _surfaceTempK = body.SurfaceTempK;
+        _hasLife = body.HasLiquidWater && body.HasAtmosphere; // vegetation needs both
+        _moistureFreq = _continentFreq * rng.Range(0.7, 1.3);
+        _moistureBias = body.Type switch
+        {
+            PlanetType.Ocean => 0.15,   // generally humid
+            PlanetType.Desert => -0.32, // arid
+            PlanetType.Ice => -0.05,
+            _ => 0.0,
+        };
+
+        // Sedimentary terracing, strongest on arid/rocky/volcanic crust (mesas, banded canyons).
+        double strataBase = body.Type switch
+        {
+            PlanetType.Desert => 0.10,
+            PlanetType.Rocky => 0.07,
+            PlanetType.Lava => 0.05,
+            _ => 0.0,
+        };
+        _strataWeight = strataBase * rng.Range(0.6, 1.3);
+        _strataFreq = _continentFreq * rng.Range(2.0, 4.0);
+        _strataSteps = rng.RangeInt(5, 11);
+        _strataSharp = rng.Range(2.0, 3.5);
     }
 
     /// <summary>Terrain height (metres, signed) at a unit direction — full detail (tests/colour).</summary>
@@ -167,9 +205,11 @@ public sealed class PlanetTerrain
         Vector3D<double> warped = unitDir + DomainWarp(unitDir, fs);
         double mountains = _noise.Ridged(warped, mtnOct, _mountainFreq * fs, 2.0, MountainGain); // [0,1]
 
-        // High-frequency roughness, also damped in the flat regions (but never fully — _detailFloor
-        // keeps a little texture even on plains so they don't read as glass).
-        double detail = _noise.Fbm(unitDir, detOct, _detailFreq * fs, 2.0, DetailGain); // [-1,1]
+        // High-frequency roughness via EROSIVE fBm: detail is suppressed on steep accumulated slopes,
+        // carving smooth valley floors with detail riding the shoulders/ridges (a cheap erosion model).
+        // Also damped in the flat regions (but never fully — _detailFloor keeps a little texture on
+        // plains so they don't read as glass).
+        double detail = _noise.ErodedFbm(unitDir, detOct, _detailFreq * fs, 2.0, DetailGain); // [-1,1]
         double detailGate = _detailFloor + (1.0 - _detailFloor) * rugged; // [_detailFloor, 1]
 
         // Fine micro-relief: high-frequency roughness, faded in only once a patch can resolve it
@@ -192,13 +232,24 @@ public sealed class PlanetTerrain
         double craterW = _craterWeight * PlanetTuning.EffectiveCraterScale(Type);
         double crater = craterW > 0.0 ? CraterField(unitDir, fs, sampleSpacing) : 0.0;
 
-        // Each term is bounded by its weight (rugged/mask/gate ∈ [0,1], crater ∈ [-1, rim]), so
-        // |shape| ≤ ContinentWeight + mWeight + DetailWeight + craterW, matching Amplitude.
+        // Sedimentary strata: a terrace applied to a FIXED-octave (LOD-independent) low-frequency
+        // field, so the steps are identical at every sample spacing and never pop across an LOD swap.
+        double strata = 0.0;
+        if (_strataWeight > 0.0)
+        {
+            var sp2 = unitDir + new Vector3D<double>(8.2, 71.5, 3.6); // decorrelate from other layers
+            double low = _noise.Fbm(sp2, 4, _strataFreq * fs, 2.0, 0.5); // [-1,1], spacing-independent
+            strata = Terrace(low, _strataSteps, _strataSharp);          // [-1,1]
+        }
+
+        // Each term is bounded by its weight (rugged/mask/gate ∈ [0,1], crater ∈ [-1, rim],
+        // strata ∈ [-1,1]), so |shape| ≤ sum of weights, matching Amplitude.
         double shape = ContinentWeight * continents
                      + mWeight * mountains * mask * rugged
                      + DetailWeight * detail * detailGate
                      + microW * micro
-                     + craterW * crater;
+                     + craterW * crater
+                     + _strataWeight * strata;
         // The solid surface keeps its full relief even below the waterline — that *is* the sea
         // floor. A separate translucent water surface (PlanetTerrainRenderer) sits at SeaLevel,
         // and coastlines emerge naturally where the rugged land crosses it.
@@ -336,11 +387,12 @@ public sealed class PlanetTerrain
     public double SeaLevelMeters => SeaLevel;
 
     /// <summary>
-    /// Surface colour from elevation, slope and biome. <paramref name="slope"/> is
-    /// cos(angle-from-vertical) — 1 on flats, → 0 on cliffs — so steep faces read as bare
-    /// rock and snow only settles on gentle high ground.
+    /// Surface colour from <b>climate</b> (temperature × moisture → biome), elevation and slope.
+    /// <paramref name="dir"/> is the unit surface direction (drives latitude/temperature and the
+    /// moisture field); <paramref name="slope"/> is cos(angle-from-vertical) — 1 on flats, → 0 on
+    /// cliffs — so steep faces read as bare rock and snow settles on gentle ground / cold latitudes.
     /// </summary>
-    public Vector3D<float> ColorAt(double height, double slope)
+    public Vector3D<float> ColorAt(Vector3D<double> dir, double height, double slope)
     {
         double amplitude = Amplitude;
 
@@ -359,36 +411,98 @@ public sealed class PlanetTerrain
             float above = (float)((height - seaLevel) / (amplitude * 0.025 + 1.0));
             if (above < 1f)
                 return Lerp(new Vector3D<float>(0.80f, 0.74f, 0.55f),
-                            LandBand(height, amplitude, slope), Smoothstepf(0f, 1f, above));
+                            LandBand(dir, height, amplitude, slope), Smoothstepf(0f, 1f, above));
         }
 
-        return LandBand(height, amplitude, slope);
+        return LandBand(dir, height, amplitude, slope);
     }
 
-    /// <summary>Elevation/slope colour ramp for dry land (lowland → rock → snow, cliffs in rock).</summary>
-    private Vector3D<float> LandBand(double height, double amplitude, double slope)
+    /// <summary>Climate + elevation + slope colour for dry land: a Whittaker biome ground colour,
+    /// rising through rock to snow (by altitude or cold latitude), with bare cliff faces.</summary>
+    private Vector3D<float> LandBand(Vector3D<double> dir, double height, double amplitude, double slope)
     {
-        Vector3D<float> tint = PlanetTuning.EffectiveLowland(Type);
-        float t = (float)Math.Clamp((height / amplitude + 0.3) / 1.3, 0f, 1f);
-        Vector3D<float> lowland = new(
-            _baseColor.X * tint.X,
-            _baseColor.Y * tint.Y,
-            _baseColor.Z * tint.Z);
+        double temp = Temperature01(dir, height, amplitude);
+        double moist = Moisture01(dir);
+        Vector3D<float> ground = BiomeGround(temp, moist);
+
         Vector3D<float> rock = PlanetTuning.EffectiveRock(Type);
         Vector3D<float> snow = PlanetTuning.EffectiveSnow(Type);
-
         float snowLine = Math.Clamp(PlanetTuning.EffectiveSnowLine(Type), 0.02f, 0.98f);
-        Vector3D<float> band = t < snowLine
-            ? Lerp(lowland, rock, t / snowLine)
-            : Lerp(rock, snow, (t - snowLine) / (1f - snowLine));
+
+        // Ground → rock as elevation climbs toward the snow line.
+        float t = (float)Math.Clamp((height / amplitude + 0.3) / 1.3, 0f, 1f);
+        Vector3D<float> band = Lerp(ground, rock, Smoothstepf(0f, snowLine, t));
+
+        // Snow from EITHER high elevation OR cold latitude — so polar regions get caps at sea level
+        // while the tropics only whiten on peaks.
+        float coldSnow = 1f - Smoothstepf(0.06f, 0.24f, (float)temp);
+        float elevSnow = Smoothstepf(snowLine, Math.Min(1f, snowLine + 0.22f), t);
+        band = Lerp(band, snow, Math.Clamp(Math.Max(coldSnow, elevSnow), 0f, 1f));
+
+        float c = Math.Clamp(PlanetTuning.EffectiveCliffThreshold(Type), 0.2f, 0.97f);
+
+        // Scree / talus: loose gravel gathering on moderate slopes just gentler than bare cliffs —
+        // a band peaking a little above the cliff threshold (in slope = cos-of-steepness terms).
+        float scree = Smoothstepf(c - 0.04f, c + 0.10f, (float)slope) * (1f - Smoothstepf(c + 0.16f, c + 0.32f, (float)slope));
+        Vector3D<float> screeColor = (PlanetTuning.EffectiveRock(Type) + PlanetTuning.EffectiveCliff(Type)) * 0.5f
+                                     + new Vector3D<float>(0.05f, 0.045f, 0.04f);
+        band = Lerp(band, screeColor, scree * 0.5f);
 
         // Steep faces are bare cliff rock; this is the main driver of close-up detail.
-        float c = Math.Clamp(PlanetTuning.EffectiveCliffThreshold(Type), 0.2f, 0.97f);
         float steep = 1f - Smoothstepf(c - 0.135f, c + 0.135f, (float)slope);
         return Lerp(band, PlanetTuning.EffectiveCliff(Type), steep * PlanetTuning.EffectiveCliffStrength(Type));
     }
 
-    /// <summary>Backward-compatible overload (treats the point as flat ground).</summary>
+    /// <summary>Point temperature in [0,1]: the planet's base warmth, cooled toward the poles
+    /// (latitude from the surface direction) and with altitude.</summary>
+    private double Temperature01(Vector3D<double> dir, double height, double amplitude)
+    {
+        double tBase = Math.Clamp((_surfaceTempK - 215.0) / (320.0 - 215.0), 0.0, 1.0);
+        double lat = Math.Abs(dir.Y);                          // 0 at equator, 1 at the poles
+        double elevAbove = Math.Max(0.0, height / amplitude);  // higher ground is colder
+        return Math.Clamp(tBase - 0.55 * Math.Pow(lat, 1.3) - 0.55 * elevAbove, 0.0, 1.0);
+    }
+
+    /// <summary>Point moisture in [0,1] from a low-frequency field, biased wet/dry per world class.</summary>
+    private double Moisture01(Vector3D<double> dir)
+    {
+        var p = dir + new Vector3D<double>(17.3, 5.9, 42.1); // decorrelate from continents/ruggedness
+        double m = 0.5 + 0.5 * _noise.Fbm(p, 4, _moistureFreq, 2.0, 0.5);
+        return Math.Clamp(m + _moistureBias, 0.0, 1.0);
+    }
+
+    /// <summary>Whittaker-style ground colour from temperature × moisture. The abiotic substrate
+    /// (frozen → temperate rock/tint → hot sand) always applies; vegetation overlays it only where
+    /// the world can support it (liquid water + atmosphere), and only in the warm, moist middle.</summary>
+    private Vector3D<float> BiomeGround(double temp, double moist)
+    {
+        Vector3D<float> tint = PlanetTuning.EffectiveLowland(Type);
+        Vector3D<float> temperate = new(_baseColor.X * tint.X, _baseColor.Y * tint.Y, _baseColor.Z * tint.Z);
+        var frozen = new Vector3D<float>(0.78f, 0.82f, 0.86f); // bare cold ground
+        var hot = new Vector3D<float>(0.80f, 0.62f, 0.40f);    // desert sand
+        Vector3D<float> substrate = temp < 0.5
+            ? Lerp(frozen, temperate, (float)(temp / 0.5))
+            : Lerp(temperate, hot, (float)((temp - 0.5) / 0.5));
+
+        if (!_hasLife) return substrate;
+
+        var tundra = new Vector3D<float>(0.45f, 0.46f, 0.34f);
+        var grass = new Vector3D<float>(0.48f, 0.56f, 0.28f);
+        var forest = new Vector3D<float>(0.20f, 0.42f, 0.18f);
+        var jungle = new Vector3D<float>(0.12f, 0.40f, 0.15f);
+        Vector3D<float> veg;
+        if (temp < 0.35) veg = Lerp(tundra, forest, (float)Smoothstep(0.15, 0.35, temp));
+        else if (temp < 0.7) veg = Lerp(grass, forest, (float)moist);
+        else veg = Lerp(substrate, jungle, (float)moist); // hot+dry stays desert, hot+wet turns jungle
+
+        // Lushness needs warmth and moisture; frozen wastes and parched deserts stay bare substrate.
+        double lush = Smoothstep(0.12, 0.35, temp) * Smoothstep(0.25, 0.6, moist);
+        return Lerp(substrate, veg, (float)lush);
+    }
+
+    /// <summary>Backward-compatible overloads (treat the point as on the equator / flat ground).</summary>
+    public Vector3D<float> ColorAt(double height, double slope)
+        => ColorAt(new Vector3D<double>(1.0, 0.0, 0.0), height, slope);
     public Vector3D<float> ColorAt(double height) => ColorAt(height, 1.0);
 
     /// <summary>A small decorrelated noise offset that bends mountain ranges organically.</summary>
@@ -399,6 +513,17 @@ public sealed class PlanetTerrain
         double wy = _noise.Fbm(dir + new Vector3D<double>(31.4, 11.7, 5.2), WarpOctaves, f, 2.0, 0.5);
         double wz = _noise.Fbm(dir + new Vector3D<double>(-7.1, 23.9, 17.3), WarpOctaves, f, 2.0, 0.5);
         return new Vector3D<double>(wx, wy, wz) * _warpStrength;
+    }
+
+    /// <summary>Quantise <paramref name="v"/>∈[-1,1] into <paramref name="steps"/> terraces: long flats
+    /// with smoothly-ramped risers (a soft step, so normals stay finite). Stays in [-1,1].</summary>
+    private static double Terrace(double v, int steps, double sharp)
+    {
+        double s = v * steps;
+        double fl = Math.Floor(s);
+        double frac = Math.Pow(s - fl, sharp);          // bias toward the flat tread
+        double riser = frac * frac * (3.0 - 2.0 * frac); // smoothstep the rise → no vertical cliff
+        return (fl + riser) / steps;
     }
 
     private static double Smoothstep(double lo, double hi, double x)

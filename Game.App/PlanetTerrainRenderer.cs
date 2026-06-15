@@ -118,20 +118,43 @@ void main() {
 
     // Translucent ocean surface: diffuse + a sharp sun glint + a fresnel edge that fades the
     // water more opaque at grazing angles. Colour (sand-shallow → deep-blue) is baked per vertex.
+    // Animated ocean: three travelling sine swells displace the flat sea radially and bend its
+    // normal analytically (moving glints). Phase is reconstructed planet-stably from a per-patch base
+    // (uPhase = wave·patchCentre, mod 2π, in double on the CPU) plus the small patch-relative vertex
+    // offset — so it neither swims with the floating origin nor seams between patches. Wave vectors,
+    // speeds and amplitudes are uniforms (single source of truth shared with the CPU phase base).
     private const string WaterVertexSource = @"#version 410 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec4 aColor;   // rgb = water colour, a = depth-based base opacity
 uniform mat4 uMVP;
 uniform mat4 uModel;
+uniform float uTime;
+uniform float uWaveAmp;     // overall swell height scale (metres)
+uniform vec3 uWD[3];        // wave directions (planet-local, unit)
+uniform vec3 uWK;           // angular wavenumbers (2*pi / wavelength)
+uniform vec3 uWW;           // angular speeds (2*pi / period)
+uniform vec3 uWA;           // per-wave amplitude weights
+uniform vec3 uPhase;        // per-patch phase base for the 3 waves
 out vec3 vNormal;
 out vec4 vColor;
 out vec3 vWorld;
 void main() {
-    vNormal = aNormal;
+    vec3 N = normalize(aNormal);
+    float h = 0.0;
+    vec3 grad = vec3(0.0);
+    for (int i = 0; i < 3; i++) {
+        float ph = uPhase[i] + uWK[i] * dot(aPos, uWD[i]) + uTime * uWW[i];
+        float a = uWA[i] * uWaveAmp;
+        h += a * sin(ph);
+        grad += a * cos(ph) * uWK[i] * uWD[i];   // d(height)/d(pos)
+    }
+    vec3 pos = aPos + N * h;
+    vec3 tang = grad - dot(grad, N) * N;          // tangential slope of the swell
+    vNormal = normalize(N - tang);
     vColor = aColor;
-    vWorld = (uModel * vec4(aPos, 1.0)).xyz;
-    gl_Position = uMVP * vec4(aPos, 1.0);
+    vWorld = (uModel * vec4(pos, 1.0)).xyz;
+    gl_Position = uMVP * vec4(pos, 1.0);
 }";
 
     private const string WaterFragmentSource = @"#version 410 core
@@ -158,7 +181,19 @@ void main() {
     private readonly GL _gl;
     private readonly Shader _shader;
     private readonly Shader _waterShader;
-    private readonly List<(TerrainPatch patch, Vector3D<float> rel)> _waterFrame = new();
+    private readonly List<(TerrainPatch patch, Vector3D<float> rel, Vector3D<double> centerLocal)> _waterFrame = new();
+
+    // Ocean swell waves (planet-local). The CPU phase base and the shader's spatial term share these,
+    // so they must be the single source of truth — passed to the shader as uniforms each frame.
+    private static readonly Vector3D<double>[] WaveDir =
+    {
+        Vector3D.Normalize(new Vector3D<double>(1.0, 0.0, 0.35)),
+        Vector3D.Normalize(new Vector3D<double>(0.25, 0.0, 1.0)),
+        Vector3D.Normalize(new Vector3D<double>(-0.8, 0.0, 0.6)),
+    };
+    private static readonly double[] WaveLen = { 55.0, 34.0, 21.0 };   // metres
+    private static readonly double[] WavePeriod = { 5.5, 4.0, 3.0 };   // seconds
+    private static readonly Vector3D<float> WaveAmp = new(0.9f, 0.5f, 0.3f); // metres
 
     // Background patch baking. Worker threads pull jobs, sample the (immutable) height field and build
     // the vertex arrays — all pure CPU work with no GL calls — then post the float arrays back here.
@@ -178,6 +213,10 @@ void main() {
     public int LeafCount { get; private set; }
     public int PatchCount { get; private set; }
     public CelestialBody? Active => _body;
+
+    /// <summary>When off, the ocean swell amplitude is zeroed so the water sits perfectly flat
+    /// (still depth-writing for a clean horizon). Off by default for now.</summary>
+    public bool AnimateWater = false;
 
     /// <summary>Max relief (metres) of the active terrain — how far below the base radius a valley can
     /// sit. The atmosphere uses this to drop its ground/clip radius so low terrain still gets hazed.</summary>
@@ -273,7 +312,7 @@ void main() {
         }
     }
 
-    public void Render(Camera camera, Vector3D<float> sunDir)
+    public void Render(Camera camera, Vector3D<float> sunDir, float time = 0f)
     {
         if (_body == null || _roots == null) return;
 
@@ -308,11 +347,27 @@ void main() {
             _gl.DepthMask(true);
             _waterShader.Use();
             _waterShader.SetVector3("uSunDir", sunDir);
-            foreach ((TerrainPatch patch, Vector3D<float> rel) in _waterFrame)
+
+            // Per-frame wave parameters (shared with the per-patch phase base computed below).
+            double twoPi = 2.0 * Math.PI;
+            var wk = new Vector3D<float>((float)(twoPi / WaveLen[0]), (float)(twoPi / WaveLen[1]), (float)(twoPi / WaveLen[2]));
+            _waterShader.SetFloat("uTime", time);
+            _waterShader.SetFloat("uWaveAmp", AnimateWater ? 1.0f : 0.0f);
+            for (int i = 0; i < 3; i++)
+                _waterShader.SetVector3($"uWD[{i}]", new Vector3D<float>((float)WaveDir[i].X, (float)WaveDir[i].Y, (float)WaveDir[i].Z));
+            _waterShader.SetVector3("uWK", wk);
+            _waterShader.SetVector3("uWW", new Vector3D<float>((float)(twoPi / WavePeriod[0]), (float)(twoPi / WavePeriod[1]), (float)(twoPi / WavePeriod[2])));
+            _waterShader.SetVector3("uWA", WaveAmp);
+
+            foreach ((TerrainPatch patch, Vector3D<float> rel, Vector3D<double> centerLocal) in _waterFrame)
             {
+                // Phase base = wave·patchCentre (mod 2π) in double, so phase stays precise and seamless.
+                var phase = new Vector3D<float>(
+                    (float)PhaseBase(0, centerLocal), (float)PhaseBase(1, centerLocal), (float)PhaseBase(2, centerLocal));
                 Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
                 _waterShader.SetMatrix("uModel", model);
                 _waterShader.SetMatrix("uMVP", model * viewProj);
+                _waterShader.SetVector3("uPhase", phase);
                 patch.DrawWater(_gl);
             }
             _gl.DepthMask(true);
@@ -387,7 +442,18 @@ void main() {
         _shader.SetFloat("uMorph", morph);
         SetPatchDetailBase(node);
         node.Patch.Draw(_gl);
-        if (node.Patch.HasWater) _waterFrame.Add((node.Patch, rel)); // drawn in the later water pass
+        if (node.Patch.HasWater) _waterFrame.Add((node.Patch, rel, node.CenterLocal)); // drawn in the later water pass
+    }
+
+    /// <summary>Per-patch swell phase base for wave <paramref name="i"/>: (2π/λ)·(direction·patchCentre),
+    /// reduced mod 2π in double so the shader can add the small patch-relative offset without losing
+    /// precision or seaming between patches.</summary>
+    private static double PhaseBase(int i, Vector3D<double> centerLocal)
+    {
+        double k = 2.0 * Math.PI / WaveLen[i];
+        double p = k * Vector3D.Dot(WaveDir[i], centerLocal);
+        p %= 2.0 * Math.PI;
+        return p < 0 ? p + 2.0 * Math.PI : p;
     }
 
     /// <summary>
@@ -562,7 +628,7 @@ void main() {
 
             // Slope = cos(angle from vertical): 1 on flats, → 0 on cliffs. Drives rock vs snow.
             double slope = Vector3D.Dot(nrmF[i, j], outward);
-            col[i, j] = terrain.ColorAt(hgt[i, j], slope);
+            col[i, j] = terrain.ColorAt(dir[i, j], hgt[i, j], slope);
         }
 
         var v3 = new List<float>((n * n * 6 + n * 16) * LandFloatsPerVertex);

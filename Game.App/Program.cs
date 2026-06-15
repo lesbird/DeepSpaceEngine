@@ -33,6 +33,7 @@ internal static class Program
     private static GalacticGridRenderer _galacticGrid = null!;
     private static BlackHoleRenderer _blackHole = null!;
     private static AtmosphereRenderer _atmosphereRenderer = null!;
+    private static CloudRenderer _cloudRenderer = null!;
     private static PlanetTerrainRenderer _terrainRenderer = null!;
     private static RoverController _rover = null!;
     private static RoverRenderer _roverRenderer = null!;
@@ -44,7 +45,7 @@ internal static class Program
     private static bool _prevR;
     private static ImGuiController _imgui = null!;
 
-    private const double TerrainActivateRadii = 8.0; // switch to terrain LOD within N planet radii
+    private const double TerrainActivateRadii = 40.0; // switch to terrain LOD within N planet radii (~50,000 km for a small world)
     private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
     private const string TuningPath = "tuning.json";
     private static string _tuningStatus = "";
@@ -69,6 +70,7 @@ internal static class Program
     private static bool _paused;
     private static double _savedTimeScale;
     private static double _fps;
+    private static double _renderClock;
     private static bool _smoke;
     private static int _smokeFrames;
 
@@ -86,6 +88,7 @@ internal static class Program
             _sceneFbo.Resize(size.X, size.Y);
             _postFbo.Resize(size.X, size.Y);
             _bloom.Resize(size.X, size.Y);
+            _cloudRenderer.Resize(size.X, size.Y);
         };
         _window.Run();
         _window.Dispose();
@@ -132,6 +135,7 @@ internal static class Program
         _galacticGrid = new GalacticGridRenderer(_gl);
         _blackHole = new BlackHoleRenderer(_gl);
         _atmosphereRenderer = new AtmosphereRenderer(_gl);
+        _cloudRenderer = new CloudRenderer(_gl);
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse);
         _roverRenderer = new RoverRenderer(_gl);
@@ -142,6 +146,7 @@ internal static class Program
         _sceneFbo.Resize(fb.X, fb.Y);
         _postFbo.Resize(fb.X, fb.Y);
         _bloom.Resize(fb.X, fb.Y);
+        _cloudRenderer.Resize(fb.X, fb.Y);
         _imgui = new ImGuiController(_gl, _window.Window, _window.Input);
 
         // Restore previously-saved tuning so the sliders persist across launches.
@@ -280,6 +285,7 @@ internal static class Program
 
     private static void OnRender(double dt)
     {
+        _renderClock += dt; // real elapsed seconds, for time-animated effects (e.g. ocean swell)
         _imgui.Update((float)dt);
 
         // Render the scene (stars + system + terrain) into an offscreen buffer so the atmosphere
@@ -365,7 +371,7 @@ internal static class Program
             // while the terrain writes fresh, correctly-linearisable depth. Their depth was only needed
             // to self-occlude during their own pass; when landed they never sit in front of the terrain.
             _gl.Clear((uint)ClearBufferMask.DepthBufferBit);
-            _terrainRenderer.Render(_camera, sunDir);
+            _terrainRenderer.Render(_camera, sunDir, (float)_renderClock);
 
             // Rover over the terrain it just drew — same near/far so it shares the depth buffer and
             // the depth-aware atmosphere composites over it correctly.
@@ -384,6 +390,10 @@ internal static class Program
             _postFbo.Bind();
             float near = _terrainTarget != null ? _terrainRenderer.LastNear : _systemRenderer.LastNear;
             float far = _terrainTarget != null ? _terrainRenderer.LastFar : _systemRenderer.LastFar;
+            // Clouds first (depth-occluded by terrain), then atmosphere over them so distant clouds
+            // pick up aerial-perspective haze and the sky tints them correctly.
+            _cloudRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
+                (float)_renderClock, _terrainTarget, _terrainRenderer.ActiveAmplitude, _postFbo);
             _atmosphereRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
                 _terrainTarget, _terrainRenderer.ActiveAmplitude);
         }
@@ -544,6 +554,29 @@ internal static class Program
                 b.Enabled = true; b.BandBrightness = 0.6f; b.StarBrightness = 1.0f;
                 b.NebulaBrightness = 0.7f;
             }
+        }
+
+        if (ImGui.CollapsingHeader("Ocean", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            ImGui.Checkbox("Animate water (swell)", ref _terrainRenderer.AnimateWater);
+            ImGui.TextDisabled("(off = perfectly flat sea)");
+        }
+
+        if (ImGui.CollapsingHeader("Clouds", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            CloudRenderer cr = _cloudRenderer;
+            ImGui.Checkbox("Render clouds", ref cr.Enabled);
+            ImGui.Checkbox("Volumetric (raymarched)", ref cr.Volumetric);
+            ImGui.SliderFloat("Coverage", ref cr.Coverage, 0f, 1f);
+            ImGui.SliderFloat("Density", ref cr.Density, 0f, 3f);
+            ImGui.SliderFloat("Wind speed", ref cr.WindSpeed, 0f, 0.03f);
+            if (ImGui.Button("Reset clouds"))
+            {
+                cr.Enabled = true; cr.Volumetric = false; cr.Coverage = 0.5f; cr.Density = 1.0f; cr.WindSpeed = 0.004f;
+            }
+            ImGui.TextDisabled(cr.Volumetric
+                ? "(volumetric raymarch — expensive)"
+                : "(cheap analytic shell layer)");
         }
 
         if (ImGui.CollapsingHeader("Asteroids", ImGuiTreeNodeFlags.DefaultOpen))

@@ -76,6 +76,72 @@ public sealed class Noise
         return norm > 0 ? sum / norm : 0;
     }
 
+    private static double SmoothDeriv(double t) => 6.0 * t * (1.0 - t); // d/dt of Smooth
+
+    /// <summary>Value noise plus its analytic gradient (∂/∂x, ∂/∂y, ∂/∂z). Value in [-1, 1].
+    /// Used by <see cref="ErodedFbm"/> to suppress detail on slopes (a cheap erosion model).</summary>
+    public (double value, Vector3D<double> grad) ValueD(double x, double y, double z)
+    {
+        long xi = (long)Math.Floor(x), yi = (long)Math.Floor(y), zi = (long)Math.Floor(z);
+        double xf = x - xi, yf = y - yi, zf = z - zi;
+        double u = Smooth(xf), v = Smooth(yf), w = Smooth(zf);
+        double du = SmoothDeriv(xf), dv = SmoothDeriv(yf), dw = SmoothDeriv(zf);
+
+        double c000 = Lattice(xi, yi, zi), c100 = Lattice(xi + 1, yi, zi);
+        double c010 = Lattice(xi, yi + 1, zi), c110 = Lattice(xi + 1, yi + 1, zi);
+        double c001 = Lattice(xi, yi, zi + 1), c101 = Lattice(xi + 1, yi, zi + 1);
+        double c011 = Lattice(xi, yi + 1, zi + 1), c111 = Lattice(xi + 1, yi + 1, zi + 1);
+
+        double x00 = Lerp(c000, c100, u), x10 = Lerp(c010, c110, u);
+        double x01 = Lerp(c001, c101, u), x11 = Lerp(c011, c111, u);
+        double y0 = Lerp(x00, x10, v), y1 = Lerp(x01, x11, v);
+        double val = Lerp(y0, y1, w);
+
+        double dfu = Lerp(Lerp(c100 - c000, c110 - c010, v), Lerp(c101 - c001, c111 - c011, v), w);
+        double dfv = Lerp(x10 - x00, x11 - x01, w);
+        double dfw = y1 - y0;
+        return (val, new Vector3D<double>(dfu * du, dfv * dv, dfw * dw));
+    }
+
+    /// <summary>
+    /// Erosive fBm: ordinary fBm, but each octave is damped by the squared magnitude of the
+    /// accumulated gradient so far — so fine detail is suppressed on already-steep slopes. The
+    /// result reads as eroded terrain: smooth, carved valley floors with detail concentrated on
+    /// flatter shoulders and ridgelines. Fractional octave count fades the top octave in smoothly
+    /// (LOD-continuous, like <see cref="Fbm(Vector3D{double}, double, double, double, double)"/>),
+    /// and the output stays normalised to [-1, 1] (each octave's damping ≤ 1), so callers' amplitude
+    /// bounds are preserved.
+    /// </summary>
+    public double ErodedFbm(Vector3D<double> p, double octaves, double frequency, double lacunarity, double gain)
+    {
+        if (octaves <= 0) return 0;
+        const double k = 1.4; // erosion strength: higher = flatter valleys, sharper ridges
+        int full = (int)Math.Floor(octaves);
+        double frac = octaves - full;
+
+        double sum = 0, amp = 1, f = frequency, norm = 0;
+        Vector3D<double> gradSum = default;
+        for (int i = 0; i < full; i++)
+        {
+            (double n, Vector3D<double> g) = ValueD(p.X * f, p.Y * f, p.Z * f);
+            gradSum += g;
+            double damp = 1.0 / (1.0 + k * Vector3D.Dot(gradSum, gradSum));
+            sum += amp * n * damp;
+            norm += amp;
+            amp *= gain;
+            f *= lacunarity;
+        }
+        if (frac > 0.0)
+        {
+            (double n, Vector3D<double> g) = ValueD(p.X * f, p.Y * f, p.Z * f);
+            gradSum += g * frac;
+            double damp = 1.0 / (1.0 + k * Vector3D.Dot(gradSum, gradSum));
+            sum += amp * frac * n * damp;
+            norm += amp * frac;
+        }
+        return norm > 0 ? sum / norm : 0;
+    }
+
     /// <summary>
     /// Ridged multifractal noise in [0, 1]. Folding the field at its zero crossings
     /// (1 - |value|) turns smooth fBm valleys into sharp creases; squaring sharpens them and
