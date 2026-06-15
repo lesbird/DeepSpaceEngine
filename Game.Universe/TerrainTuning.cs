@@ -27,6 +27,14 @@ public static class TerrainTuning
     /// <summary>Scales how many craters appear (the fraction of cells that bear one); 0 = none.</summary>
     public static float CraterDensity = 1.0f;
 
+    /// <summary>Airless-body albedo from the crater cascade: dark floors + bright rims/ejecta; 0 = off.
+    /// Baked into the surface colour, so a change needs a terrain rebuild.</summary>
+    public static float CraterAlbedo = 1.0f;
+
+    /// <summary>Strength of low-frequency maria provinces (darker basaltic plains) on airless worlds;
+    /// 0 = off. Baked into the surface colour, so a change needs a terrain rebuild.</summary>
+    public static float MariaStrength = 0.6f;
+
     /// <summary>Scales the fine, LOD-gated micro-relief height layer that only appears up close;
     /// 0 removes it. Changing it requires a terrain rebuild (it's geometry).</summary>
     public static float MicroDetailScale = 1.0f;

@@ -92,6 +92,8 @@ uniform float uVertexSpacingDir;   // this patch's vertex spacing in unit-direct
 uniform float uPlanetRadius;       // metres (converts a direction-space step to surface arc length)
 uniform float uOrbitalStrength;    // macro-relief normal strength (0 = off)
 uniform float uOrbitalAlbedo;      // macro-relief albedo mottle amount
+uniform float uCraterStrength;     // orbital crater shading (0 = not a cratered world)
+uniform float uCraterFreq;         // largest-crater base frequency (cells over the unit sphere)
 out vec4 FragColor;
 
 // Small-input integer hash (Dave Hoskins style) — cell coords are wrapped below so it stays precise.
@@ -164,33 +166,82 @@ float reliefFbm(vec3 dir, float baseFreq, float fp) {
     return sum / max(norm, 1e-6);
 }
 
+// Multi-octave impact-crater relief over a direction, in ≈[-1, rim]: a 3x3x3 cellular field of
+// bowls + raised rims per octave (matching the CPU CraterField), each octave anti-aliased by the
+// pixel footprint so only the scales a pixel can resolve contribute — large basins from orbit,
+// finer craters as you approach. Lets the cratered look show from space, where the mesh is too
+// coarse to carry baked craters.
+float craterField(vec3 dir, float baseFreq, float fp) {
+    float sum = 0.0, wsum = 0.0, freq = baseFreq, weight = 1.0;
+    for (int o = 0; o < 3; o++) {   // coarse crater bands only — these read from orbit; finer ones are baked geometry
+        float aa = 1.0 - smoothstep(0.5, 1.1, freq * fp);
+        if (aa > 0.0) {
+            vec3 p = dir * freq;
+            vec3 ip = floor(p);
+            float minBowl = 0.0, maxRim = 0.0, salt = float(o) * 17.0;
+            for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                vec3 c = ip + vec3(float(dx), float(dy), float(dz));
+                float ex = hash13(c + vec3(salt));
+                if (ex > 0.6) continue;                       // crater density
+                vec3 jit = vec3(hash13(c + vec3(salt + 1.7)), hash13(c + vec3(salt + 9.1)), hash13(c + vec3(salt + 4.3)));
+                float radius = 0.22 + 0.28 * fract(ex * 7.3 + 0.19);
+                float t = length(p - (c + jit)) / radius;
+                if (t >= 1.5) continue;
+                float bowl = -(1.0 - smoothstep(0.0, 0.85, min(t, 1.0)));
+                float e = (t - 0.95) / 0.12;
+                float rim = 0.28 * exp(-0.5 * e * e);
+                minBowl = min(minBowl, bowl);
+                maxRim = max(maxRim, rim);
+            }
+            sum += weight * aa * (minBowl + maxRim);
+        }
+        wsum += weight; freq *= 1.9; weight *= 0.62;
+    }
+    return sum / max(wsum, 1e-4);
+}
+
 void main() {
     vec3 N = normalize(vNormal);
     vec3 col = vColor;
 
-    // --- Orbital macro relief: lights mountain ranges that the smooth far-LOD mesh can't show. ---
-    if (uOrbitalStrength > 0.0001 && vRelief > 0.001) {
+    // --- Orbital surface detail the smooth far-LOD mesh can't show: macro relief + impact craters. ---
+    {
         vec3 dir = normalize(vDir);
         float fp = max(max(fwidth(dir.x), fwidth(dir.y)), fwidth(dir.z)); // pixel footprint (dir units)
-        // Hand off to the real geometry as it resolves these scales: full from orbit (the mesh shows
-        // none of this relief), fading to nothing once vertex spacing resolves the mountain band.
         float geomCut = 1.0 / max(2.0 * uVertexSpacingDir, 1e-9);         // freq the mesh already carries
-        float master = 1.0 - smoothstep(uReliefBaseFreq, uReliefBaseFreq * 32.0, geomCut);
-        master *= vRelief;
-        if (master > 0.001) {
-            // Surface-tangent gradient of the relief height → a normal perturbation. The step is the
+        // Each layer hands off to the real geometry as it resolves that band. Relief rides the
+        // ruggedness mask (mountains live on highlands); craters cover the whole airless body.
+        float reliefM = (uOrbitalStrength > 0.0001 ? vRelief : 0.0)
+                      * (1.0 - smoothstep(uReliefBaseFreq, uReliefBaseFreq * 32.0, geomCut));
+        float craterM = (uCraterStrength > 0.0001 ? 1.0 : 0.0)
+                      * (1.0 - smoothstep(uCraterFreq, uCraterFreq * 64.0, geomCut));
+        if (reliefM > 0.001 || craterM > 0.001) {
+            // Surface-tangent gradient of the combined height → a normal perturbation. The step is the
             // pixel footprint, so the slope we light is exactly the one a pixel can resolve.
             vec3 up = abs(dir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
             vec3 T1 = normalize(cross(dir, up));
             vec3 T2 = cross(dir, T1);
             float eps = max(fp, 1e-5);
-            float h0 = reliefFbm(dir, uReliefBaseFreq, fp);
-            float hA = reliefFbm(normalize(dir + T1 * eps), uReliefBaseFreq, fp);
-            float hB = reliefFbm(normalize(dir + T2 * eps), uReliefBaseFreq, fp);
-            float invArc = 1.0 / (eps * uPlanetRadius);     // direction step → surface metres
-            vec3 bump = ((hA - h0) * T1 + (hB - h0) * T2) * uReliefAmp * invArc;
-            N = normalize(N - uOrbitalStrength * master * bump);
-            col *= 1.0 + uOrbitalAlbedo * master * h0;       // valleys darker, ridges lighter
+            float r0 = reliefM > 0.001 ? reliefFbm(dir, uReliefBaseFreq, fp) : 0.0;
+            float rA = reliefM > 0.001 ? reliefFbm(normalize(dir + T1 * eps), uReliefBaseFreq, fp) : 0.0;
+            float rB = reliefM > 0.001 ? reliefFbm(normalize(dir + T2 * eps), uReliefBaseFreq, fp) : 0.0;
+            float sR = uOrbitalStrength * reliefM;
+            float invArc = (uReliefAmp / (eps * uPlanetRadius));
+            vec3 bump = ((rA - r0) * T1 + (rB - r0) * T2) * sR * invArc;
+            N = normalize(N - bump);
+            col *= 1.0 + uOrbitalAlbedo * sR * r0;                  // relief: valleys dark, ridges light
+
+            // Craters as ALBEDO ONLY (one evaluation, not a 3-tap normal): from orbit the floor/rim
+            // tone is what reads, and up close the crater GEOMETRY cascade already supplies the relief.
+            // The 3×3×3 crater field is the dominant cost over a full-screen planet, so we evaluate it once.
+            if (craterM > 0.001) {
+                float c0 = craterField(dir, uCraterFreq, fp);
+                float sC = uCraterStrength * craterM;
+                col *= 1.0 - 0.45 * sC * max(0.0, -c0);            // crater floors darker
+                col *= 1.0 + 0.30 * sC * max(0.0, c0) / 0.28;      // crater rims/ejecta brighter
+            }
         }
     }
 
@@ -471,6 +522,10 @@ void main() {
         _shader.SetFloat("uPlanetRadius", (float)_terrain.Radius);
         _shader.SetFloat("uOrbitalStrength", Math.Max(0f, TerrainTuning.OrbitalReliefStrength));
         _shader.SetFloat("uOrbitalAlbedo", TerrainTuning.OrbitalReliefAlbedo);
+        // Orbital craters: only on airless cratered worlds, scaled by the same live crater knobs.
+        bool cratered = _terrain.IsCratered && TerrainTuning.CraterScale > 0f;
+        _shader.SetFloat("uCraterStrength", cratered ? Math.Max(0f, TerrainTuning.OrbitalReliefStrength) : 0f);
+        _shader.SetFloat("uCraterFreq", (float)_terrain.CraterOrbitalFrequency);
 
         DrainReadyPatches(); // upload any patches baked since last frame before we traverse
         LeafCount = 0;
@@ -778,7 +833,7 @@ void main() {
 
             // Slope = cos(angle from vertical): 1 on flats, → 0 on cliffs. Drives rock vs snow.
             double slope = Vector3D.Dot(nrmF[i, j], outward);
-            col[i, j] = terrain.ColorAt(dir[i, j], hgt[i, j], slope);
+            col[i, j] = terrain.ColorAt(dir[i, j], hgt[i, j], slope, spacing);
             rel[i, j] = (float)terrain.MacroReliefMask(dir[i, j]);
         }
 

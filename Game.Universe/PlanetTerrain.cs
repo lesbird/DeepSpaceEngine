@@ -91,6 +91,14 @@ public sealed class PlanetTerrain
     private const double MountainGain = 0.58; // > 0.5 keeps amplitude in the high octaves → rugged
     private const double DetailGain = 0.55;
     private const double CraterRimFrac = 0.28; // raised rim height as a fraction of crater depth
+    // Impact craters are a multi-scale cascade, not two classes: many size decades from large basins
+    // down to small pits, each LOD-gated so the right scales appear at the right distance (the look of
+    // a real airless body, where craters pepper every scale). Finer octaves are shallower (depth ∝
+    // diameter), and the weighted-average normalisation keeps the field in [-1, rim] so the analytic
+    // Amplitude bound is unchanged.
+    private const int CraterOctaves = 10;
+    private const double CraterLacunarity = 1.9;
+    private const double CraterDepthFalloff = 0.62; // per-octave weight: smaller craters are shallower
 
     // Analytic upper bound on |height|: the three layers are bounded by their weights, and the
     // mountain term is ≥ 0. Resolved per type so an enabled override wins over the global knobs.
@@ -182,6 +190,15 @@ public sealed class PlanetTerrain
     /// (continent-scale) relief is already carried by the baked silhouette/colour.
     /// </summary>
     public double MacroReliefFrequency => _mountainFreq * PlanetTuning.EffectiveFrequency(Type);
+
+    /// <summary>True if this world is genuinely crater-dominated (airless "cratered" style), as opposed
+    /// to a weathered world carrying only a faint residual crater weight. Gates the crater albedo/maria
+    /// and the orbital crater shading — so an Ocean/plains world isn't painted (or charged) for craters.</summary>
+    public bool IsCratered => _craterWeight > 0.25;
+
+    /// <summary>Base frequency (cells over the unit sphere) of the largest craters — the scale the
+    /// orbital crater shader starts from (matching <see cref="CraterField"/>'s coarsest octave).</summary>
+    public double CraterOrbitalFrequency => _craterFreqA * 0.5 * PlanetTuning.EffectiveFrequency(Type);
 
     /// <summary>
     /// Where rugged mountain relief actually belongs, in [0,1]: 0 over ocean basins and flat
@@ -322,14 +339,28 @@ public sealed class PlanetTerrain
 
     // --- impact craters ---
 
-    /// <summary>Two crater size classes (large basins + smaller craters), normalised to [-1, rim].</summary>
+    /// <summary>A cascade of crater size classes (large basins → small pits), normalised to [-1, rim].
+    /// Each octave is finer and shallower than the last and LOD-gated, so coarse basins read from
+    /// orbit and progressively smaller craters fade in as the camera descends — no aliasing, no pop.</summary>
     private double CraterField(Vector3D<double> unitDir, double freqScale, double sampleSpacing)
     {
         double density = Math.Clamp(_craterDensity * PlanetTuning.EffectiveCraterDensity(Type), 0.0, 1.0);
-        double a = CraterLayer(unitDir, _craterFreqA * freqScale, 0x1111u, sampleSpacing, density);
-        double b = CraterLayer(unitDir, _craterFreqB * freqScale, 0x2222u, sampleSpacing, density);
-        return (a + 0.6 * b) / 1.6;
+        // Start half an octave below the seeded basin frequency so the largest craters are genuine
+        // basins, then climb CraterOctaves decades finer.
+        double freq = _craterFreqA * 0.5;
+        double weight = 1.0, sum = 0.0, wsum = 0.0;
+        for (int o = 0; o < CraterOctaves; o++)
+        {
+            sum += weight * CraterLayer(unitDir, freq * freqScale, CraterSalt(o), sampleSpacing, density);
+            wsum += weight;
+            freq *= CraterLacunarity;
+            weight *= CraterDepthFalloff;
+        }
+        return sum / wsum; // weighted average stays in [-1, rim]
     }
+
+    /// <summary>Per-octave hash salt so each crater size class lays down an independent pattern.</summary>
+    private static ulong CraterSalt(int octave) => 0x1111u + (ulong)octave * 0x9E3779B97F4A7C15u;
 
     /// <summary>
     /// One crater size class. Accumulates every crater in the surrounding 3×3×3 cells (one per cell)
@@ -416,7 +447,7 @@ public sealed class PlanetTerrain
     /// moisture field); <paramref name="slope"/> is cos(angle-from-vertical) — 1 on flats, → 0 on
     /// cliffs — so steep faces read as bare rock and snow settles on gentle ground / cold latitudes.
     /// </summary>
-    public Vector3D<float> ColorAt(Vector3D<double> dir, double height, double slope)
+    public Vector3D<float> ColorAt(Vector3D<double> dir, double height, double slope, double sampleSpacing)
     {
         double amplitude = Amplitude;
 
@@ -438,7 +469,42 @@ public sealed class PlanetTerrain
                             LandBand(dir, height, amplitude, slope), Smoothstepf(0f, 1f, above));
         }
 
-        return LandBand(dir, height, amplitude, slope);
+        Vector3D<float> land = LandBand(dir, height, amplitude, slope);
+        // Airless cratered worlds get crater-floor/rim albedo and maria provinces over the bare land.
+        return IsCratered ? RegolithAlbedo(land, dir, sampleSpacing) : land;
+    }
+
+    /// <summary>
+    /// Airless-body albedo over the bare substrate: <b>dark crater floors</b> and <b>bright rims/
+    /// ejecta</b> tracking the crater cascade, plus low-frequency <b>maria</b> provinces (darker
+    /// basaltic plains). This is what makes a cratered moon read as cratered from orbit to the
+    /// surface — relief alone goes flat on coarse far patches, but the maria term is low-frequency
+    /// enough to survive there. Strengths are live (TerrainTuning); a colour change needs a rebuild.
+    /// </summary>
+    private Vector3D<float> RegolithAlbedo(Vector3D<float> col, Vector3D<double> dir, double sampleSpacing)
+    {
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+
+        float ca = Math.Max(0f, TerrainTuning.CraterAlbedo);
+        if (ca > 0f)
+        {
+            double cr = CraterField(dir, fs, sampleSpacing);               // [-1, rim]
+            float dark = (float)Math.Max(0.0, -cr);                        // 0 at rim → 1 deep floor
+            float bright = (float)(Math.Max(0.0, cr) / CraterRimFrac);     // 0 → 1 at the rim crest
+            col *= 1f - 0.45f * ca * dark;                                 // darker, dust-pooled floors
+            col *= 1f + 0.30f * ca * bright;                               // brighter rims/ejecta
+        }
+
+        float ms = Math.Max(0f, TerrainTuning.MariaStrength);
+        if (ms > 0f)
+        {
+            var p = dir + new Vector3D<double>(23.7, 88.1, 4.3);           // decorrelate from other fields
+            double m = _noise.Fbm(p, 4, _continentFreq * fs * 0.6, 2.0, 0.5); // low freq → reads from orbit
+            float maria = (float)Smoothstep(0.08, 0.5, m);
+            Vector3D<float> mare = new(col.X * 0.55f, col.Y * 0.56f, col.Z * 0.60f); // darker, faintly cooler
+            col = Lerp(col, mare, maria * ms);
+        }
+        return col;
     }
 
     /// <summary>Climate + elevation + slope colour for dry land: a Whittaker biome ground colour,
@@ -524,9 +590,11 @@ public sealed class PlanetTerrain
         return Lerp(substrate, veg, (float)lush);
     }
 
-    /// <summary>Backward-compatible overloads (treat the point as on the equator / flat ground).</summary>
+    /// <summary>Backward-compatible overloads (full detail; treat the point as on the equator / flat ground).</summary>
+    public Vector3D<float> ColorAt(Vector3D<double> dir, double height, double slope)
+        => ColorAt(dir, height, slope, 0.0);
     public Vector3D<float> ColorAt(double height, double slope)
-        => ColorAt(new Vector3D<double>(1.0, 0.0, 0.0), height, slope);
+        => ColorAt(new Vector3D<double>(1.0, 0.0, 0.0), height, slope, 0.0);
     public Vector3D<float> ColorAt(double height) => ColorAt(height, 1.0);
 
     /// <summary>A small decorrelated noise offset that bends mountain ranges organically.</summary>

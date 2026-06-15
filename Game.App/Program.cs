@@ -640,10 +640,13 @@ internal static class Program
             terrainDirty |= ImGui.SliderFloat("Frequency", ref freq, 0.3f, 3f);
             terrainDirty |= ImGui.SliderFloat("Crater depth", ref craterDepth, 0f, 3f);
             terrainDirty |= ImGui.SliderFloat("Crater density", ref craterDensity, 0f, 3f);
-            ImGui.TextDisabled("(craters only on airless/cratered worlds)");
+            terrainDirty |= ImGui.SliderFloat("Crater albedo", ref TerrainTuning.CraterAlbedo, 0f, 2f);
+            terrainDirty |= ImGui.SliderFloat("Maria", ref TerrainTuning.MariaStrength, 0f, 1.5f);
+            ImGui.TextDisabled("(craters/maria only on airless worlds)");
             if (ImGui.Button("Reset terrain"))
             {
                 relief = 1f; mountain = 1f; freq = 1f; craterDepth = 1f; craterDensity = 1f;
+                TerrainTuning.CraterAlbedo = 1f; TerrainTuning.MariaStrength = 0.6f;
                 terrainDirty = true;
             }
         }

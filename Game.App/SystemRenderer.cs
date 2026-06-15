@@ -27,18 +27,92 @@ void main() {
     gl_Position = uMVP * vec4(aPos, 1.0);
 }";
 
+    // Distant planets/moons are drawn as smooth spheres (the quadtree terrain only activates for the
+    // one body you're near). This shader gives those spheres procedural surface detail — macro relief,
+    // impact craters and maria — so they read as real worlds from afar, all per-pixel and footprint
+    // band-limited (no aliasing) with no per-planet quadtree. Same noise/crater model as the terrain's
+    // orbital pass, so a body looks consistent as you approach and terrain takes over.
     private const string PlanetFragment = @"#version 410 core
 in vec3 vWorld;
 uniform vec3 uPlanetCenter;
 uniform vec3 uSunCenter;
 uniform vec3 uColor;
 uniform float uEmissive;
+uniform float uReliefAmp;       // relief height (metres) → normal perturbation
+uniform float uReliefFreq;      // macro-relief base frequency (cells over the unit sphere)
+uniform float uCraterStrength;  // 0 = not a cratered (airless) world
+uniform float uCraterFreq;      // largest-crater base frequency
+uniform float uMariaStrength;   // dark basaltic-plain provinces (airless)
+uniform float uPlanetRadiusM;
+uniform vec3  uSeedOffset;      // per-planet noise offset (variety)
 out vec4 FragColor;
+
+float h13(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }
+float vn(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    float n000 = h13(i), n100 = h13(i + vec3(1,0,0)), n010 = h13(i + vec3(0,1,0)), n110 = h13(i + vec3(1,1,0));
+    float n001 = h13(i + vec3(0,0,1)), n101 = h13(i + vec3(1,0,1)), n011 = h13(i + vec3(0,1,1)), n111 = h13(i + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x), x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+float fbm(vec3 p) { float s=0.0,a=0.5,n=0.0; for (int i=0;i<5;i++){s+=a*vn(p);n+=a;p*=2.03;a*=0.5;} return s/n; }
+float reliefF(vec3 d, float f, float fp) {
+    float s=0.0, fr=f, a=1.0, nm=0.0;
+    for (int o=0;o<6;o++){ float aa=1.0-smoothstep(0.4,0.9,fr*fp); s+=aa*a*(vn(d*fr)*2.0-1.0); nm+=a; fr*=2.0; a*=0.6; }
+    return s / max(nm, 1e-4);
+}
+float craterF(vec3 dir, float baseFreq, float fp) {
+    float sum=0.0, wsum=0.0, freq=baseFreq, weight=1.0;
+    for (int o=0;o<3;o++){   // coarse bands only — distant spheres need just the big craters
+        float aa = 1.0 - smoothstep(0.5, 1.1, freq * fp);
+        if (aa > 0.0) {
+            vec3 p = dir * freq; vec3 ip = floor(p); float minBowl=0.0, maxRim=0.0, salt=float(o)*17.0;
+            for (int dz=-1;dz<=1;dz++) for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++) {
+                vec3 c = ip + vec3(float(dx),float(dy),float(dz));
+                float ex = h13(c + vec3(salt)); if (ex > 0.6) continue;
+                vec3 jit = vec3(h13(c+vec3(salt+1.7)), h13(c+vec3(salt+9.1)), h13(c+vec3(salt+4.3)));
+                float radius = 0.22 + 0.28 * fract(ex*7.3+0.19);
+                float t = length(p - (c + jit)) / radius; if (t >= 1.5) continue;
+                float bowl = -(1.0 - smoothstep(0.0, 0.85, min(t,1.0)));
+                float e = (t - 0.95) / 0.12; float rim = 0.28 * exp(-0.5*e*e);
+                minBowl = min(minBowl, bowl); maxRim = max(maxRim, rim);
+            }
+            sum += weight * aa * (minBowl + maxRim);
+        }
+        wsum += weight; freq *= 1.9; weight *= 0.62;
+    }
+    return sum / max(wsum, 1e-4);
+}
+
 void main() {
     vec3 N = normalize(vWorld - uPlanetCenter);
     vec3 L = normalize(uSunCenter - vWorld);
+    vec3 col = uColor;
+
+    if (uEmissive < 0.5 && (uReliefAmp > 0.0 || uCraterStrength > 0.0)) {
+        vec3 dir = N + uSeedOffset;                                   // per-planet variety
+        float fp = max(max(fwidth(N.x), fwidth(N.y)), fwidth(N.z));   // pixel footprint
+        vec3 up = abs(N.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
+        vec3 T1 = normalize(cross(N, up)); vec3 T2 = cross(N, T1);
+        float eps = max(fp, 1e-5);
+        float r0 = reliefF(dir, uReliefFreq, fp), rA = reliefF(dir+T1*eps, uReliefFreq, fp), rB = reliefF(dir+T2*eps, uReliefFreq, fp);
+        float invArc = uReliefAmp / (eps * uPlanetRadiusM);
+        N = normalize(N - ((rA-r0)*T1 + (rB-r0)*T2) * invArc);       // relief normal (cheap fBm, no cell search)
+        col *= 1.0 + 0.12 * (fbm(dir * 4.0) * 2.0 - 1.0);            // subtle large-scale mottle
+        if (uCraterStrength > 0.001) {
+            // Craters as albedo only (one crater-field evaluation) — the expensive 3×3×3 search runs once.
+            float c0 = craterF(dir, uCraterFreq, fp);
+            col *= 1.0 - 0.45 * uCraterStrength * max(0.0, -c0);     // crater floors darker
+            col *= 1.0 + 0.30 * uCraterStrength * max(0.0,  c0) / 0.28; // rims/ejecta brighter
+        }
+        if (uMariaStrength > 0.001) {
+            float m = smoothstep(0.08, 0.5, fbm(dir * 2.2) * 2.0 - 1.0);
+            col = mix(col, col * vec3(0.55, 0.56, 0.60), m * uMariaStrength);
+        }
+    }
+
     float diff = max(dot(N, L), 0.0);
-    vec3 lit = uColor * (0.04 + diff);
+    vec3 lit = col * (0.04 + diff);
     FragColor = vec4(mix(lit, uColor, uEmissive), 1.0);
 }";
 
@@ -143,7 +217,7 @@ void main() { FragColor = uColor; }";
         // --- Sun (emissive) ---
         _planetShader.Use();
         _planetShader.SetVector3("uSunCenter", sunRel);
-        DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f);
+        DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f, SurfaceParams.None);
 
         // --- Planets + moons (lit) ---
         foreach (Planet p in system.Planets)
@@ -153,14 +227,14 @@ void main() { FragColor = uColor; }";
             if (!ReferenceEquals(p, terrainBody))
             {
                 Vector3D<float> rel = p.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, rel, p.RadiusMeters, p.Color, sunRel, emissive: 0f);
+                DrawBody(viewProj, rel, p.RadiusMeters, p.Color, sunRel, emissive: 0f, ParamsFor(p));
             }
 
             foreach (Moon mn in p.Moons)
             {
                 if (ReferenceEquals(mn, terrainBody)) continue;
                 Vector3D<float> mrel = mn.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.Color, sunRel, emissive: 0f);
+                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.Color, sunRel, emissive: 0f, ParamsFor(mn));
             }
         }
 
@@ -214,7 +288,7 @@ void main() { FragColor = uColor; }";
     }
 
     private void DrawBody(in Matrix4X4<float> viewProj, Vector3D<float> rel, double radius,
-        Vector3D<float> color, Vector3D<float> sunRel, float emissive)
+        Vector3D<float> color, Vector3D<float> sunRel, float emissive, in SurfaceParams sp)
     {
         Matrix4X4<float> model = Matrix4X4.CreateScale((float)radius) * Matrix4X4.CreateTranslation(rel);
         _planetShader.SetMatrix("uModel", model);
@@ -223,7 +297,39 @@ void main() { FragColor = uColor; }";
         _planetShader.SetVector3("uSunCenter", sunRel);
         _planetShader.SetVector3("uColor", color);
         _planetShader.SetFloat("uEmissive", emissive);
+        _planetShader.SetFloat("uReliefAmp", sp.ReliefAmp);
+        _planetShader.SetFloat("uReliefFreq", sp.ReliefFreq);
+        _planetShader.SetFloat("uCraterStrength", sp.CraterStrength);
+        _planetShader.SetFloat("uCraterFreq", sp.CraterFreq);
+        _planetShader.SetFloat("uMariaStrength", sp.MariaStrength);
+        _planetShader.SetFloat("uPlanetRadiusM", (float)radius);
+        _planetShader.SetVector3("uSeedOffset", sp.SeedOffset);
         _sphere.Draw();
+    }
+
+    /// <summary>Cheap per-body procedural-surface params for the distant sphere shader, derived from
+    /// the body (no PlanetTerrain needed). Gas/ice giants stay flat; airless worlds get craters + maria;
+    /// others get gentle relief. The seed offset varies the noise so worlds differ.</summary>
+    private readonly record struct SurfaceParams(
+        float ReliefAmp, float ReliefFreq, float CraterStrength, float CraterFreq, float MariaStrength,
+        Vector3D<float> SeedOffset)
+    {
+        public static readonly SurfaceParams None = new(0f, 0f, 0f, 0f, 0f, default);
+    }
+
+    private static SurfaceParams ParamsFor(CelestialBody b)
+    {
+        if (!b.HasSurface) return SurfaceParams.None; // gas/ice giants keep their flat banding colour
+        bool airless = !b.HasAtmosphere;
+        var rng = new DeterministicRng(Hashing.Combine(b.Seed, 0xB0DEu));
+        var off = new Vector3D<float>((float)rng.Range(0, 128), (float)rng.Range(0, 128), (float)rng.Range(0, 128));
+        return new SurfaceParams(
+            ReliefAmp: (float)(b.RadiusMeters * (airless ? 0.020 : 0.012)),
+            ReliefFreq: 6f,
+            CraterStrength: airless ? 1f : 0f,
+            CraterFreq: 18f,
+            MariaStrength: airless ? 0.6f : 0f,
+            SeedOffset: off);
     }
 
     /// <summary>Near/far planes from the most recent <see cref="FitProjection"/> (for depth reconstruction).</summary>
