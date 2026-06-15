@@ -26,6 +26,7 @@ public sealed class PlanetTerrainRenderer : IDisposable
     // thread, capped at this many finished patches per frame so a burst of bakes can't stall a frame.
     private const int UploadsPerFrame = 8;
     private const int LandFloatsPerVertex = 15; // finePos(3) + coarsePos(3) + fineNrm(3) + coarseNrm(3) + color(3)
+    private const double DetailBaseFreq = 0.25; // detail-normal noise cells per metre (~4 m wavelength)
 
     // Geomorphing: each vertex carries both a FINE position/normal (this patch's resolution) and a
     // COARSE one (its parent's resolution). uMorph (0 = full detail, 1 = exactly the parent's
@@ -39,23 +40,80 @@ layout(location = 3) in vec3 aCoarseNormal;
 layout(location = 4) in vec3 aColor;
 uniform mat4 uMVP;
 uniform float uMorph;
+uniform vec3 uPatchFracBase;  // fract(patchCenter * detailFreq) — integer part travels in uPatchCellBase
+uniform float uDetailFreq;    // detail-noise cells per metre
 out vec3 vNormal;
 out vec3 vColor;
+out vec3 vNoiseCoord;         // planet-stable, precise fractional noise coordinate (no swim, no seams)
 void main() {
     vec3 pos = mix(aFinePos, aCoarsePos, uMorph);
     vNormal = normalize(mix(aFineNormal, aCoarseNormal, uMorph));
     vColor = aColor;
+    // pos is patch-centre-relative (small, precise); adding fracBase reconstructs the planet-local
+    // noise coordinate without the precision loss of using full planet-scale positions.
+    vNoiseCoord = uPatchFracBase + pos * uDetailFreq;
     gl_Position = uMVP * vec4(pos, 1.0);
 }";
 
     private const string FragmentSource = @"#version 410 core
 in vec3 vNormal;
 in vec3 vColor;
+in vec3 vNoiseCoord;
 uniform vec3 uSunDir;
+uniform vec3 uPatchCellBase;   // wrapped integer cell base (planet-local), keeps the hash precise
+uniform float uDetailStrength; // detail-normal bump strength (0 = off)
+uniform float uDetailAlbedo;   // albedo break-up amount
 out vec4 FragColor;
+
+// Small-input integer hash (Dave Hoskins style) — cell coords are wrapped below so it stays precise.
+float hash13(vec3 p) {
+    p = mod(p, 4096.0);
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+// Value noise in [0,1]. `base` is the (large, integer) planet-local cell; `nc` the precise small
+// fractional coordinate. Splitting them this way avoids the catastrophic cancellation that using a
+// single planet-scale float would cause, and the mod() in hash13 keeps the result seamless across
+// patches (a shared planet-local point maps to the same cell + fraction from either patch).
+float vnoise(vec3 base, vec3 nc) {
+    vec3 c = base + floor(nc);
+    vec3 f = fract(nc);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(c),                 n100 = hash13(c + vec3(1,0,0));
+    float n010 = hash13(c + vec3(0,1,0)),   n110 = hash13(c + vec3(1,1,0));
+    float n001 = hash13(c + vec3(0,0,1)),   n101 = hash13(c + vec3(1,0,1));
+    float n011 = hash13(c + vec3(0,1,1)),   n111 = hash13(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+
 void main() {
-    float d = max(dot(normalize(vNormal), uSunDir), 0.0);
-    FragColor = vec4(vColor * (0.06 + 0.95 * d), 1.0);
+    vec3 N = normalize(vNormal);
+    vec3 col = vColor;
+
+    if (uDetailStrength > 0.0001) {
+        // Band-limit by the pixel footprint in noise cells: fade the detail out once a pixel spans
+        // more than ~a cell, so it adds crisp roughness up close but never shimmers from orbit.
+        float footprint = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        float fade = 1.0 - smoothstep(0.4, 1.5, footprint);
+        if (fade > 0.0) {
+            float e = 0.15;
+            float n0 = vnoise(uPatchCellBase, vNoiseCoord);
+            float nx = vnoise(uPatchCellBase, vNoiseCoord + vec3(e, 0.0, 0.0));
+            float ny = vnoise(uPatchCellBase, vNoiseCoord + vec3(0.0, e, 0.0));
+            float nz = vnoise(uPatchCellBase, vNoiseCoord + vec3(0.0, 0.0, e));
+            vec3 grad = vec3(nx - n0, ny - n0, nz - n0) / e;       // gradient of the micro-height
+            vec3 tang = grad - dot(grad, N) * N;                   // along-surface component
+            N = normalize(N - uDetailStrength * fade * tang);      // bump-mapped normal
+            col *= 1.0 + uDetailAlbedo * (n0 - 0.5) * fade;        // subtle albedo break-up
+        }
+    }
+
+    float d = max(dot(N, uSunDir), 0.0);
+    FragColor = vec4(col * (0.06 + 0.95 * d), 1.0);
 }";
 
     // Translucent ocean surface: diffuse + a sharp sun glint + a fresnel edge that fades the
@@ -114,6 +172,7 @@ void main() {
     private CelestialBody? _body;
     private PlanetTerrain? _terrain;
     private QuadNode[]? _roots;
+    private double _detailNoiseFreq; // this frame's detail-normal frequency (set in Render)
 
     public int LeafCount { get; private set; }
     public int PatchCount { get; private set; }
@@ -225,6 +284,10 @@ void main() {
         _gl.DepthMask(true);
         _shader.Use();
         _shader.SetVector3("uSunDir", sunDir);
+        _detailNoiseFreq = DetailBaseFreq * Math.Max(0.01f, TerrainTuning.DetailNormalScale);
+        _shader.SetFloat("uDetailFreq", (float)_detailNoiseFreq);
+        _shader.SetFloat("uDetailStrength", Math.Max(0f, TerrainTuning.DetailNormalStrength));
+        _shader.SetFloat("uDetailAlbedo", TerrainTuning.DetailAlbedo);
 
         DrainReadyPatches(); // upload any patches baked since last frame before we traverse
         LeafCount = 0;
@@ -319,8 +382,33 @@ void main() {
         Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
         _shader.SetMatrix("uMVP", model * viewProj);
         _shader.SetFloat("uMorph", morph);
+        SetPatchDetailBase(node);
         node.Patch.Draw(_gl);
         if (node.Patch.HasWater) _waterFrame.Add((node.Patch, rel)); // drawn in the later water pass
+    }
+
+    /// <summary>
+    /// Per-patch detail-noise base: the patch centre's planet-local cell (integer part, wrapped to a
+    /// large period so the shader hash stays precise) and fraction. The fragment shader reconstructs a
+    /// seamless, swim-free noise coordinate from this plus the (small, precise) patch-relative vertex
+    /// position — so detail neither slides as you move nor seams at patch boundaries.
+    /// </summary>
+    private void SetPatchDetailBase(QuadNode node)
+    {
+        double freq = _detailNoiseFreq;
+        Vector3D<double> c = node.CenterLocal;
+        double fx = Math.Floor(c.X * freq), fy = Math.Floor(c.Y * freq), fz = Math.Floor(c.Z * freq);
+        _shader.SetVector3("uPatchCellBase", new Vector3D<float>(WrapCell(fx), WrapCell(fy), WrapCell(fz)));
+        _shader.SetVector3("uPatchFracBase", new Vector3D<float>(
+            (float)(c.X * freq - fx), (float)(c.Y * freq - fy), (float)(c.Z * freq - fz)));
+    }
+
+    /// <summary>Wrap an integer cell index into [0, 4096) (matching the shader's hash period).</summary>
+    private static float WrapCell(double flooredCell)
+    {
+        double m = flooredCell % 4096.0;
+        if (m < 0) m += 4096.0;
+        return (float)m;
     }
 
     private static double Smoothstep(double lo, double hi, double x)

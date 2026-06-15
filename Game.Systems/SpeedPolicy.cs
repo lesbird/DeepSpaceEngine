@@ -29,7 +29,7 @@ public static class SpeedPolicy
     public const double ApproachRate = 3.0;
 
     /// <summary>Lowest the cap ever falls to (m/s), so you can still creep right at a surface.</summary>
-    public const double MinApproachSpeed = 100.0;
+    public const double MinApproachSpeed = 1000.0;
 
     /// <summary>A star's slowdown zone reaches this many stellar radii from its surface. Large, so the
     /// limit engages out at roughly the scale of the planetary system (~hundredths of a light-year for

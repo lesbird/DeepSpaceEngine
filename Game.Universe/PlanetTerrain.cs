@@ -35,6 +35,7 @@ public sealed class PlanetTerrain
     private readonly double _continentFreq;
     private readonly double _mountainFreq;
     private readonly double _detailFreq;
+    private readonly double _microFreq;
     private readonly double _warpFreq;
     private readonly double _warpStrength;
     private readonly double _mountainWeight;    // seeded mountain weight (scaled by MountainScale)
@@ -58,8 +59,15 @@ public sealed class PlanetTerrain
     // aliasing into noise when the whole planet is a few coarse patches seen from orbit.
     private const int WarpOctaves = 3;
     private const int MaxContinentOctaves = 9;
-    private const int MaxMountainOctaves = 16;
-    private const int MaxDetailOctaves = 14;
+    private const int MaxMountainOctaves = 20;
+    private const int MaxDetailOctaves = 18;
+    // A separate fine micro-relief layer, octaves above the detail layer and LOD-gated so it appears
+    // only when a patch resolves it (no aliasing from orbit). Small weight: it adds crisp close-up
+    // roughness without changing the planet's silhouette. Folded into `shape` like the other layers,
+    // so the analytic Amplitude bound (weights sum to the relief budget) still holds exactly.
+    private const int MaxMicroOctaves = 8;
+    private const double MicroGain = 0.5;
+    private const double MicroWeight = 0.0006;
     // Continents are the lowest-frequency layer, so their amplitude shows up as the planet's
     // large-scale silhouette. Keeping it modest stops continental swells from looming over the
     // limb as "mountains" that turn out to be gentle slopes when you actually fly there; the
@@ -76,6 +84,7 @@ public sealed class PlanetTerrain
     public double Amplitude =>
         _baseAmplitude * PlanetTuning.EffectiveRelief(Type) *
         (ContinentWeight + _mountainWeight * PlanetTuning.EffectiveMountain(Type) + DetailWeight
+         + MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale)
          + _craterWeight * PlanetTuning.EffectiveCraterScale(Type));
 
     public PlanetTerrain(CelestialBody body)
@@ -109,6 +118,7 @@ public sealed class PlanetTerrain
         _continentFreq = rng.Range(1.1, 2.2);
         _mountainFreq = _continentFreq * rng.Range(2.5, 4.0);
         _detailFreq = rng.Range(28.0, 60.0);   // fine roughness, layered above the mountains
+        _microFreq = _detailFreq * 10.0;       // micro-relief, an order finer (fixed multiple → no rng shift)
         _warpFreq = _continentFreq * rng.Range(0.8, 1.6);
         _warpStrength = rng.Range(0.10, 0.22);
 
@@ -162,6 +172,21 @@ public sealed class PlanetTerrain
         double detail = _noise.Fbm(unitDir, detOct, _detailFreq * fs, 2.0, DetailGain); // [-1,1]
         double detailGate = _detailFloor + (1.0 - _detailFloor) * rugged; // [_detailFloor, 1]
 
+        // Fine micro-relief: high-frequency roughness, faded in only once a patch can resolve it
+        // (LayerGate) and damped in the flat regions (detailGate), so it crisps up close without
+        // aliasing from afar. Bounded by its weight, so |micro term| ≤ microW (Amplitude includes it).
+        double microW = MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale);
+        double micro = 0.0;
+        if (microW > 0.0)
+        {
+            double microGate = LayerGate(_microFreq * fs, sampleSpacing);
+            if (microGate > 0.0)
+            {
+                double microOct = OctavesFor(_microFreq * fs, sampleSpacing, MaxMicroOctaves);
+                micro = _noise.Fbm(unitDir, microOct, _microFreq * fs, 2.0, MicroGain) * microGate * detailGate;
+            }
+        }
+
         // Impact craters (airless worlds): a depressed bowl with a raised rim, in [-1, CraterRimFrac].
         // Depth and density are live-tunable (TerrainTuning.Crater*), scaling the seeded per-world amount.
         double craterW = _craterWeight * PlanetTuning.EffectiveCraterScale(Type);
@@ -172,6 +197,7 @@ public sealed class PlanetTerrain
         double shape = ContinentWeight * continents
                      + mWeight * mountains * mask * rugged
                      + DetailWeight * detail * detailGate
+                     + microW * micro
                      + craterW * crater;
         // The solid surface keeps its full relief even below the waterline — that *is* the sea
         // floor. A separate translucent water surface (PlanetTerrainRenderer) sits at SeaLevel,

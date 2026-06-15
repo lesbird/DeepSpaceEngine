@@ -26,4 +26,18 @@ public static class TerrainTuning
 
     /// <summary>Scales how many craters appear (the fraction of cells that bear one); 0 = none.</summary>
     public static float CraterDensity = 1.0f;
+
+    /// <summary>Scales the fine, LOD-gated micro-relief height layer that only appears up close;
+    /// 0 removes it. Changing it requires a terrain rebuild (it's geometry).</summary>
+    public static float MicroDetailScale = 1.0f;
+
+    /// <summary>Strength of the fragment-shader detail-normal bump (perceived close-up roughness);
+    /// 0 = off. Read live by the terrain shader — no rebuild needed.</summary>
+    public static float DetailNormalStrength = 0.4f;
+
+    /// <summary>Scales the detail-normal frequency; &gt;1 = finer bumps. Live (no rebuild).</summary>
+    public static float DetailNormalScale = 1.0f;
+
+    /// <summary>How much the detail noise breaks up the surface albedo (0 = none). Live (no rebuild).</summary>
+    public static float DetailAlbedo = 0.12f;
 }
