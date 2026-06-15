@@ -37,6 +37,15 @@ interstellar flight down to standing on a planet. See the full design in
 > thread, so descending toward a surface stays smooth instead of stalling the frame. Generation is
 > fully deterministic. M5 (fidelity) is underway.
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Interstellar flight with the Milky-Way band and star reticles](Screenshots/001.jpg)<br>**Interstellar flight** — the distant Milky-Way band behind the streamed star field, with on-screen reticles (id · class · distance) and the green nearest-star arrow. | ![Closing on an M-class star against the galactic bulge](Screenshots/002.jpg)<br>**Closing on a star** — an M-class sun reticled at 0.15 ly against the glowing galactic bulge, just inside system-spawn range. |
+| ![A spawned solar system seen from above with orbit rings](Screenshots/003.jpg)<br>**System overview** — a deterministic system materialised: emissive sun, Keplerian-orbiting planets and moons with `STAR-PLANET` designations and faint orbit rings. | ![A rocky planet with two moons up close](Screenshots/004.jpg)<br>**Approach** — a rocky world with two moons, the moons marked by distance-scaled glow dots that fade as their spheres resolve. |
+| ![Low pass over a cratered airless world](Screenshots/005.jpg)<br>**Airless world** — a low pass over a cratered moon, the rest of the system strung across the sky above the limb. | ![Approaching an atmospheric world, limb glow from space](Screenshots/006.jpg)<br>**Atmosphere from space** — the volumetric Rayleigh + Mie limb glow haloing a world as you drop toward it. |
+| ![Sunrise over mountainous terrain with aerial haze](Screenshots/007.jpg)<br>**Sunrise on the surface** — ridged-multifractal mountains under aerial-perspective haze, the sun and sibling planets climbing the sky. | ![Golden sunset on a planet surface](Screenshots/008.jpg)<br>**Sunset** — strong forward-scattered Mie glow reddening toward the terminator, with the planet chain overhead. |
+
 ## Tech stack
 
 - **.NET 7** (targets `net7.0`; the plan calls for net8 LTS — a one-line change in
