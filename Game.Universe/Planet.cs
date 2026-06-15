@@ -26,4 +26,8 @@ public sealed class Planet : CelestialBody
     public float RingTilt;               // radians — inclination of the ring plane
     public float RingTiltAzimuth;        // radians — node the tilt is taken about
     public ulong RingSeed;
+
+    /// <summary>Asteroid particles filling the ring annulus (null when the planet has no rings).
+    /// Rendered chunky/up-close by the hybrid-LOD asteroid renderer, over the smooth annulus band.</summary>
+    public PlanetRing? RingRocks;
 }

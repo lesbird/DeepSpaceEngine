@@ -121,11 +121,11 @@ void main() {
     private const string WaterVertexSource = @"#version 410 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec3 aColor;
+layout(location = 2) in vec4 aColor;   // rgb = water colour, a = depth-based base opacity
 uniform mat4 uMVP;
 uniform mat4 uModel;
 out vec3 vNormal;
-out vec3 vColor;
+out vec4 vColor;
 out vec3 vWorld;
 void main() {
     vNormal = aNormal;
@@ -136,10 +136,9 @@ void main() {
 
     private const string WaterFragmentSource = @"#version 410 core
 in vec3 vNormal;
-in vec3 vColor;
+in vec4 vColor;
 in vec3 vWorld;
 uniform vec3 uSunDir;
-uniform float uAlpha;
 out vec4 FragColor;
 void main() {
     vec3 N = normalize(vNormal);
@@ -149,8 +148,10 @@ void main() {
     vec3 H = normalize(L + V);
     float spec = pow(max(dot(N, H), 0.0), 90.0); // tight sun glint
     float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    vec3 col = vColor * (0.12 + 0.9 * diff) + vec3(1.0) * spec * 0.7;
-    float a = clamp(uAlpha + fres * 0.35, 0.0, 1.0);
+    vec3 col = vColor.rgb * (0.12 + 0.9 * diff) + vec3(1.0) * spec * 0.7;
+    // Base opacity is baked per vertex (deep water nearly opaque so the rugged sea floor never shows
+    // through; shallows stay clear). Grazing angles firm up further via fresnel.
+    float a = clamp(vColor.a + fres * 0.2, 0.0, 1.0);
     FragColor = vec4(col, a);
 }";
 
@@ -295,16 +296,18 @@ void main() {
         foreach (QuadNode root in _roots)
             Process(root, camera, viewProj);
 
-        // Translucent ocean pass over the opaque sea floor. Depth-tested (so land/terrain in
-        // front occludes it) but not depth-writing (so it blends and the atmosphere reads behind it).
+        // Ocean pass over the opaque sea floor. Depth-tested AND depth-writing: the flat sea-level
+        // surface must form the horizon silhouette (a smooth limb) and occlude the rugged sea floor
+        // behind/below it — otherwise the bumpy floor shows through and makes the "sea" look like
+        // hills. It still alpha-blends over the floor it covers (deep water nearly opaque, shallows
+        // clear), and the depth it writes is the true surface, so the atmosphere hazes the sea top.
         if (_waterFrame.Count > 0)
         {
             _gl.Enable(EnableCap.Blend);
             _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-            _gl.DepthMask(false);
+            _gl.DepthMask(true);
             _waterShader.Use();
             _waterShader.SetVector3("uSunDir", sunDir);
-            _waterShader.SetFloat("uAlpha", 0.62f);
             foreach ((TerrainPatch patch, Vector3D<float> rel) in _waterFrame)
             {
                 Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
@@ -639,9 +642,10 @@ void main() {
             Vector3D<double> nrm = dir[i, j];                 // radial (outward) normal
             float f = (float)Math.Clamp((seaLevel - hgt[i, j]) / (amp * 0.12 + 1.0), 0f, 1f);
             Vector3D<float> c = shallow + (deep - shallow) * f; // shallows pale, deeps dark blue
+            float alpha = 0.5f + 0.48f * f;                     // shallows see-through, deeps ~opaque
             w.Add((float)(p.X - centerLocal.X)); w.Add((float)(p.Y - centerLocal.Y)); w.Add((float)(p.Z - centerLocal.Z));
             w.Add((float)nrm.X); w.Add((float)nrm.Y); w.Add((float)nrm.Z);
-            w.Add(c.X); w.Add(c.Y); w.Add(c.Z);
+            w.Add(c.X); w.Add(c.Y); w.Add(c.Z); w.Add(alpha);
         }
 
         for (int j = 0; j < n; j++)
@@ -766,9 +770,9 @@ void main() {
 
         public bool HasWater => _waterCount > 0;
 
-        // Land: finePos, coarsePos, fineNrm, coarseNrm, colour (5 × vec3). Water: pos, nrm, colour.
+        // Land: finePos, coarsePos, fineNrm, coarseNrm, colour (5 × vec3). Water: pos, nrm, colour+alpha.
         private static readonly int[] LandLayout = { 3, 3, 3, 3, 3 };
-        private static readonly int[] WaterLayout = { 3, 3, 3 };
+        private static readonly int[] WaterLayout = { 3, 3, 4 };
 
         public TerrainPatch(GL gl, float[] land, float[] water)
         {

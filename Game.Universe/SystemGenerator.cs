@@ -61,7 +61,10 @@ public static class SystemGenerator
             planets[i] = planet;
         }
 
-        return new SolarSystem(star, planets);
+        // A main belt near the snow line (independent RNG, so it never perturbs the stream above).
+        AsteroidBelt? belt = AsteroidBelt.Generate(star, snowLineAu, starMassKg);
+
+        return new SolarSystem(star, planets, belt);
     }
 
     private static Moon[] GenerateMoons(ref DeterministicRng rng, Planet planet, string starDesignation, int planetIndex, double tempK)
@@ -204,6 +207,9 @@ public static class SystemGenerator
         p.RingTilt = (float)(p.AxialTilt + r.Range(-0.12, 0.12));
         p.RingTiltAzimuth = (float)r.Range(0, 2 * Math.PI);
         p.RingSeed = r.NextULong();
+
+        // Fill the annulus with orbiting asteroid particles (chunky up close, smooth band from afar).
+        p.RingRocks = PlanetRing.Generate(p);
     }
 
     private static void AssignAtmosphere(ref DeterministicRng rng, Planet p)

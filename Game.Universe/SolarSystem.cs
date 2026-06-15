@@ -13,16 +13,20 @@ public sealed class SolarSystem
     public readonly Star Sun;
     public readonly Planet[] Planets;
 
+    /// <summary>Optional main-belt asteroids orbiting the star (null when the system rolled none).</summary>
+    public readonly AsteroidBelt? Belt;
+
     public double MaxOrbitRadius { get; }
     public double MaxPlanetRadius { get; }
 
     /// <summary>Fastest body's true orbital speed (m/s); multiply by TimeScale for the apparent speed.</summary>
     public double MaxOrbitalSpeedMps { get; }
 
-    public SolarSystem(Star sun, Planet[] planets)
+    public SolarSystem(Star sun, Planet[] planets, AsteroidBelt? belt = null)
     {
         Sun = sun;
         Planets = planets;
+        Belt = belt;
 
         double maxOrbit = 0, maxRadius = 0, maxSpeed = 0;
         foreach (Planet p in planets)

@@ -14,6 +14,7 @@ namespace Game.App;
 internal static class Program
 {
     private const int RenderRadiusCells = 8;     // ~33 ly bubble
+    private const int AsteroidFieldRadiusCells = 2; // deep-space clusters within ~1.5 ly
     private const ulong WorldSeed = 0xA11CE5EEDUL;
 
     private static GL _gl = null!;
@@ -25,6 +26,9 @@ internal static class Program
     private static StarOverlay _overlay = null!;
     private static SolarSystemManager _systemManager = null!;
     private static SystemRenderer _systemRenderer = null!;
+    private static AsteroidFieldManager _asteroidFields = null!;
+    private static AsteroidRenderer _asteroidRenderer = null!;
+    private static readonly List<AsteroidInstance> _asteroidScratch = new();
     private static PlanetGlowRenderer _planetGlow = null!;
     private static GalacticGridRenderer _galacticGrid = null!;
     private static BlackHoleRenderer _blackHole = null!;
@@ -58,6 +62,8 @@ internal static class Program
     private static bool _prevTab;
     private static bool _prevComma, _prevPeriod, _prevP, _prevSpace;
     private static bool _prevF;
+    private static bool _prevB, _prevJ;
+    private static string _jumpStatus = "";
     private static bool _scannerOpen;
     private static bool _galacticGridVisible;
     private static bool _paused;
@@ -120,6 +126,8 @@ internal static class Program
         _overlay = new StarOverlay();
         _systemManager = new SolarSystemManager();
         _systemRenderer = new SystemRenderer(_gl);
+        _asteroidFields = new AsteroidFieldManager(WorldSeed);
+        _asteroidRenderer = new AsteroidRenderer(_gl);
         _planetGlow = new PlanetGlowRenderer(_gl);
         _galacticGrid = new GalacticGridRenderer(_gl);
         _blackHole = new BlackHoleRenderer(_gl);
@@ -192,6 +200,11 @@ internal static class Program
         // 'P' toggles the galactic-plane grid: a faint reference plane through the galaxy centre.
         if (Edge(Key.P, ref _prevP)) _galacticGridVisible = !_galacticGridVisible;
 
+        // Navigator shortcuts to actually find the asteroids: 'B' frames the nearest belted system,
+        // 'J' jumps into the nearest deep-space asteroid field.
+        if (!_driving && Edge(Key.B, ref _prevB)) JumpToBelt();
+        if (!_driving && Edge(Key.J, ref _prevJ)) JumpToCluster();
+
         // Orbit time controls: ',' slower, '.' faster, Space pause. (Edge is read every frame so the
         // toggle stays in sync; the pause only fires in free-flight, since Space is the rover brake.)
         bool spaceEdge = Edge(Key.Space, ref _prevSpace);
@@ -213,6 +226,7 @@ internal static class Program
 
         if (!_driving) _controller.Update(dt);
         _starField.Update(_camera.Position, RenderRadiusCells);
+        _asteroidFields.Update(_camera.Position, AsteroidFieldRadiusCells);
         _systemManager.Update(dt, _camera.Position, _starField);
 
         if (_driving)
@@ -278,6 +292,22 @@ internal static class Program
         _backdrop.Render(_camera);
         _starRenderer.Render(_camera, _starField.Visible, _systemManager.ActiveStarId);
 
+        // Deep-space asteroid clusters: drawn on the still-clear depth buffer with their own fitted
+        // projection so rocks self-occlude. Depth is cleared again below before the system pass, so
+        // this stays isolated from the system/terrain depth.
+        if (_asteroidRenderer.Enabled)
+        {
+            _asteroidScratch.Clear();
+            _asteroidFields.Collect(_systemManager.SimTime, _camera.Position, 0.1 * MathUtil.LightYear, _asteroidScratch);
+            if (_asteroidScratch.Count > 0)
+            {
+                _gl.Enable(EnableCap.DepthTest);
+                Matrix4X4<float> vp = AsteroidRenderer.FitProjection(_camera, _asteroidScratch);
+                _asteroidRenderer.Render(_camera, _asteroidScratch, vp, default, hasSun: false, _sceneFbo.Height);
+                _gl.Disable(EnableCap.DepthTest);
+            }
+        }
+
         // Galactic-centre features at the origin: the optional plane grid, then the supermassive
         // black hole. Drawn now while the depth buffer is still clear; both use their own wide
         // projections, so we clear depth again afterwards to leave the system/terrain passes — and
@@ -291,6 +321,32 @@ internal static class Program
             _systemRenderer.Render(_camera, _systemManager.Active!, _terrainTarget);
             // Distance-scaled glow dots that mark each body from afar and fade as its sphere grows.
             _planetGlow.Render(_camera, _systemManager.Active!, _sceneFbo.Height, _terrainTarget);
+
+            // Sun-lit asteroids sharing the system's projection + depth (planets occlude them and
+            // vice versa): the main belt plus each ringed planet's orbiting ring particles, gathered
+            // into one batch and drawn hybrid-LOD. All collected in double precision.
+            if (_asteroidRenderer.Enabled)
+            {
+                SolarSystem sys = _systemManager.Active!;
+                double simT = _systemManager.SimTime;
+                UniversePosition cam = _camera.Position;
+                double maxDist = _systemRenderer.LastFar;
+
+                _asteroidScratch.Clear();
+                sys.Belt?.Collect(simT, sys.Sun.Position, cam, maxDist, _asteroidScratch);
+                foreach (Planet p in sys.Planets)
+                    p.RingRocks?.Collect(simT, p.CurrentPosition, cam, maxDist, _asteroidScratch);
+
+                if (_asteroidScratch.Count > 0)
+                {
+                    Vector3D<float> sunRel = sys.Sun.Position.ToCameraRelative(cam);
+                    Matrix4X4<float> vp = _camera.ViewMatrix * MatrixHelper.PerspectiveGL(
+                        _camera.FovRadians, _camera.AspectRatio, _systemRenderer.LastNear, _systemRenderer.LastFar);
+                    _gl.Enable(EnableCap.DepthTest);
+                    _asteroidRenderer.Render(_camera, _asteroidScratch, vp, sunRel, hasSun: true, _sceneFbo.Height);
+                    _gl.Disable(EnableCap.DepthTest);
+                }
+            }
         }
 
         if (_terrainTarget != null)
@@ -374,6 +430,9 @@ internal static class Program
 
         ImGui.Text($"Stars rendered: {_starRenderer.LastDrawn}");
         ImGui.Text($"Cells cached:   {_starField.CachedCellCount}");
+        int rocks = _asteroidRenderer.LastRocks, sprites = _asteroidRenderer.LastSprites;
+        if (rocks + sprites > 0)
+            ImGui.Text($"Asteroids:      {rocks} rocks / {sprites} dots");
         ImGui.Separator();
 
         if (_starField.HasNearest)
@@ -439,7 +498,9 @@ internal static class Program
         ImGui.Text(_mouseCaptured ? "Mouse: captured (Tab to release)" : "Mouse: free (Tab to capture)");
         ImGui.Text(_driving
             ? "DRIVE: W/S throttle | A/D steer | Space brake | R exit | Esc quit"
-            : "WASD move | Q/E roll | wheel speed | R drive | F scan | P grid | Space pause | Esc quit");
+            : "WASD move | Q/E roll | wheel speed | R drive | F scan | P grid | B belt | J field | Esc quit");
+        if (_jumpStatus.Length > 0)
+            ImGui.TextColored(new System.Numerics.Vector4(0.6f, 1f, 0.7f, 1f), _jumpStatus);
         ImGui.End();
     }
 
@@ -477,10 +538,21 @@ internal static class Program
             ImGui.Checkbox("Render backdrop", ref b.Enabled);
             ImGui.SliderFloat("Band glow", ref b.BandBrightness, 0f, 2f);
             ImGui.SliderFloat("Distant stars", ref b.StarBrightness, 0f, 3f);
+            ImGui.SliderFloat("Nebulae", ref b.NebulaBrightness, 0f, 2f);
             if (ImGui.Button("Reset backdrop"))
             {
                 b.Enabled = true; b.BandBrightness = 0.6f; b.StarBrightness = 1.0f;
+                b.NebulaBrightness = 0.7f;
             }
+        }
+
+        if (ImGui.CollapsingHeader("Asteroids", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            ImGui.Checkbox("Render asteroids", ref _asteroidRenderer.Enabled);
+            ImGui.Text($"3D rocks: {_asteroidRenderer.LastRocks}");
+            ImGui.Text($"Sprites:  {_asteroidRenderer.LastSprites}");
+            ImGui.Text($"Clusters in range: {_asteroidFields.VisibleClusterCount}");
+            ImGui.TextDisabled("(belt appears in-system; clusters roam deep space)");
         }
 
         if (ImGui.CollapsingHeader("Bloom", ImGuiTreeNodeFlags.DefaultOpen))
@@ -768,6 +840,49 @@ internal static class Program
                 Consider(b.CurrentPosition.DistanceTo(_camera.Position), b.RadiusMeters, isStar: false);
 
         _controller.SetSpeedContext(cap, gap);
+    }
+
+    /// <summary>Frame the nearest belted star's system from an oblique angle, so the asteroid ring is
+    /// in view. The system itself spawns on the next update (the new position is well within range).</summary>
+    private static void JumpToBelt()
+    {
+        Star best = default;
+        bool found = false;
+        double bestSq = double.MaxValue;
+        foreach (Star s in _starField.Visible)
+        {
+            if (!AsteroidBelt.Rolls(s)) continue;
+            double dsq = s.Position.DistanceSquaredTo(_camera.Position);
+            if (dsq < bestSq) { bestSq = dsq; best = s; found = true; }
+        }
+        if (!found) { _jumpStatus = "No belted system in range"; return; }
+
+        SolarSystem sys = SystemGenerator.Generate(best);
+        if (sys.Belt is not { } belt) { _jumpStatus = "No belt on nearest candidate"; return; }
+
+        // Same framing the app opens with on the black hole: pitch down, then back off along forward.
+        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.5f);
+        Vector3D<float> fwd = _camera.Forward;
+        double dist = belt.OuterRadius * 1.6;
+        _camera.Position = best.Position.Translated(
+            new Vector3D<double>(-fwd.X * dist, -fwd.Y * dist, -fwd.Z * dist));
+        _jumpStatus = $"Framed belt of {best.Designation} — {belt.Count} rocks (fly in to resolve them)";
+    }
+
+    /// <summary>Drop the camera into the nearest deep-space asteroid field, looking through its core.</summary>
+    private static void JumpToCluster()
+    {
+        if (!_asteroidFields.TryFindNearest(_camera.Position, searchCells: 6, out AsteroidField f))
+        {
+            _jumpStatus = "No asteroid field found within range";
+            return;
+        }
+        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.15f);
+        Vector3D<float> fwd = _camera.Forward;
+        double back = f.BoundRadius * 0.5; // sit toward one edge so the bulk of the field is ahead
+        _camera.Position = f.Center.Translated(
+            new Vector3D<double>(-fwd.X * back, -fwd.Y * back, -fwd.Z * back));
+        _jumpStatus = $"Dropped into asteroid field — {f.Count} rocks";
     }
 
     private static CelestialBody? PickTerrainTarget()

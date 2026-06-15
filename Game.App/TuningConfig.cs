@@ -17,6 +17,7 @@ public sealed class TuningConfig
     public bool RenderBackdrop { get; set; } = true;
     public float BandBrightness { get; set; } = 0.6f;
     public float BackdropStarBrightness { get; set; } = 1.0f;
+    public float NebulaBrightness { get; set; } = 0.7f;
 
     // Atmosphere.
     public bool RenderAtmosphere { get; set; } = true;
@@ -77,6 +78,7 @@ public sealed class TuningConfig
         RenderBackdrop = b.Enabled,
         BandBrightness = b.BandBrightness,
         BackdropStarBrightness = b.StarBrightness,
+        NebulaBrightness = b.NebulaBrightness,
         RenderAtmosphere = a.Enabled,
         SunIntensity = a.SunIntensity,
         Exposure = a.Exposure,
@@ -132,6 +134,7 @@ public sealed class TuningConfig
         b.Enabled = RenderBackdrop;
         b.BandBrightness = BandBrightness;
         b.StarBrightness = BackdropStarBrightness;
+        b.NebulaBrightness = NebulaBrightness;
         a.Enabled = RenderAtmosphere;
         a.SunIntensity = SunIntensity;
         a.Exposure = Exposure;

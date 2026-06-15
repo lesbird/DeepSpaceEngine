@@ -251,6 +251,8 @@ void main() { FragColor = uColor; }";
             Consider(p.CurrentPosition, extent);
             foreach (Moon mn in p.Moons) Consider(mn.CurrentPosition, mn.RadiusMeters);
         }
+        // The asteroid belt extends past the planets in some systems — keep its rocks inside the far plane.
+        if (system.Belt != null) Consider(system.Sun.Position, system.Belt.OuterRadius);
 
         double near = Math.Max(100.0, minSurf * 0.5);
         double far = Math.Max(maxFar * 1.2, near * 10.0);
