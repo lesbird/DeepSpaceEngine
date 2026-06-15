@@ -408,14 +408,17 @@ void main() {
         _gl.DepthMask(true);
     }
 
+    // Clouds only attach to terrestrial worlds. Gas/ice giants set HasAtmosphere (for the atmosphere
+    // limb/scattering) but have no solid surface — their banding IS their appearance, so an Earth-style
+    // cloud deck layered over it just looks wrong. Gate on HasSurface to exclude them.
     private static CelestialBody? PickBody(SolarSystem system, in UniversePosition cam, CelestialBody? groundBody)
     {
-        if (groundBody is { HasAtmosphere: true }) return groundBody;
+        if (groundBody is { HasAtmosphere: true, HasSurface: true }) return groundBody;
         CelestialBody? best = null;
         double bestSq = double.MaxValue;
         foreach (CelestialBody b in system.AllBodies())
         {
-            if (!b.HasAtmosphere) continue;
+            if (!b.HasAtmosphere || !b.HasSurface) continue;
             double dsq = b.CurrentPosition.DistanceSquaredTo(cam);
             if (dsq < bestSq) { bestSq = dsq; best = b; }
         }
