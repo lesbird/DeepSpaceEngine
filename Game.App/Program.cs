@@ -641,13 +641,35 @@ internal static class Program
             terrainDirty |= ImGui.SliderFloat("Micro relief", ref TerrainTuning.MicroDetailScale, 0f, 3f);
             ImGui.SliderFloat("Detail normals", ref TerrainTuning.DetailNormalStrength, 0f, 1.5f);
             ImGui.SliderFloat("Detail fineness", ref TerrainTuning.DetailNormalScale, 0.25f, 4f);
+            ImGui.SliderFloat("Detail range", ref TerrainTuning.SurfaceDetailRange, 1f, 16f);
             ImGui.SliderFloat("Detail albedo", ref TerrainTuning.DetailAlbedo, 0f, 0.5f);
+            ImGui.SliderFloat("Material detail", ref TerrainTuning.MaterialDetail, 0f, 1.5f);
+            ImGui.SliderFloat("Surface specular", ref TerrainTuning.SurfaceSpecular, 0f, 1f);
+            ImGui.SliderFloat("Surface ambient", ref TerrainTuning.SurfaceAmbient, 0f, 0.3f);
             ImGui.TextDisabled("(detail appears only as you get close to the surface)");
             if (ImGui.Button("Reset detail"))
             {
                 TerrainTuning.MicroDetailScale = 1f; TerrainTuning.DetailNormalStrength = 0.4f;
                 TerrainTuning.DetailNormalScale = 1f; TerrainTuning.DetailAlbedo = 0.12f;
+                TerrainTuning.SurfaceDetailRange = 4f;
+                TerrainTuning.MaterialDetail = 0.5f; TerrainTuning.SurfaceSpecular = 0.2f;
+                TerrainTuning.SurfaceAmbient = 0.10f;
                 terrainDirty = true;
+            }
+        }
+
+        if (ImGui.CollapsingHeader("Orbital relief (from space)", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            // All read live by the shader — mountain ranges lit/mottled on the smooth far-LOD mesh.
+            ImGui.SliderFloat("Relief shading", ref TerrainTuning.OrbitalReliefStrength, 0f, 3f);
+            ImGui.SliderFloat("Relief albedo", ref TerrainTuning.OrbitalReliefAlbedo, 0f, 0.6f);
+            ImGui.SliderFloat("Relief fineness", ref TerrainTuning.OrbitalReliefScale, 0.25f, 4f);
+            ImGui.TextDisabled("(fades out as you descend and real terrain takes over)");
+            if (ImGui.Button("Reset orbital relief"))
+            {
+                TerrainTuning.OrbitalReliefStrength = 1f;
+                TerrainTuning.OrbitalReliefAlbedo = 0.2f;
+                TerrainTuning.OrbitalReliefScale = 1f;
             }
         }
 

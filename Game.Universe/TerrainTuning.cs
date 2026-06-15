@@ -38,6 +38,39 @@ public static class TerrainTuning
     /// <summary>Scales the detail-normal frequency; &gt;1 = finer bumps. Live (no rebuild).</summary>
     public static float DetailNormalScale = 1.0f;
 
+    /// <summary>How far from the camera the surface detail stays visible before smoothing out:
+    /// higher keeps coarser octaves on so the ground reads as textured toward the horizon instead
+    /// of going flat in the mid-distance. 1 = close-up only. Live (no rebuild).</summary>
+    public static float SurfaceDetailRange = 4.0f;
+
     /// <summary>How much the detail noise breaks up the surface albedo (0 = none). Live (no rebuild).</summary>
     public static float DetailAlbedo = 0.12f;
+
+    /// <summary>Procedural material breakup up close: dark cracks/cavity on rock + a faint mineral
+    /// tint, so the ground reads as material rather than flat paint; 0 = off. Live (no rebuild).</summary>
+    public static float MaterialDetail = 0.5f;
+
+    /// <summary>Close-up specular highlight strength — makes the detail normals catch the sun;
+    /// 0 = matte. Live (no rebuild).</summary>
+    public static float SurfaceSpecular = 0.2f;
+
+    /// <summary>Hemispheric ambient fill so shadowed slopes keep their form instead of going black;
+    /// the old flat term was 0.06. Live (no rebuild).</summary>
+    public static float SurfaceAmbient = 0.10f;
+
+    // --- Orbital macro-relief (the fragment-shader layer that makes mountain ranges read from space) ---
+    // Geometry is correctly band-limited to a smooth silhouette at orbital distance, so this relief
+    // lives entirely in the lighting normal and albedo: multi-octave noise over the planet direction,
+    // anti-aliased by the pixel footprint and faded out as the real mesh resolves the same scales up
+    // close. All three are read live by the terrain shader — no rebuild needed.
+
+    /// <summary>Strength of the orbital macro-relief normal shading (mountain ranges catching the sun
+    /// from space); 0 = off.</summary>
+    public static float OrbitalReliefStrength = 1.0f;
+
+    /// <summary>How much the macro relief darkens valleys / lightens ridges in albedo (0 = none).</summary>
+    public static float OrbitalReliefAlbedo = 0.2f;
+
+    /// <summary>Scales the macro-relief base frequency; &gt;1 = finer ranges. Live (no rebuild).</summary>
+    public static float OrbitalReliefScale = 1.0f;
 }

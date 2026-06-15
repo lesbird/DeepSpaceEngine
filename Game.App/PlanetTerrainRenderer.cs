@@ -25,8 +25,12 @@ public sealed class PlanetTerrainRenderer : IDisposable
     // on a background worker pool (see WorkerLoop). Only the cheap GPU upload happens on the render
     // thread, capped at this many finished patches per frame so a burst of bakes can't stall a frame.
     private const int UploadsPerFrame = 8;
-    private const int LandFloatsPerVertex = 15; // finePos(3) + coarsePos(3) + fineNrm(3) + coarseNrm(3) + color(3)
-    private const double DetailBaseFreq = 0.25; // detail-normal noise cells per metre (~4 m wavelength)
+    private const int LandFloatsPerVertex = 16; // finePos(3) + coarsePos(3) + fineNrm(3) + coarseNrm(3) + color(3) + relief(1)
+    // Coarse anchor for the surface-detail octave stack (~64 m wavelength). The shader runs 8 octaves
+    // up from here (×1…×128 → ~64 m down to ~0.5 m) as integer multipliers, so the seamless 4096-cell
+    // wrap still cancels at patch edges. A band-pass per octave keeps ~4 active at any distance: fine
+    // ones up close, coarse ones far away, so the ground stays textured out to the horizon.
+    private const double DetailBaseFreq = 0.015625; // detail-noise cells per metre (1/64 m)
 
     // Geomorphing: each vertex carries both a FINE position/normal (this patch's resolution) and a
     // COARSE one (its parent's resolution). uMorph (0 = full detail, 1 = exactly the parent's
@@ -38,13 +42,19 @@ layout(location = 1) in vec3 aCoarsePos;
 layout(location = 2) in vec3 aFineNormal;
 layout(location = 3) in vec3 aCoarseNormal;
 layout(location = 4) in vec3 aColor;
+layout(location = 5) in float aRelief;   // macro-relief mask (0 ocean/plains → 1 rugged highlands)
 uniform mat4 uMVP;
+uniform mat4 uModel;          // camera-relative patch translation — gives the view vector for specular
 uniform float uMorph;
 uniform vec3 uPatchFracBase;  // fract(patchCenter * detailFreq) — integer part travels in uPatchCellBase
 uniform float uDetailFreq;    // detail-noise cells per metre
+uniform vec3 uPatchCenter;    // patch centre in planet-local space (so we can rebuild the direction)
 out vec3 vNormal;
 out vec3 vColor;
 out vec3 vNoiseCoord;         // planet-stable, precise fractional noise coordinate (no swim, no seams)
+out vec3 vDir;                // planet-local surface direction (unit) — drives the orbital macro relief
+out vec3 vWorld;              // camera-relative world position (camera at the origin) — for the view dir
+out float vRelief;
 void main() {
     vec3 pos = mix(aFinePos, aCoarsePos, uMorph);
     vNormal = normalize(mix(aFineNormal, aCoarseNormal, uMorph));
@@ -52,6 +62,11 @@ void main() {
     // pos is patch-centre-relative (small, precise); adding fracBase reconstructs the planet-local
     // noise coordinate without the precision loss of using full planet-scale positions.
     vNoiseCoord = uPatchFracBase + pos * uDetailFreq;
+    // pos + patch centre is the planet-local position; normalised it is the surface direction. Low
+    // frequencies only, so float precision here is ample.
+    vDir = normalize(pos + uPatchCenter);
+    vWorld = (uModel * vec4(pos, 1.0)).xyz;
+    vRelief = aRelief;
     gl_Position = uMVP * vec4(pos, 1.0);
 }";
 
@@ -59,10 +74,24 @@ void main() {
 in vec3 vNormal;
 in vec3 vColor;
 in vec3 vNoiseCoord;
+in vec3 vDir;
+in vec3 vWorld;
+in float vRelief;
 uniform vec3 uSunDir;
 uniform vec3 uPatchCellBase;   // wrapped integer cell base (planet-local), keeps the hash precise
 uniform float uDetailStrength; // detail-normal bump strength (0 = off)
 uniform float uDetailAlbedo;   // albedo break-up amount
+uniform float uDetailLowCut;   // smallest cells-per-pixel an octave shows at (smaller = detail reaches further)
+uniform float uMaterialStrength; // procedural material breakup: cracks/cavity + mineral tint (0 = off)
+uniform float uSurfaceSpecular;  // close-up specular highlight strength (0 = off)
+uniform float uSurfaceAmbient;   // hemispheric ambient floor (sky/ground fill)
+// Orbital macro relief: mountain-scale relief that shows from space via lighting + albedo only.
+uniform float uReliefBaseFreq;     // base noise frequency (cells over the unit sphere)
+uniform float uReliefAmp;          // relief height scale (metres) used to turn slopes into a normal
+uniform float uVertexSpacingDir;   // this patch's vertex spacing in unit-direction units (spacing / R)
+uniform float uPlanetRadius;       // metres (converts a direction-space step to surface arc length)
+uniform float uOrbitalStrength;    // macro-relief normal strength (0 = off)
+uniform float uOrbitalAlbedo;      // macro-relief albedo mottle amount
 out vec4 FragColor;
 
 // Small-input integer hash (Dave Hoskins style) — cell coords are wrapped below so it stays precise.
@@ -90,30 +119,131 @@ float vnoise(vec3 base, vec3 nc) {
     return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
 }
 
+// One detail octave at integer frequency multiplier m. Because the per-patch cell base is an integer,
+// scaling both it and the fractional coordinate by an integer m reconstructs the exact same higher-
+// frequency lattice from any patch — so finer octaves stay seamless and swim-free like the base one.
+// Returns the value in .w (0..1) and its scaled-space gradient in .xyz (for the normal bump).
+vec4 detailSample(float m) {
+    vec3 bm = uPatchCellBase * m;
+    vec3 sc = vNoiseCoord * m;
+    float e = 0.15;
+    float n0 = vnoise(bm, sc);
+    float nx = vnoise(bm, sc + vec3(e, 0.0, 0.0));
+    float ny = vnoise(bm, sc + vec3(0.0, e, 0.0));
+    float nz = vnoise(bm, sc + vec3(0.0, 0.0, e));
+    return vec4(vec3(nx - n0, ny - n0, nz - n0) / e, n0);
+}
+
+// Low-frequency 3D value noise in [0,1] over the planet direction. Coordinates stay small (a few ×
+// the base frequency), so a single-coordinate hash is precise — no split-coordinate trick needed.
+float vnoise3(vec3 p) {
+    vec3 c = floor(p);
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(c),                 n100 = hash13(c + vec3(1,0,0));
+    float n010 = hash13(c + vec3(0,1,0)),   n110 = hash13(c + vec3(1,1,0));
+    float n001 = hash13(c + vec3(0,0,1)),   n101 = hash13(c + vec3(1,0,1));
+    float n011 = hash13(c + vec3(0,1,1)),   n111 = hash13(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+
+// Multi-octave macro relief height in ≈[-1,1] over a direction. Each octave fades out once it
+// approaches the pixel footprint (fp = cells per pixel at the base), so the field is always smooth
+// at pixel scale and never shimmers — the orbital analogue of the geometry band-limiter.
+float reliefFbm(vec3 dir, float baseFreq, float fp) {
+    float sum = 0.0, freq = baseFreq, amp = 1.0, norm = 0.0;
+    for (int o = 0; o < 8; o++) {
+        float aa = 1.0 - smoothstep(0.4, 0.9, freq * fp);   // anti-alias by the pixel footprint
+        sum += aa * amp * (vnoise3(dir * freq) * 2.0 - 1.0);
+        norm += amp;
+        freq *= 2.0;
+        amp *= 0.6;                                          // > 0.5 keeps ridges crisp
+    }
+    return sum / max(norm, 1e-6);
+}
+
 void main() {
     vec3 N = normalize(vNormal);
     vec3 col = vColor;
 
-    if (uDetailStrength > 0.0001) {
-        // Band-limit by the pixel footprint in noise cells: fade the detail out once a pixel spans
-        // more than ~a cell, so it adds crisp roughness up close but never shimmers from orbit.
-        float footprint = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
-        float fade = 1.0 - smoothstep(0.4, 1.5, footprint);
-        if (fade > 0.0) {
-            float e = 0.15;
-            float n0 = vnoise(uPatchCellBase, vNoiseCoord);
-            float nx = vnoise(uPatchCellBase, vNoiseCoord + vec3(e, 0.0, 0.0));
-            float ny = vnoise(uPatchCellBase, vNoiseCoord + vec3(0.0, e, 0.0));
-            float nz = vnoise(uPatchCellBase, vNoiseCoord + vec3(0.0, 0.0, e));
-            vec3 grad = vec3(nx - n0, ny - n0, nz - n0) / e;       // gradient of the micro-height
-            vec3 tang = grad - dot(grad, N) * N;                   // along-surface component
-            N = normalize(N - uDetailStrength * fade * tang);      // bump-mapped normal
-            col *= 1.0 + uDetailAlbedo * (n0 - 0.5) * fade;        // subtle albedo break-up
+    // --- Orbital macro relief: lights mountain ranges that the smooth far-LOD mesh can't show. ---
+    if (uOrbitalStrength > 0.0001 && vRelief > 0.001) {
+        vec3 dir = normalize(vDir);
+        float fp = max(max(fwidth(dir.x), fwidth(dir.y)), fwidth(dir.z)); // pixel footprint (dir units)
+        // Hand off to the real geometry as it resolves these scales: full from orbit (the mesh shows
+        // none of this relief), fading to nothing once vertex spacing resolves the mountain band.
+        float geomCut = 1.0 / max(2.0 * uVertexSpacingDir, 1e-9);         // freq the mesh already carries
+        float master = 1.0 - smoothstep(uReliefBaseFreq, uReliefBaseFreq * 32.0, geomCut);
+        master *= vRelief;
+        if (master > 0.001) {
+            // Surface-tangent gradient of the relief height → a normal perturbation. The step is the
+            // pixel footprint, so the slope we light is exactly the one a pixel can resolve.
+            vec3 up = abs(dir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            vec3 T1 = normalize(cross(dir, up));
+            vec3 T2 = cross(dir, T1);
+            float eps = max(fp, 1e-5);
+            float h0 = reliefFbm(dir, uReliefBaseFreq, fp);
+            float hA = reliefFbm(normalize(dir + T1 * eps), uReliefBaseFreq, fp);
+            float hB = reliefFbm(normalize(dir + T2 * eps), uReliefBaseFreq, fp);
+            float invArc = 1.0 / (eps * uPlanetRadius);     // direction step → surface metres
+            vec3 bump = ((hA - h0) * T1 + (hB - h0) * T2) * uReliefAmp * invArc;
+            N = normalize(N - uOrbitalStrength * master * bump);
+            col *= 1.0 + uOrbitalAlbedo * master * h0;       // valleys darker, ridges lighter
         }
     }
 
-    float d = max(dot(N, uSunDir), 0.0);
-    FragColor = vec4(col * (0.06 + 0.95 * d), 1.0);
+    if (uDetailStrength > 0.0001 || uMaterialStrength > 0.0001) {
+        // Band-limit by the pixel footprint in noise cells: fade the detail out once a pixel spans
+        // more than ~a cell, so it adds crisp roughness up close but never shimmers from orbit.
+        float footprint = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        // Band-pass octave stack: each octave shows only while its features span between ~2 px and
+        // ~(2/uDetailLowCut) px. So whatever scale a pixel can resolve at THIS distance, an octave
+        // covers it — fine grain up close, coarser texture far away — and the ground never collapses
+        // to smooth plastic in the mid-distance. The low cut also hands coarse scales back to the
+        // real mesh up close (where geometry already carries them), like the orbital layer's fade.
+        vec3 tangAccum = vec3(0.0);
+        float nDetail = 0.0, wsum = 0.0, m = 1.0;
+        for (int o = 0; o < 8; o++) {   // 8 octaves: ~64 m (×1) down to ~0.5 m (×128)
+            float c = footprint * m;                                  // this octave's cells per pixel
+            float oct = (1.0 - smoothstep(0.45, 1.3, c))             // anti-alias (drop sub-pixel octaves)
+                      * smoothstep(uDetailLowCut, uDetailLowCut * 3.0, c); // hand coarse scales to geometry
+            if (oct > 0.0) {
+                vec4 s = detailSample(m);
+                tangAccum += oct * (s.xyz - dot(s.xyz, N) * N);       // tangential component
+                nDetail += oct * (s.w - 0.5) * 2.0;                   // signed, ≈[-1,1]
+                wsum += oct;
+            }
+            m *= 2.0;
+        }
+        float baseFade = clamp(wsum, 0.0, 1.0);   // material/albedo presence (0 only when nothing resolves)
+        if (wsum > 0.0) {
+            nDetail = nDetail / wsum;
+
+            // (A) Multi-octave normal bump.
+            N = normalize(N - uDetailStrength * tangAccum);
+
+            // (B) Material breakup: brightness mottle, plus dark cracks/cavity that deepen on steep
+            // faces, plus a faint mineral tint — so the surface reads as rock/sediment, not flat paint.
+            float steep = 1.0 - clamp(dot(normalize(vNormal), normalize(vDir)), 0.0, 1.0); // 0 flat→1 cliff
+            col *= 1.0 + uDetailAlbedo * nDetail * baseFade;
+            float crack = smoothstep(0.25, -0.1, nDetail);                  // deep crevices (low noise)
+            col *= 1.0 - uMaterialStrength * baseFade * crack * (0.35 + 0.65 * steep);
+            col += uMaterialStrength * baseFade * 0.04 * nDetail * vec3(0.6, 0.5, 0.4);
+        }
+    }
+
+    // (C) Lighting: hemispheric ambient (up catches sky, down gets ground bounce) so shadowed slopes
+    // keep their form, plus a subtle specular that makes all the normal detail above actually read.
+    vec3 up = normalize(vDir);
+    vec3 V = normalize(-vWorld);
+    float diff = max(dot(N, uSunDir), 0.0);
+    float ambient = uSurfaceAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up));
+    vec3 H = normalize(uSunDir + V);
+    float gloss = mix(18.0, 70.0, clamp(col.b - col.r + 0.3, 0.0, 1.0)); // icy/wet (bluer) → tighter glint
+    float spec = uSurfaceSpecular * pow(max(dot(N, H), 0.0), gloss) * diff;
+    FragColor = vec4(col * (ambient + 0.95 * diff) + vec3(spec), 1.0);
 }";
 
     // Translucent ocean surface: diffuse + a sharp sun glint + a fresnel edge that fades the
@@ -328,6 +458,19 @@ void main() {
         _shader.SetFloat("uDetailFreq", (float)_detailNoiseFreq);
         _shader.SetFloat("uDetailStrength", Math.Max(0f, TerrainTuning.DetailNormalStrength));
         _shader.SetFloat("uDetailAlbedo", TerrainTuning.DetailAlbedo);
+        // Larger "range" → smaller low-cut → coarser octaves stay on → detail reaches further out.
+        _shader.SetFloat("uDetailLowCut", 0.16f / Math.Clamp(TerrainTuning.SurfaceDetailRange, 1f, 16f));
+        _shader.SetFloat("uMaterialStrength", Math.Max(0f, TerrainTuning.MaterialDetail));
+        _shader.SetFloat("uSurfaceSpecular", Math.Max(0f, TerrainTuning.SurfaceSpecular));
+        _shader.SetFloat("uSurfaceAmbient", Math.Max(0f, TerrainTuning.SurfaceAmbient));
+
+        // Orbital macro relief (live; no rebuild). Base frequency tracks the planet's mountain scale.
+        double reliefFreq = _terrain!.MacroReliefFrequency * Math.Max(0.05f, TerrainTuning.OrbitalReliefScale);
+        _shader.SetFloat("uReliefBaseFreq", (float)reliefFreq);
+        _shader.SetFloat("uReliefAmp", (float)_terrain.Amplitude);
+        _shader.SetFloat("uPlanetRadius", (float)_terrain.Radius);
+        _shader.SetFloat("uOrbitalStrength", Math.Max(0f, TerrainTuning.OrbitalReliefStrength));
+        _shader.SetFloat("uOrbitalAlbedo", TerrainTuning.OrbitalReliefAlbedo);
 
         DrainReadyPatches(); // upload any patches baked since last frame before we traverse
         LeafCount = 0;
@@ -439,6 +582,7 @@ void main() {
         if (node.Patch == null) return;
         Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
         _shader.SetMatrix("uMVP", model * viewProj);
+        _shader.SetMatrix("uModel", model);
         _shader.SetFloat("uMorph", morph);
         SetPatchDetailBase(node);
         node.Patch.Draw(_gl);
@@ -470,6 +614,11 @@ void main() {
         _shader.SetVector3("uPatchCellBase", new Vector3D<float>(WrapCell(fx), WrapCell(fy), WrapCell(fz)));
         _shader.SetVector3("uPatchFracBase", new Vector3D<float>(
             (float)(c.X * freq - fx), (float)(c.Y * freq - fy), (float)(c.Z * freq - fz)));
+
+        // Orbital macro relief needs the patch centre (to rebuild the surface direction) and this
+        // patch's vertex spacing in direction units (so the shader knows what the mesh already shows).
+        _shader.SetVector3("uPatchCenter", new Vector3D<float>((float)c.X, (float)c.Y, (float)c.Z));
+        _shader.SetFloat("uVertexSpacingDir", (float)(node.WorldSize / GridN / _terrain!.Radius));
     }
 
     /// <summary>Wrap an integer cell index into [0, 4096) (matching the shader's hash period).</summary>
@@ -619,6 +768,7 @@ void main() {
         var nrmF = new Vector3D<double>[n + 1, n + 1];
         var nrmC = new Vector3D<double>[n + 1, n + 1];
         var col = new Vector3D<float>[n + 1, n + 1];
+        var rel = new float[n + 1, n + 1]; // macro-relief mask (low-freq → safe to interpolate)
         for (int j = 0; j <= n; j++)
         for (int i = 0; i <= n; i++)
         {
@@ -629,18 +779,20 @@ void main() {
             // Slope = cos(angle from vertical): 1 on flats, → 0 on cliffs. Drives rock vs snow.
             double slope = Vector3D.Dot(nrmF[i, j], outward);
             col[i, j] = terrain.ColorAt(dir[i, j], hgt[i, j], slope);
+            rel[i, j] = (float)terrain.MacroReliefMask(dir[i, j]);
         }
 
         var v3 = new List<float>((n * n * 6 + n * 16) * LandFloatsPerVertex);
-        void Emit(Vector3D<double> pF, Vector3D<double> pC, Vector3D<double> nF, Vector3D<double> nC, Vector3D<float> c)
+        void Emit(Vector3D<double> pF, Vector3D<double> pC, Vector3D<double> nF, Vector3D<double> nC, Vector3D<float> c, float r)
         {
             v3.Add((float)(pF.X - centerLocal.X)); v3.Add((float)(pF.Y - centerLocal.Y)); v3.Add((float)(pF.Z - centerLocal.Z));
             v3.Add((float)(pC.X - centerLocal.X)); v3.Add((float)(pC.Y - centerLocal.Y)); v3.Add((float)(pC.Z - centerLocal.Z));
             v3.Add((float)nF.X); v3.Add((float)nF.Y); v3.Add((float)nF.Z);
             v3.Add((float)nC.X); v3.Add((float)nC.Y); v3.Add((float)nC.Z);
             v3.Add(c.X); v3.Add(c.Y); v3.Add(c.Z);
+            v3.Add(r);
         }
-        void EmitVert(int i, int j) => Emit(posF[i, j], posC[i, j], nrmF[i, j], nrmC[i, j], col[i, j]);
+        void EmitVert(int i, int j) => Emit(posF[i, j], posC[i, j], nrmF[i, j], nrmC[i, j], col[i, j], rel[i, j]);
 
         // Surface triangles.
         for (int j = 0; j < n; j++)
@@ -661,8 +813,9 @@ void main() {
             Vector3D<double> b1F = t1F - Vector3D.Normalize(t1F) * skirt, b1C = t1C - Vector3D.Normalize(t1C) * skirt;
             Vector3D<double> n0F = nrmF[i0, j0], n0C = nrmC[i0, j0], n1F = nrmF[i1, j1], n1C = nrmC[i1, j1];
             Vector3D<float> c0 = col[i0, j0], c1 = col[i1, j1];
-            Emit(t0F, t0C, n0F, n0C, c0); Emit(t1F, t1C, n1F, n1C, c1); Emit(b1F, b1C, n1F, n1C, c1);
-            Emit(t0F, t0C, n0F, n0C, c0); Emit(b1F, b1C, n1F, n1C, c1); Emit(b0F, b0C, n0F, n0C, c0);
+            float r0 = rel[i0, j0], r1 = rel[i1, j1];
+            Emit(t0F, t0C, n0F, n0C, c0, r0); Emit(t1F, t1C, n1F, n1C, c1, r1); Emit(b1F, b1C, n1F, n1C, c1, r1);
+            Emit(t0F, t0C, n0F, n0C, c0, r0); Emit(b1F, b1C, n1F, n1C, c1, r1); Emit(b0F, b0C, n0F, n0C, c0, r0);
         }
         for (int j = 0; j < n; j++) { SkirtQuad(0, j, 0, j + 1); SkirtQuad(n, j + 1, n, j); }
         for (int i = 0; i < n; i++) { SkirtQuad(i + 1, 0, i, 0); SkirtQuad(i, n, i + 1, n); }
@@ -837,7 +990,7 @@ void main() {
         public bool HasWater => _waterCount > 0;
 
         // Land: finePos, coarsePos, fineNrm, coarseNrm, colour (5 × vec3). Water: pos, nrm, colour+alpha.
-        private static readonly int[] LandLayout = { 3, 3, 3, 3, 3 };
+        private static readonly int[] LandLayout = { 3, 3, 3, 3, 3, 1 };
         private static readonly int[] WaterLayout = { 3, 3, 4 };
 
         public TerrainPatch(GL gl, float[] land, float[] water)

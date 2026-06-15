@@ -177,6 +177,30 @@ public sealed class PlanetTerrain
     public double HeightAt(Vector3D<double> unitDir) => HeightAt(unitDir, 0.0);
 
     /// <summary>
+    /// Base frequency (noise cells over the unit sphere) of the mountain layer — the scale the
+    /// orbital macro-relief shader starts from. The shader adds octaves finer than this; coarser
+    /// (continent-scale) relief is already carried by the baked silhouette/colour.
+    /// </summary>
+    public double MacroReliefFrequency => _mountainFreq * PlanetTuning.EffectiveFrequency(Type);
+
+    /// <summary>
+    /// Where rugged mountain relief actually belongs, in [0,1]: 0 over ocean basins and flat
+    /// plains, → 1 on rugged highlands. It is the product of the regional ruggedness field and the
+    /// same highland mask the mountain layer uses, so it tracks the real terrain. Both inputs are
+    /// LOW-frequency, so this interpolates cleanly across even a coarse (orbital) patch grid — the
+    /// renderer bakes it per vertex and the shader uses it to keep fake relief off the seas/plains.
+    /// </summary>
+    public double MacroReliefMask(Vector3D<double> unitDir)
+    {
+        if (!HasSurface) return 0.0;
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+        double rugged = Ruggedness(unitDir, fs);                                           // [0,1]
+        double continents = _noise.Fbm(unitDir, MaxContinentOctaves, _continentFreq * fs, 2.0, ContinentGain);
+        double mask = Smoothstep(-0.2, 0.4, continents);                                   // [0,1] highlands
+        return Math.Clamp(rugged * mask, 0.0, 1.0);
+    }
+
+    /// <summary>
     /// Terrain height (metres, signed) at a unit direction, band-limited to a patch whose
     /// vertices are <paramref name="sampleSpacing"/> metres apart (0 = full detail). Clamping
     /// the octave count to what the patch can resolve keeps coarse, far-away patches smooth and
