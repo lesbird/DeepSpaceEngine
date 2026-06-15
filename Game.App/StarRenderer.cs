@@ -24,22 +24,29 @@ uniform mat4 uViewProj;
 uniform float uPixelScale;
 uniform float uMinSize;
 uniform float uMaxSize;
+uniform float uFadeStart;   // distance (m) where stars begin fading toward the bubble edge
+uniform float uFadeEnd;     // distance (m) of the cull boundary — alpha reaches 0 here
 out vec3 vColor;
+out float vFade;
 void main() {
     vColor = aColor;
     gl_Position = uViewProj * vec4(aRelPos, 1.0);
     float dist = max(length(aRelPos), 1.0);
     gl_PointSize = clamp(uPixelScale * aSize / dist, uMinSize, uMaxSize);
+    // Fade out toward the cull boundary so stars stream in/out smoothly instead of popping when the
+    // bubble edge sweeps past them (more noticeable the larger the draw radius).
+    vFade = 1.0 - smoothstep(uFadeStart, uFadeEnd, dist);
 }";
 
     private const string FragmentSource = @"#version 410 core
 in vec3 vColor;
+in float vFade;
 out vec4 FragColor;
 void main() {
     vec2 c = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(c, c);
     if (r2 > 1.0) discard;
-    float a = exp(-r2 * 2.5);
+    float a = exp(-r2 * 2.5) * vFade;
     FragColor = vec4(vColor, 1.0) * a;
 }";
 
@@ -78,7 +85,7 @@ void main() {
         gl.BindVertexArray(0);
     }
 
-    public unsafe void Render(Camera camera, IReadOnlyList<Star> visible, ulong? excludeId = null)
+    public unsafe void Render(Camera camera, IReadOnlyList<Star> visible, double bubbleMeters, ulong? excludeId = null)
     {
         EnsureCapacity(visible.Count);
         var cam = camera.Position;
@@ -115,6 +122,9 @@ void main() {
         _shader.SetFloat("uPixelScale", PixelScale);
         _shader.SetFloat("uMinSize", MinPixelSize);
         _shader.SetFloat("uMaxSize", MaxPixelSize);
+        // Fade across the outer ~15% of the bubble so the cull boundary is invisible.
+        _shader.SetFloat("uFadeStart", (float)(bubbleMeters * 0.85));
+        _shader.SetFloat("uFadeEnd", (float)bubbleMeters);
 
         _gl.BindVertexArray(_vao);
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _vbo);

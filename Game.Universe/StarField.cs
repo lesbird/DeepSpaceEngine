@@ -23,7 +23,10 @@ public sealed class StarField
     private static readonly double CellVolumeLy3 = CellSizeLy * CellSizeLy * CellSizeLy;
 
     private const int MaxStarsPerCell = 4096;
-    private const int MaxCachedCells = 40_000;
+    // Must comfortably exceed the working set of one render bubble (the keep region is
+    // (2·(radiusCells+2)+1)³ cells) or cells inside the bubble get evicted and regenerated every
+    // frame. 80k holds up to radiusCells ≈ 16 ((2·18+1)³ = 50653) with headroom.
+    private const int MaxCachedCells = 80_000;
 
     private readonly GalaxyModel _galaxy;
     private readonly Dictionary<Vector3D<long>, Star[]> _cache = new();

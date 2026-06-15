@@ -13,7 +13,9 @@ namespace Game.App;
 
 internal static class Program
 {
-    private const int RenderRadiusCells = 8;     // ~33 ly bubble
+    // Star-field draw radius in cells (~4.15 ly each). Live-tunable via the HUD; bigger = deeper
+    // field but cubic CPU/GPU cost and a bigger one-time generation hitch when entering a region.
+    private static int RenderRadiusCells = 12;   // ~52 ly bubble
     private const int AsteroidFieldRadiusCells = 2; // deep-space clusters within ~1.5 ly
     private const ulong WorldSeed = 0xA11CE5EEDUL;
 
@@ -296,7 +298,8 @@ internal static class Program
         // Distant galaxy first (writes no depth), so the streamed stars, system, and atmosphere all
         // composite over it and any opaque body occludes the sky behind it.
         _backdrop.Render(_camera);
-        _starRenderer.Render(_camera, _starField.Visible, _systemManager.ActiveStarId);
+        double starBubbleMeters = (RenderRadiusCells + 0.5) * StarField.CellSizeMeters;
+        _starRenderer.Render(_camera, _starField.Visible, starBubbleMeters, _systemManager.ActiveStarId);
 
         // Deep-space asteroid clusters: drawn on the still-clear depth buffer with their own fitted
         // projection so rocks self-occlude. Depth is cleared again below before the system pass, so
@@ -554,6 +557,16 @@ internal static class Program
                 b.Enabled = true; b.BandBrightness = 0.6f; b.StarBrightness = 1.0f;
                 b.NebulaBrightness = 0.7f;
             }
+        }
+
+        if (ImGui.CollapsingHeader("Star field", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            // Draw radius in cells (~4.15 ly each). Bigger = deeper field, but cost grows cubically
+            // and a fresh region generates synchronously, so a large radius hitches on first entry.
+            ImGui.SliderInt("Draw radius", ref RenderRadiusCells, 4, 16);
+            double ly = (RenderRadiusCells + 0.5) * StarField.CellSizeLy;
+            ImGui.TextDisabled($"(~{ly:0} ly bubble — {_starRenderer.LastDrawn} stars)");
+            if (ImGui.Button("Reset star field")) RenderRadiusCells = 12;
         }
 
         if (ImGui.CollapsingHeader("Ocean", ImGuiTreeNodeFlags.DefaultOpen))
