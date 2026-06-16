@@ -115,9 +115,11 @@ void main() {
             _data[o + 0] = rel.X;
             _data[o + 1] = rel.Y;
             _data[o + 2] = rel.Z;
-            _data[o + 3] = b.Color.X;
-            _data[o + 4] = b.Color.Y;
-            _data[o + 5] = b.Color.Z;
+            // Mean surface albedo (not the raw seeded tint) so a body's colour stays consistent from a
+            // far glow dot, through the lit sphere, to the close terrain — no pop as it resolves.
+            _data[o + 3] = b.SurfaceAlbedo.X;
+            _data[o + 4] = b.SurfaceAlbedo.Y;
+            _data[o + 5] = b.SurfaceAlbedo.Z;
             _data[o + 6] = (float)b.RadiusMeters;
         }
 

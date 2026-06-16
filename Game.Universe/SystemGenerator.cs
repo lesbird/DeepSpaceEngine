@@ -56,6 +56,7 @@ public static class SystemGenerator
             AssignAtmosphere(ref rng, planet);
             planet.SurfaceTempK = (float)EquilibriumTempK(star.Luminosity, aAu);
             ApplyScanData(planet);
+            AssignSurfaceAlbedo(planet);
             // Moons share the parent's distance from the star, so they inherit its temperature.
             planet.Moons = GenerateMoons(ref rng, planet, star.Designation, i + 1, planet.SurfaceTempK);
             planets[i] = planet;
@@ -115,6 +116,7 @@ public static class SystemGenerator
             };
             AssignMoonAtmosphere(ref rng, moon);
             ApplyScanData(moon);
+            AssignSurfaceAlbedo(moon);
             moons[j] = moon;
         }
         return moons;
@@ -146,6 +148,12 @@ public static class SystemGenerator
         var grey = new Vector3D<float>(0.58f, 0.58f, 0.56f);
         return c * 0.6f + grey * 0.4f;
     }
+
+    /// <summary>Record the mean albedo the body's surface actually shows, so the distant sphere matches
+    /// the terrain/baked map instead of popping colour when they load. Surfaceless gas/ice giants keep
+    /// their flat seeded tint. Builds a throwaway <see cref="PlanetTerrain"/> (cheap, pure RNG reads).</summary>
+    private static void AssignSurfaceAlbedo(CelestialBody b)
+        => b.SurfaceAlbedo = b.HasSurface ? new PlanetTerrain(b).AverageAlbedo() : b.Color;
 
     /// <summary>Multiplies every generated atmosphere shell's thickness — a pure visual-size knob.
     /// Because the renderer derives the scattering coefficient as optical-depth ÷ scale-height, a

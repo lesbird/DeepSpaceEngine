@@ -252,14 +252,14 @@ void main() { FragColor = uColor; }";
             if (!ReferenceEquals(p, terrainBody))
             {
                 Vector3D<float> rel = p.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, rel, p.RadiusMeters, p.Color, sunRel, emissive: 0f, ParamsFor(p), p.Seed == mapId);
+                DrawBody(viewProj, rel, p.RadiusMeters, p.SurfaceAlbedo, sunRel, emissive: 0f, ParamsFor(p), p.Seed == mapId);
             }
 
             foreach (Moon mn in p.Moons)
             {
                 if (ReferenceEquals(mn, terrainBody)) continue;
                 Vector3D<float> mrel = mn.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.Color, sunRel, emissive: 0f, ParamsFor(mn), mn.Seed == mapId);
+                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.SurfaceAlbedo, sunRel, emissive: 0f, ParamsFor(mn), mn.Seed == mapId);
             }
         }
 

@@ -442,6 +442,50 @@ public sealed class PlanetTerrain
     public double SeaLevelMeters => SeaLevel;
 
     /// <summary>
+    /// Mean surface albedo over the whole globe — the flat colour the body shows from far away.
+    /// It is computed from the <em>same</em> per-direction logic the surface map bakes (water blue
+    /// below the waterline, <see cref="ColorAt"/> otherwise), averaged over a Fibonacci-sphere
+    /// sample. Feeding this to the distant sphere instead of the raw seeded tint keeps the far view
+    /// matching the surface, so a cold ice/regolith moon no longer pops from brown to white when the
+    /// terrain or baked map loads. Returns the seeded base colour for surfaceless gas/ice giants.
+    /// Sampled at an orbital band-limit (no per-metre detail), matching what the far view resolves.
+    /// </summary>
+    public Vector3D<float> AverageAlbedo(int samples = 256)
+    {
+        if (!HasSurface) return _baseColor;
+
+        double spacing = 2.0 * Math.PI * Radius / 1024.0; // ~map texel scale: average the orbital look
+        double seaLevel = SeaLevel;
+        // Water tones must mirror PlanetSurfaceMap.Bake so the gen-time mean matches the baked map.
+        var shallow = new Vector3D<float>(0.20f, 0.55f, 0.62f);
+        var deep = new Vector3D<float>(0.02f, 0.10f, 0.26f);
+
+        var sum = new Vector3D<float>(0f, 0f, 0f);
+        double ga = Math.PI * (3.0 - Math.Sqrt(5.0)); // golden angle → an even spiral over the sphere
+        for (int i = 0; i < samples; i++)
+        {
+            double y = 1.0 - (i + 0.5) / samples * 2.0;        // +1 (north) → -1 (south)
+            double r = Math.Sqrt(Math.Max(0.0, 1.0 - y * y));
+            double th = ga * i;
+            var dir = new Vector3D<double>(Math.Cos(th) * r, y, Math.Sin(th) * r);
+
+            double h = HeightAt(dir, spacing);
+            Vector3D<float> c;
+            if (_hasOcean && h < seaLevel)
+            {
+                float f = (float)Math.Clamp((seaLevel - h) / (Amplitude * 0.12 + 1.0), 0, 1);
+                c = shallow + (deep - shallow) * f;
+            }
+            else
+            {
+                c = ColorAt(dir, h, 1.0, spacing); // slope = 1 (gentle ground dominates the visible area)
+            }
+            sum += c;
+        }
+        return sum * (1f / samples);
+    }
+
+    /// <summary>
     /// Surface colour from <b>climate</b> (temperature × moisture → biome), elevation and slope.
     /// <paramref name="dir"/> is the unit surface direction (drives latitude/temperature and the
     /// moisture field); <paramref name="slope"/> is cos(angle-from-vertical) — 1 on flats, → 0 on

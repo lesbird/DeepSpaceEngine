@@ -30,7 +30,16 @@ public abstract class CelestialBody
     // Physical / visual.
     public double RadiusMeters;
     public double MassKg;
+
+    /// <summary>Seeded base tint, used both as the distant-sphere fallback colour and as the lowland
+    /// ground tint the terrain colouring builds on (see <see cref="PlanetTerrain"/>).</summary>
     public Vector3D<float> Color;
+
+    /// <summary>Mean albedo the body actually shows (the average of the terrain/baked-map surface
+    /// colour). The distant sphere uses this so the far view matches the surface — a cold regolith
+    /// moon reads white from orbit, not the raw brown <see cref="Color"/> tint. Set by the generator
+    /// for surfaced worlds; equals <see cref="Color"/> for gas/ice giants.</summary>
+    public Vector3D<float> SurfaceAlbedo;
 
     // Atmosphere (a volumetric single-scattering shell; see AtmosphereRenderer).
     public bool HasAtmosphere;
