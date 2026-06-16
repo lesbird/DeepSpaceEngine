@@ -94,7 +94,18 @@ uniform float uOrbitalStrength;    // macro-relief normal strength (0 = off)
 uniform float uOrbitalAlbedo;      // macro-relief albedo mottle amount
 uniform float uCraterStrength;     // orbital crater shading (0 = not a cratered world)
 uniform float uCraterFreq;         // largest-crater base frequency (cells over the unit sphere)
+// Baked surface map (albedo + planet-local normal), sampled on coarse far patches where the mesh is
+// too sparse to carry craters/relief. Same source as the geometry, so the orbital view matches the
+// surface exactly. uHasMap = 0 falls back to the procedural orbital relief below.
+uniform float uHasMap;
+uniform sampler2D uAlbedoMap;
+uniform sampler2D uNormalMap;
 out vec4 FragColor;
+
+const float PI_M = 3.14159265359;
+vec2 dirToUv(vec3 d) {
+    return vec2(atan(d.z, d.x) / (2.0 * PI_M) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI_M + 0.5);
+}
 
 // Small-input integer hash (Dave Hoskins style) — cell coords are wrapped below so it stays precise.
 float hash13(vec3 p) {
@@ -206,8 +217,18 @@ void main() {
     vec3 N = normalize(vNormal);
     vec3 col = vColor;
 
-    // --- Orbital surface detail the smooth far-LOD mesh can't show: macro relief + impact craters. ---
-    {
+    // --- Orbital surface detail the smooth far-LOD mesh can't show: baked map, else procedural. ---
+    if (uHasMap > 0.5) {
+        // Coarse (far) patches blend toward the baked map (which carries crater/relief the mesh lacks);
+        // fine (near) patches keep the real geometry. Same source, so the crossfade is seamless and a
+        // crater seen from orbit is exactly the one you land in.
+        vec2 uv = dirToUv(normalize(vDir));
+        vec3 mapAlb = texture(uAlbedoMap, uv).rgb;
+        vec3 mapNrm = normalize(texture(uNormalMap, uv).rgb * 2.0 - 1.0);
+        float w = smoothstep(0.0015, 0.006, uVertexSpacingDir); // patch coarser than a map texel → use map
+        col = mix(col, mapAlb, w);
+        N = normalize(mix(N, mapNrm, w));
+    } else {
         vec3 dir = normalize(vDir);
         float fp = max(max(fwidth(dir.x), fwidth(dir.y)), fwidth(dir.z)); // pixel footprint (dir units)
         float geomCut = 1.0 / max(2.0 * uVertexSpacingDir, 1e-9);         // freq the mesh already carries
@@ -493,7 +514,7 @@ void main() {
         }
     }
 
-    public void Render(Camera camera, Vector3D<float> sunDir, float time = 0f)
+    public void Render(Camera camera, Vector3D<float> sunDir, float time = 0f, PlanetSurfaceMap? map = null)
     {
         if (_body == null || _roots == null) return;
 
@@ -526,6 +547,19 @@ void main() {
         bool cratered = _terrain.IsCratered && TerrainTuning.CraterScale > 0f;
         _shader.SetFloat("uCraterStrength", cratered ? Math.Max(0f, TerrainTuning.OrbitalReliefStrength) : 0f);
         _shader.SetFloat("uCraterFreq", (float)_terrain.CraterOrbitalFrequency);
+
+        // Baked surface map for this body (if ready): coarse far patches sample it instead of the
+        // procedural orbital relief, so the orbital view matches the surface exactly.
+        bool useMap = map is { Ready: true } && _body != null && map.BodyId == _body.Seed;
+        _shader.SetFloat("uHasMap", useMap ? 1f : 0f);
+        if (useMap)
+        {
+            _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, map!.AlbedoTex);
+            _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, map!.NormalTex);
+            _shader.SetInt("uAlbedoMap", 0);
+            _shader.SetInt("uNormalMap", 1);
+            _gl.ActiveTexture(TextureUnit.Texture0);
+        }
 
         DrainReadyPatches(); // upload any patches baked since last frame before we traverse
         LeafCount = 0;

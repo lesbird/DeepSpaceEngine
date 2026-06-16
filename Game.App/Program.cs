@@ -37,6 +37,8 @@ internal static class Program
     private static AtmosphereRenderer _atmosphereRenderer = null!;
     private static CloudRenderer _cloudRenderer = null!;
     private static PlanetTerrainRenderer _terrainRenderer = null!;
+    private static PlanetSurfaceMap _surfaceMap = null!;
+    private static ulong _mapBodyId = ulong.MaxValue;
     private static RoverController _rover = null!;
     private static RoverRenderer _roverRenderer = null!;
     private static SceneFramebuffer _sceneFbo = null!;
@@ -139,6 +141,7 @@ internal static class Program
         _atmosphereRenderer = new AtmosphereRenderer(_gl);
         _cloudRenderer = new CloudRenderer(_gl);
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
+        _surfaceMap = new PlanetSurfaceMap(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse);
         _roverRenderer = new RoverRenderer(_gl);
         _sceneFbo = new SceneFramebuffer(_gl);
@@ -327,7 +330,18 @@ internal static class Program
 
         if (_systemManager.HasActive)
         {
-            _systemRenderer.Render(_camera, _systemManager.Active!, _terrainTarget);
+            // Keep an albedo+normal surface map baked for the nearest surfaced body, so its distant
+            // sphere and its near terrain sample one source (a crater seen from orbit is the same one
+            // you land in). Re-baked only when the nearest body changes; uploaded on this thread.
+            CelestialBody? mapBody = NearestSurfacedBody();
+            if (mapBody != null && mapBody.Seed != _mapBodyId)
+            {
+                _mapBodyId = mapBody.Seed;
+                _surfaceMap.Request(new PlanetTerrain(mapBody), mapBody.Seed);
+            }
+            _surfaceMap.Update();
+
+            _systemRenderer.Render(_camera, _systemManager.Active!, _terrainTarget, _surfaceMap);
             // Distance-scaled glow dots that mark each body from afar and fade as its sphere grows.
             _planetGlow.Render(_camera, _systemManager.Active!, _sceneFbo.Height, _terrainTarget);
 
@@ -374,7 +388,7 @@ internal static class Program
             // while the terrain writes fresh, correctly-linearisable depth. Their depth was only needed
             // to self-occlude during their own pass; when landed they never sit in front of the terrain.
             _gl.Clear((uint)ClearBufferMask.DepthBufferBit);
-            _terrainRenderer.Render(_camera, sunDir, (float)_renderClock);
+            _terrainRenderer.Render(_camera, sunDir, (float)_renderClock, _surfaceMap);
 
             // Rover over the terrain it just drew — same near/far so it shares the depth buffer and
             // the depth-aware atmosphere composites over it correctly.

@@ -45,7 +45,17 @@ uniform float uCraterFreq;      // largest-crater base frequency
 uniform float uMariaStrength;   // dark basaltic-plain provinces (airless)
 uniform float uPlanetRadiusM;
 uniform vec3  uSeedOffset;      // per-planet noise offset (variety)
+// Baked surface map for the focused body: exact-match albedo + planet-local normal. When present it
+// replaces the procedural detail, so the distant sphere shows the same craters you land in.
+uniform float uHasMap;
+uniform sampler2D uAlbedoMap;
+uniform sampler2D uNormalMap;
 out vec4 FragColor;
+
+const float PI_M = 3.14159265359;
+vec2 dirToUv(vec3 d) {
+    return vec2(atan(d.z, d.x) / (2.0 * PI_M) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI_M + 0.5);
+}
 
 float h13(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }
 float vn(vec3 x) {
@@ -89,7 +99,12 @@ void main() {
     vec3 L = normalize(uSunCenter - vWorld);
     vec3 col = uColor;
 
-    if (uEmissive < 0.5 && (uReliefAmp > 0.0 || uCraterStrength > 0.0)) {
+    if (uEmissive < 0.5 && uHasMap > 0.5) {
+        // Exact baked surface (same source as the terrain) — distant view matches the surface.
+        vec2 uv = dirToUv(N);
+        col = texture(uAlbedoMap, uv).rgb;
+        N = normalize(texture(uNormalMap, uv).rgb * 2.0 - 1.0);
+    } else if (uEmissive < 0.5 && (uReliefAmp > 0.0 || uCraterStrength > 0.0)) {
         vec3 dir = N + uSeedOffset;                                   // per-planet variety
         float fp = max(max(fwidth(N.x), fwidth(N.y)), fwidth(N.z));   // pixel footprint
         vec3 up = abs(N.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
@@ -203,10 +218,12 @@ void main() { FragColor = uColor; }";
         _ring = Primitives.BuildRingAnnulus(gl, segments: 256);
     }
 
-    public void Render(Camera camera, SolarSystem system, CelestialBody? terrainBody = null)
+    public void Render(Camera camera, SolarSystem system, CelestialBody? terrainBody = null,
+        PlanetSurfaceMap? map = null)
     {
         UniversePosition cam = camera.Position;
         Vector3D<float> sunRel = system.Sun.Position.ToCameraRelative(cam);
+        ulong mapId = map is { Ready: true } ? map.BodyId : ulong.MaxValue;
 
         Matrix4X4<float> proj = FitProjection(camera, system);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
@@ -217,7 +234,15 @@ void main() { FragColor = uColor; }";
         // --- Sun (emissive) ---
         _planetShader.Use();
         _planetShader.SetVector3("uSunCenter", sunRel);
-        DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f, SurfaceParams.None);
+        if (map is { Ready: true })
+        {
+            _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, map.AlbedoTex);
+            _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, map.NormalTex);
+            _planetShader.SetInt("uAlbedoMap", 0);
+            _planetShader.SetInt("uNormalMap", 1);
+            _gl.ActiveTexture(TextureUnit.Texture0);
+        }
+        DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f, SurfaceParams.None, useMap: false);
 
         // --- Planets + moons (lit) ---
         foreach (Planet p in system.Planets)
@@ -227,14 +252,14 @@ void main() { FragColor = uColor; }";
             if (!ReferenceEquals(p, terrainBody))
             {
                 Vector3D<float> rel = p.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, rel, p.RadiusMeters, p.Color, sunRel, emissive: 0f, ParamsFor(p));
+                DrawBody(viewProj, rel, p.RadiusMeters, p.Color, sunRel, emissive: 0f, ParamsFor(p), p.Seed == mapId);
             }
 
             foreach (Moon mn in p.Moons)
             {
                 if (ReferenceEquals(mn, terrainBody)) continue;
                 Vector3D<float> mrel = mn.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.Color, sunRel, emissive: 0f, ParamsFor(mn));
+                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.Color, sunRel, emissive: 0f, ParamsFor(mn), mn.Seed == mapId);
             }
         }
 
@@ -288,7 +313,7 @@ void main() { FragColor = uColor; }";
     }
 
     private void DrawBody(in Matrix4X4<float> viewProj, Vector3D<float> rel, double radius,
-        Vector3D<float> color, Vector3D<float> sunRel, float emissive, in SurfaceParams sp)
+        Vector3D<float> color, Vector3D<float> sunRel, float emissive, in SurfaceParams sp, bool useMap)
     {
         Matrix4X4<float> model = Matrix4X4.CreateScale((float)radius) * Matrix4X4.CreateTranslation(rel);
         _planetShader.SetMatrix("uModel", model);
@@ -304,6 +329,7 @@ void main() { FragColor = uColor; }";
         _planetShader.SetFloat("uMariaStrength", sp.MariaStrength);
         _planetShader.SetFloat("uPlanetRadiusM", (float)radius);
         _planetShader.SetVector3("uSeedOffset", sp.SeedOffset);
+        _planetShader.SetFloat("uHasMap", useMap ? 1f : 0f);
         _sphere.Draw();
     }
 
