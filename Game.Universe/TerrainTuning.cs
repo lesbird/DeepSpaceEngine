@@ -51,6 +51,13 @@ public static class TerrainTuning
     /// of going flat in the mid-distance. 1 = close-up only. Live (no rebuild).</summary>
     public static float SurfaceDetailRange = 4.0f;
 
+    /// <summary>How aggressively the terrain quadtree subdivides on approach: a patch splits once the
+    /// camera is closer than this multiple of the patch's size. Higher = finer geometry (so the real,
+    /// baked craters/relief resolve) shows from a higher altitude, closing the mid-altitude detail gap
+    /// — at the cost of more patches/triangles and more background baking. Live (no rebuild): it only
+    /// changes the per-frame split/merge decision. 2.5 was the old fixed value.</summary>
+    public static float LodDistanceFactor = 4.0f;
+
     /// <summary>How much the detail noise breaks up the surface albedo (0 = none). Live (no rebuild).</summary>
     public static float DetailAlbedo = 0.12f;
 

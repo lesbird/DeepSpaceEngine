@@ -19,7 +19,9 @@ public sealed class PlanetTerrainRenderer : IDisposable
 {
     private const int GridN = 16;          // grid cells per patch edge
     private const int MaxLevel = 22;       // deepest subdivision (≈ sub-metre on an Earth-sized world)
-    private const double LodFactor = 2.5;  // split when distance < LodFactor × patch size
+    // Split when distance < LodFactor × patch size. Live-tunable (TerrainTuning.LodDistanceFactor) so
+    // the player can trade geometry detail on approach against patch/bake cost; snapshot per frame in
+    // Render so the whole traversal uses one consistent value.
     private const double MergeHysteresis = 1.3; // keep children cached until 1.3× the split distance (anti-thrash)
     // The expensive part of a patch — sampling the height field and building its vertex arrays — runs
     // on a background worker pool (see WorkerLoop). Only the cheap GPU upload happens on the render
@@ -411,6 +413,7 @@ void main() {
     private PlanetTerrain? _terrain;
     private QuadNode[]? _roots;
     private double _detailNoiseFreq; // this frame's detail-normal frequency (set in Render)
+    private double _lodFactor = 4.0; // this frame's split-distance factor (snapshot from TerrainTuning)
 
     public int LeafCount { get; private set; }
     public int PatchCount { get; private set; }
@@ -518,6 +521,9 @@ void main() {
     {
         if (_body == null || _roots == null) return;
 
+        // Snapshot the live LOD aggressiveness once so split, merge and morph all agree this frame.
+        _lodFactor = Math.Clamp(TerrainTuning.LodDistanceFactor, 1.0, 32.0);
+
         Matrix4X4<float> proj = FitProjection(camera);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
         ExtractFrustum(viewProj);
@@ -624,7 +630,7 @@ void main() {
         double dist = camera.Position.DistanceTo(center);
         if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
 
-        double splitDist = LodFactor * node.WorldSize;
+        double splitDist = _lodFactor * node.WorldSize;
         bool wantSplit = visible && node.Level < MaxLevel && dist < splitDist;
 
         if (wantSplit)

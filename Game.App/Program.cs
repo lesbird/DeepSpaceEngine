@@ -732,6 +732,9 @@ internal static class Program
         if (ImGui.CollapsingHeader("Surface detail (close-up)", ImGuiTreeNodeFlags.DefaultOpen))
         {
             // Micro-relief is geometry → needs a rebuild; the detail-normal knobs are read live.
+            // LOD distance is read live too: higher resolves the real geometry (and its craters/relief)
+            // from a higher altitude, closing the mid-approach detail gap, at the cost of more patches.
+            ImGui.SliderFloat("LOD distance", ref TerrainTuning.LodDistanceFactor, 1.5f, 16f);
             terrainDirty |= ImGui.SliderFloat("Micro relief", ref TerrainTuning.MicroDetailScale, 0f, 3f);
             ImGui.SliderFloat("Detail normals", ref TerrainTuning.DetailNormalStrength, 0f, 1.5f);
             ImGui.SliderFloat("Detail fineness", ref TerrainTuning.DetailNormalScale, 0.25f, 4f);
@@ -743,6 +746,7 @@ internal static class Program
             ImGui.TextDisabled("(detail appears only as you get close to the surface)");
             if (ImGui.Button("Reset detail"))
             {
+                TerrainTuning.LodDistanceFactor = 4f;
                 TerrainTuning.MicroDetailScale = 1f; TerrainTuning.DetailNormalStrength = 0.4f;
                 TerrainTuning.DetailNormalScale = 1f; TerrainTuning.DetailAlbedo = 0.12f;
                 TerrainTuning.SurfaceDetailRange = 4f;
