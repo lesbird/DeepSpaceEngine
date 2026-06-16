@@ -32,7 +32,7 @@ public sealed class SolarSystemManager
     /// <summary>Distance from the camera to the active star, in light-years (∞ if none).</summary>
     public double ActiveStarDistanceLy { get; private set; } = double.PositiveInfinity;
 
-    public void Update(double dt, in UniversePosition camera, StarField field)
+    public void Update(double dt, in UniversePosition camera, INearestStar field)
     {
         _simTime += dt * TimeScale;
 

@@ -50,6 +50,61 @@ void main() {
     FragColor = vec4(vColor, 1.0) * a;
 }";
 
+    // --- Static catalog path (draws a whole pre-generated block in one go) ---
+    private const int CatFloatsPerStar = 7; // pos(3) + color(3) + luminosity(1)
+
+    private const string CatVertexSource = @"#version 410 core
+layout(location = 0) in vec3 aPos;     // metres relative to the catalog origin
+layout(location = 1) in vec3 aColor;
+layout(location = 2) in float aLum;    // luminosity (Lsun)
+uniform mat4 uViewProj;
+uniform vec3 uCamRel;                   // camera position relative to the catalog origin (m)
+uniform float uBrightScale;
+uniform float uGamma;                   // perceptual compression of the huge flux range
+uniform float uSizeScale;
+uniform float uMinSize;
+uniform float uMaxSize;
+out vec3 vColor;
+out float vBright;
+const float LY = 9.4607e15;             // metres per light-year
+void main() {
+    vColor = aColor;
+    vec3 rel = aPos - uCamRel;          // relative-to-camera (single-precision; far dots jitter sub-pixel)
+    gl_Position = uViewProj * vec4(rel, 1.0);
+    float distLy = max(length(rel) / LY, 1.0e-4);
+    // Flux falls as 1/d^2, but raw flux spans an enormous range; a gamma far below 1 compresses it
+    // perceptually (like apparent magnitude) so distant stars stay visible as faint points instead
+    // of snapping to black just past a light-year.
+    float flux = aLum / (distLy * distLy);
+    float bright = uBrightScale * pow(flux, uGamma);
+    vBright = bright;
+    gl_PointSize = clamp(uSizeScale * sqrt(bright), uMinSize, uMaxSize);
+}";
+
+    private const string CatFragmentSource = @"#version 410 core
+in vec3 vColor;
+in float vBright;
+out vec4 FragColor;
+void main() {
+    vec2 c = gl_PointCoord * 2.0 - 1.0;
+    float r2 = dot(c, c);
+    if (r2 > 1.0) discard;
+    float a = exp(-r2 * 2.5) * clamp(vBright, 0.0, 1.0);
+    FragColor = vec4(vColor, 1.0) * a;
+}";
+
+    private Shader? _catShader;
+    private uint _catVao, _catVbo;
+    private int _catCount;
+
+    /// <summary>Brightness mapping for the catalog draw (tunable). With CatGamma ≈ 0.25 a Sun-like
+    /// star stays visible out to tens of light-years and even M-dwarfs show within ~10 ly.</summary>
+    public float CatBrightScale = 3.0f;
+    public float CatGamma = 0.25f;
+    public float CatSizeScale = 5f;
+    public float CatMinSize = 1.5f;
+    public float CatMaxSize = 160f;
+
     private readonly GL _gl;
     private readonly Shader _shader;
     private readonly uint _vao;
@@ -138,6 +193,89 @@ void main() {
         _gl.Disable(EnableCap.Blend);
     }
 
+    /// <summary>Upload a finite star block once. Positions are baked relative to the catalog
+    /// origin; the per-frame draw subtracts the camera. Call again only if the block changes.</summary>
+    public unsafe void UploadCatalog(IReadOnlyList<Star> stars, in UniversePosition origin)
+    {
+        if (_catShader == null)
+        {
+            _catShader = new Shader(_gl, CatVertexSource, CatFragmentSource);
+            _catVao = _gl.GenVertexArray();
+            _catVbo = _gl.GenBuffer();
+            _gl.BindVertexArray(_catVao);
+            _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _catVbo);
+            uint stride = CatFloatsPerStar * sizeof(float);
+            _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, (void*)0);
+            _gl.EnableVertexAttribArray(0);
+            _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, (void*)(3 * sizeof(float)));
+            _gl.EnableVertexAttribArray(1);
+            _gl.VertexAttribPointer(2, 1, VertexAttribPointerType.Float, false, stride, (void*)(6 * sizeof(float)));
+            _gl.EnableVertexAttribArray(2);
+        }
+
+        var data = new float[stars.Count * CatFloatsPerStar];
+        for (int i = 0; i < stars.Count; i++)
+        {
+            Star s = stars[i];
+            Vector3D<float> p = s.Position.ToCameraRelative(origin); // = position relative to origin
+            int o = i * CatFloatsPerStar;
+            data[o + 0] = p.X; data[o + 1] = p.Y; data[o + 2] = p.Z;
+            data[o + 3] = s.Color.X; data[o + 4] = s.Color.Y; data[o + 5] = s.Color.Z;
+            data[o + 6] = s.Luminosity;
+        }
+        _catCount = stars.Count;
+
+        _gl.BindVertexArray(_catVao);
+        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _catVbo);
+        _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, new ReadOnlySpan<float>(data), BufferUsageARB.StaticDraw);
+        _gl.BindVertexArray(0);
+    }
+
+    /// <summary>Draw the whole uploaded catalog as apparent-brightness point sprites. The active
+    /// system's sun (by catalog index, since Id == index) is skipped: up close, single-precision
+    /// relative-to-camera puts its dot visibly off from its precisely-rendered sphere, so the
+    /// system pass owns that star instead.</summary>
+    public void RenderCatalog(Camera camera, in UniversePosition origin, int? excludeIndex = null)
+    {
+        if (_catShader == null || _catCount == 0) return;
+
+        Vector3D<float> camRel = camera.Position.ToCameraRelative(origin); // camera relative to origin
+
+        _gl.Enable(EnableCap.ProgramPointSize);
+        _gl.Enable(EnableCap.Blend);
+        _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.One);
+        _gl.DepthMask(false);
+        _gl.Disable(EnableCap.DepthTest);
+
+        _catShader.Use();
+        Matrix4X4<float> viewProj = camera.ViewMatrix * camera.ProjectionMatrix;
+        _catShader.SetMatrix("uViewProj", viewProj);
+        _catShader.SetVector3("uCamRel", camRel);
+        _catShader.SetFloat("uBrightScale", CatBrightScale);
+        _catShader.SetFloat("uGamma", CatGamma);
+        _catShader.SetFloat("uSizeScale", CatSizeScale);
+        _catShader.SetFloat("uMinSize", CatMinSize);
+        _catShader.SetFloat("uMaxSize", CatMaxSize);
+
+        _gl.BindVertexArray(_catVao);
+        if (excludeIndex is { } ex && ex >= 0 && ex < _catCount)
+        {
+            // Draw the two spans around the excluded star.
+            if (ex > 0) _gl.DrawArrays(PrimitiveType.Points, 0, (uint)ex);
+            int after = _catCount - ex - 1;
+            if (after > 0) _gl.DrawArrays(PrimitiveType.Points, ex + 1, (uint)after);
+        }
+        else
+        {
+            _gl.DrawArrays(PrimitiveType.Points, 0, (uint)_catCount);
+        }
+        _gl.BindVertexArray(0);
+
+        _gl.DepthMask(true);
+        _gl.Disable(EnableCap.Blend);
+        LastDrawn = _catCount;
+    }
+
     private void EnsureCapacity(int starCount)
     {
         int needed = starCount * FloatsPerStar;
@@ -150,5 +288,11 @@ void main() {
         _shader.Dispose();
         _gl.DeleteBuffer(_vbo);
         _gl.DeleteVertexArray(_vao);
+        if (_catShader != null)
+        {
+            _catShader.Dispose();
+            _gl.DeleteBuffer(_catVbo);
+            _gl.DeleteVertexArray(_catVao);
+        }
     }
 }

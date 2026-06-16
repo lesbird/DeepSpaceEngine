@@ -13,7 +13,7 @@ namespace Game.Universe;
 /// sub-AU double — full precision anywhere in the universe, never routed through a
 /// giant absolute double.
 /// </summary>
-public sealed class StarField
+public sealed class StarField : INearestStar
 {
     /// <summary>Cell edge length in sectors (AU). 262144 AU ≈ 4.146 light-years.</summary>
     public const long CellSizeSectors = 262_144;
@@ -94,7 +94,7 @@ public sealed class StarField
         return stars;
     }
 
-    private static void SampleStarType(ref DeterministicRng rng, out float temp, out float lum,
+    internal static void SampleStarType(ref DeterministicRng rng, out float temp, out float lum,
         out float mass, out double radiusMeters, out SpectralClass cls)
     {
         double u = rng.NextDouble();

@@ -13,16 +13,16 @@ namespace Game.App;
 
 internal static class Program
 {
-    // Star-field draw radius in cells (~4.15 ly each). Live-tunable via the HUD; bigger = deeper
-    // field but cubic CPU/GPU cost and a bigger one-time generation hitch when entering a region.
-    private static int RenderRadiusCells = 12;   // ~52 ly bubble
+    // The whole star catalog is drawn every frame, so there is no draw-radius bubble. This is only
+    // how far out we gather nearby stars for HUD labels, system spawning, and the speed limit.
+    private static double TrackRadiusLy = 25.0;
     private const int AsteroidFieldRadiusCells = 2; // deep-space clusters within ~1.5 ly
     private const ulong WorldSeed = 0xA11CE5EEDUL;
 
     private static GL _gl = null!;
     private static Camera _camera = null!;
     private static FreeFlyController _controller = null!;
-    private static StarField _starField = null!;
+    private static StarCatalog _starCatalog = null!;
     private static StarRenderer _starRenderer = null!;
     private static GalaxyBackdrop _backdrop = null!;
     private static StarOverlay _overlay = null!;
@@ -70,6 +70,10 @@ internal static class Program
     private static bool _prevB, _prevJ;
     private static string _jumpStatus = "";
     private static bool _scannerOpen;
+    private static string _starSearch = "";
+    private static Star _searchTarget;
+    private static bool _hasSearchTarget;
+    private static string _searchStatus = "";
     private static bool _galacticGridVisible;
     private static bool _paused;
     private static double _savedTimeScale;
@@ -127,8 +131,9 @@ internal static class Program
         _camera.Position = UniversePosition.Origin.Translated(
             new Vector3D<double>(-fwd.X * startDist, -fwd.Y * startDist, -fwd.Z * startDist));
 
-        _starField = new StarField(new GalaxyModel(WorldSeed));
+        _starCatalog = new StarCatalog(new GalaxyModel(WorldSeed));
         _starRenderer = new StarRenderer(_gl);
+        _starRenderer.UploadCatalog(_starCatalog.Stars, _starCatalog.Origin);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
         _overlay = new StarOverlay();
         _systemManager = new SolarSystemManager();
@@ -166,9 +171,9 @@ internal static class Program
         if (_smoke && _smokeFrames == 0)
         {
             // Headless: jump next to the nearest star so the spawn/generate/render path runs.
-            _starField.Update(_camera.Position, RenderRadiusCells);
-            if (_starField.HasNearest)
-                _camera.Position = _starField.Nearest.Position
+            _starCatalog.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
+            if (_starCatalog.HasNearest)
+                _camera.Position = _starCatalog.Nearest.Position
                     .Translated(new Vector3D<double>(0.3 * MathUtil.LightYear, 0, 0));
         }
         if (_smoke && _smokeFrames == 1 && _systemManager.HasActive)
@@ -235,9 +240,9 @@ internal static class Program
         UniversePosition? ridePrev = _terrainTarget?.CurrentPosition;
 
         if (!_driving) _controller.Update(dt);
-        _starField.Update(_camera.Position, RenderRadiusCells);
+        _starCatalog.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
         _asteroidFields.Update(_camera.Position, AsteroidFieldRadiusCells);
-        _systemManager.Update(dt, _camera.Position, _starField);
+        _systemManager.Update(dt, _camera.Position, _starCatalog);
 
         if (_driving)
         {
@@ -301,8 +306,10 @@ internal static class Program
         // Distant galaxy first (writes no depth), so the streamed stars, system, and atmosphere all
         // composite over it and any opaque body occludes the sky behind it.
         _backdrop.Render(_camera);
-        double starBubbleMeters = (RenderRadiusCells + 0.5) * StarField.CellSizeMeters;
-        _starRenderer.Render(_camera, _starField.Visible, starBubbleMeters, _systemManager.ActiveStarId);
+        // Draw the whole million-star block, skipping the active sun (the system pass renders it
+        // precisely; its catalog dot would otherwise sit slightly off when viewed up close).
+        int? activeSun = _systemManager.ActiveStarId is { } id && id < (ulong)_starCatalog.Count ? (int)id : null;
+        _starRenderer.RenderCatalog(_camera, _starCatalog.Origin, activeSun);
 
         // Deep-space asteroid clusters: drawn on the still-clear depth buffer with their own fitted
         // projection so rocks self-occlude. Depth is cleared again below before the system pass, so
@@ -420,7 +427,7 @@ internal static class Program
         uint bloomTex = _bloom.Enabled ? _bloom.Render(_postFbo.ColorTexture) : _postFbo.ColorTexture;
         _bloom.Composite(_postFbo.ColorTexture, bloomTex);
 
-        _overlay.Draw(_camera, _starField, _systemManager);
+        _overlay.Draw(_camera, _starCatalog, _systemManager, _hasSearchTarget ? _searchTarget : null);
         DrawHud();
         DrawTuning();
         DrawScanner();
@@ -456,17 +463,17 @@ internal static class Program
         ImGui.Separator();
 
         ImGui.Text($"Stars rendered: {_starRenderer.LastDrawn}");
-        ImGui.Text($"Cells cached:   {_starField.CachedCellCount}");
+        ImGui.Text($"Catalog stars:  {_starCatalog.Count:N0}  ({_starCatalog.Visible.Count} near)");
         int rocks = _asteroidRenderer.LastRocks, sprites = _asteroidRenderer.LastSprites;
         if (rocks + sprites > 0)
             ImGui.Text($"Asteroids:      {rocks} rocks / {sprites} dots");
         ImGui.Separator();
 
-        if (_starField.HasNearest)
+        if (_starCatalog.HasNearest)
         {
-            var s = _starField.Nearest;
-            double nLy = _starField.NearestDistanceMeters / MathUtil.LightYear;
-            ImGui.Text($"Nearest star: {s.ClassLetter}  #{s.Id:X}");
+            var s = _starCatalog.Nearest;
+            double nLy = _starCatalog.NearestDistanceMeters / MathUtil.LightYear;
+            ImGui.Text($"Nearest star: {s.ClassLetter}  #{s.Id}");
             ImGui.Text($"  {s.Temperature:0} K   lum {s.Luminosity:0.00} Lsun");
             ImGui.Text($"  Distance: {nLy:0.0000} ly");
             if (nLy < _systemManager.SpawnLightYears)
@@ -477,6 +484,25 @@ internal static class Program
         {
             ImGui.Text("Nearest star: (none in range)");
         }
+
+        ImGui.Separator();
+        ImGui.Text($"Find star (catalog # 0–{_starCatalog.Count - 1:N0}):");
+        ImGui.SetNextItemWidth(90);
+        bool submit = ImGui.InputText("##starsearch", ref _starSearch, 12,
+            ImGuiInputTextFlags.EnterReturnsTrue | ImGuiInputTextFlags.CharsDecimal);
+        ImGui.SameLine();
+        if (ImGui.Button("Find")) submit = true;
+        if (submit) FindStar();
+        if (_hasSearchTarget)
+        {
+            if (ImGui.Button("Go to it")) GoToStar();
+            ImGui.SameLine();
+            if (ImGui.Button("Clear")) { _hasSearchTarget = false; _searchStatus = ""; }
+        }
+        if (_searchStatus.Length > 0)
+            ImGui.TextColored(_hasSearchTarget
+                ? new System.Numerics.Vector4(1f, 0.84f, 0.35f, 1f)
+                : new System.Numerics.Vector4(1f, 0.6f, 0.5f, 1f), _searchStatus);
 
         ImGui.Separator();
         if (_systemManager.HasActive)
@@ -531,6 +557,42 @@ internal static class Program
         ImGui.End();
     }
 
+    /// <summary>Look a star up by its catalog index (the number shown on HUD reticles) and flag it.
+    /// The index is stable for the life of the catalog, and the marker persists once set.</summary>
+    private static void FindStar()
+    {
+        string q = _starSearch.Trim();
+        if (q.Length == 0) { _hasSearchTarget = false; _searchStatus = ""; return; }
+
+        if (!int.TryParse(q, out int index) || !_starCatalog.TryGet(index, out Star star))
+        {
+            _hasSearchTarget = false;
+            _searchStatus = $"No star #{q} (valid 0–{_starCatalog.Count - 1:N0})";
+            return;
+        }
+
+        _searchTarget = star;
+        _hasSearchTarget = true;
+        double ly = star.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
+        _searchStatus = $"#{star.Id}: {star.ClassLetter}-class, {ly:0.000} ly — Go to it";
+    }
+
+    /// <summary>Jump the camera to frame the current search target, a few AU out and looking at it
+    /// (close enough that its solar system spawns), mirroring the belt/cluster jumps.</summary>
+    private static void GoToStar()
+    {
+        if (!_hasSearchTarget) return;
+
+        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.3f);
+        Vector3D<float> fwd = _camera.Forward;
+        double dist = 8.0 * MathUtil.AstronomicalUnit; // well inside the system-spawn range
+        _camera.Position = _searchTarget.Position.Translated(
+            new Vector3D<double>(-fwd.X * dist, -fwd.Y * dist, -fwd.Z * dist));
+        double ly = _searchTarget.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
+        _jumpStatus = $"Arrived at star #{_searchTarget.Id} ({_searchTarget.ClassLetter}-class)";
+        _searchStatus = $"#{_searchTarget.Id}: {_searchTarget.ClassLetter}-class, {ly:0.000} ly";
+    }
+
     private static void DrawTuning()
     {
         ImGui.SetNextWindowPos(new System.Numerics.Vector2(990, 10), ImGuiCond.FirstUseEver);
@@ -575,12 +637,14 @@ internal static class Program
 
         if (ImGui.CollapsingHeader("Star field", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            // Draw radius in cells (~4.15 ly each). Bigger = deeper field, but cost grows cubically
-            // and a fresh region generates synchronously, so a large radius hitches on first entry.
-            ImGui.SliderInt("Draw radius", ref RenderRadiusCells, 4, 16);
-            double ly = (RenderRadiusCells + 0.5) * StarField.CellSizeLy;
-            ImGui.TextDisabled($"(~{ly:0} ly bubble — {_starRenderer.LastDrawn} stars)");
-            if (ImGui.Button("Reset star field")) RenderRadiusCells = 12;
+            // The full catalog is drawn every frame; brightness (inverse-square) decides how many
+            // read as points vs. fade into the background haze.
+            ImGui.TextDisabled($"{_starCatalog.Count:N0} stars in a {_starCatalog.SideMeters / MathUtil.LightYear:0} ly block");
+            ImGui.SliderFloat("Brightness", ref _starRenderer.CatBrightScale, 0.1f, 5f);
+            // Lower gamma = flatter falloff = distant stars stay visible (more, fainter points).
+            ImGui.SliderFloat("Falloff (gamma)", ref _starRenderer.CatGamma, 0.12f, 0.6f);
+            ImGui.SliderFloat("Star size", ref _starRenderer.CatSizeScale, 1f, 20f);
+            ImGui.SliderFloat("Max size", ref _starRenderer.CatMaxSize, 20f, 300f);
         }
 
         if (ImGui.CollapsingHeader("Ocean", ImGuiTreeNodeFlags.DefaultOpen))
@@ -916,8 +980,8 @@ internal static class Program
 
         // The nearest catalog star — present even before its system spawns, so the slowdown begins as
         // you approach the star itself, not only once planets appear.
-        if (_starField.HasNearest)
-            Consider(_starField.NearestDistanceMeters, _starField.Nearest.RadiusMeters, isStar: true);
+        if (_starCatalog.HasNearest)
+            Consider(_starCatalog.NearestDistanceMeters, _starCatalog.Nearest.RadiusMeters, isStar: true);
 
         // Planets and moons tighten the limit further the closer you get to one.
         if (_systemManager.HasActive)
@@ -934,7 +998,7 @@ internal static class Program
         Star best = default;
         bool found = false;
         double bestSq = double.MaxValue;
-        foreach (Star s in _starField.Visible)
+        foreach (Star s in _starCatalog.Visible)
         {
             if (!AsteroidBelt.Rolls(s)) continue;
             double dsq = s.Position.DistanceSquaredTo(_camera.Position);

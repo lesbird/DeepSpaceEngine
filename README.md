@@ -34,8 +34,11 @@ interstellar flight down to standing on a planet. See the full design in
 > your speed in as you near a star — and tighter still as you approach its planets and moons — so
 > bodies no longer blur past in an instant (far from everything there's no limit at all). Terrain
 > patches now **bake on a background worker pool**, with only the GPU upload left on the render
-> thread, so descending toward a surface stays smooth instead of stalling the frame. Generation is
-> fully deterministic. M5 (fidelity) is underway.
+> thread, so descending toward a surface stays smooth instead of stalling the frame. The foreground
+> star field is now a finite, pre-generated **catalog of 1,000,000 stars** with stable catalog
+> numbers — the whole block is drawn every frame (apparent-brightness point sprites, so distant
+> stars fade into a haze instead of saturating), and you can **search any star by its number and
+> jump straight to it**. Generation is fully deterministic. M5 (fidelity) is underway.
 
 ## Screenshots
 
@@ -63,7 +66,7 @@ interstellar flight down to standing on a planet. See the full design in
 | `Engine.Core` | `UniversePosition` (hierarchical coords), deterministic hashing/RNG, math constants |
 | `Engine.Rendering` | GL wrappers: `Shader`, `Mesh`, `Camera`, `Primitives`, matrix helpers |
 | `Engine.Platform` | `GameWindow` — Silk.NET window + GL context + input bootstrap |
-| `Game.Universe` | procedural generation: galaxy/`StarField`, the `BackdropStars` far-field dome, `SystemGenerator` (planets + moons), `Noise` (fBm + ridged), `PlanetTerrain`, atmospheres, the `Rover` surface-physics sim, and the live knobs (`TerrainTuning`/`BiomeTuning` globals + `PlanetTuning` per-type overrides) |
+| `Game.Universe` | procedural generation: galaxy/`StarCatalog` (a finite, indexed 1M-star block; `StarField` is the legacy infinite cell-streamer), the `BackdropStars` far-field dome, `SystemGenerator` (planets + moons), `Noise` (fBm + ridged), `PlanetTerrain`, atmospheres, the `Rover` surface-physics sim, and the live knobs (`TerrainTuning`/`BiomeTuning` globals + `PlanetTuning` per-type overrides) |
 | `Game.Systems` | runtime systems: `SolarSystemManager` (spawn/despawn lifecycle, sim time) and `SpeedPolicy` (the free-fly proximity speed limiter) |
 | `Game.App` | entry point, main loop, `FreeFlyController` + `RoverController` (chase-cam driving), renderers (`StarRenderer`, `GalaxyBackdrop`, `SystemRenderer`, `PlanetTerrainRenderer` — patches baked on a background worker pool, uploaded on the render thread, `RoverRenderer`, depth-aware `AtmosphereRenderer` over a `SceneFramebuffer`), `StarOverlay`, HUD + tuning panel (`TuningConfig` save/load) |
 | `Engine.Core.Tests` | xUnit tests: coordinate precision, generation determinism, terrain, rover, backdrop & speed policy |
@@ -129,11 +132,18 @@ even at extreme speed (or a low frame-rate) you can never skip straight through 
 the automatic limit for a fine descent, just wheel the desired speed down; the HUD shows the current
 speed and flags when the limiter is holding you below what the wheel commands.
 
-**Navigation aids.** In open space, nearby stars carry reticles (catalog id + class +
+**Navigation aids.** In open space, nearby stars carry reticles (catalog number + class +
 distance) and a green arrow always points to the nearest star. Inside a system the star
 clutter drops away: the sun is marked, each planet shows its `STAR-PLANET` designation, and
 a planet's moons (`STAR-PLANET-MOON`) only reveal once you fly close to it. A "nearest
-planet" arrow guides you in.
+planet" arrow guides you in. Catalog numbers are plain decimal indices into the star catalog
+(star `42`, planet `42-1`, moon `42-1-3`).
+
+**Find a star.** The HUD's *Find star* box takes a catalog number (0 … 999,999) — type it and
+press *Find* to flag that star with an amber target marker (on-screen brackets, or an edge
+arrow when it's off-screen or behind you), then *Go to it* to jump the camera in to frame it
+within system-spawn range. Because the catalog is finite and pre-generated, any star is
+addressable by number, not just the ones currently near you.
 
 **Scanner.** Press `F` to toggle a scanner panel that reads out the nearest body once you're in
 range — class, radius, surface gravity, temperature, hydrosphere, and atmosphere/surface
@@ -144,7 +154,8 @@ system (planets, moons, orbit time-lapse with apparent speed in `c`), and — wh
 your altitude and live terrain patch counts. Fly to extreme distances to confirm there is
 **no positional jitter**.
 
-**Tuning panel.** A second HUD window with live controls for the **galaxy backdrop** (an on/off
+**Tuning panel.** A second HUD window with live controls for the **star field** (catalog
+brightness, perceptual falloff/gamma, and point size), the **galaxy backdrop** (an on/off
 toggle plus band-glow and distant-star brightness), the **atmosphere** (an on/off
 toggle, plus sun intensity, exposure, Rayleigh/Mie strength, haze anisotropy, shell height —
 and a *Debug: transmittance* toggle that shows the ray-march geometry), **terrain relief**
@@ -169,4 +180,4 @@ Defaults are neutral, so generation stays deterministic until you turn a knob.
 - **M2 — Solar systems** ✅ deterministic system generation, spawn/despawn at 0.5 ly (hysteresis), emissive sun + lit orbiting planets + orbit rings
 - **M3 — Planets & terrain** ✅ cube-sphere quadtree-LOD terrain with **ridged-multifractal mountains** + domain warp + **per-LOD band-limited detail** + **slope-aware biome colouring**, skirts, per-patch floating origin, frame-riding, descend & land with no jitter; **ocean worlds** (rugged sea floor + translucent water surface + coastlines); **moons**; **volumetric (Rayleigh + Mie) atmospheres**; **live tuning HUD** with `tuning.json` save/load
 - **M4 — Rover** ✅ drivable surface vehicle: per-planet gravity, terrain-following + slope tilt, ledge falls/landings, throttle/steer driving under a third-person chase camera (`R` to deploy/exit); arcade-grounded, pure testable sim
-- **M5 — Fidelity** (in progress) — **distant-galaxy backdrop** ✅ (a deterministic far-field dome of background stars concentrated on the galactic plane + a fullscreen Milky-Way band with dust lanes and a central bulge, drawn behind the streamed star field, with live brightness knobs saved to `tuning.json`); **smooth terrain LOD** ✅ (continuous fractional-octave detail fade + geomorphing between levels + merge hysteresis, so the surface no longer pops/rebuilds across LOD transitions); **planetary rings** ✅ (gas/ice giants get a deterministic banded annulus in their tilted equatorial plane — procedural radial bands with Cassini-like gaps, sunlit and translucent, with the planet casting a real shadow across the ring); **threaded terrain generation** ✅ (patch meshes baked on a background worker pool, uploaded on the render thread, so descending to a surface no longer stalls the frame); **proximity speed limiter** ✅ (continuous distance-based slowdown near stars, planets and moons — unlimited in open space, with anti-tunnelling so you can't skip through a body); still to come: per-wheel suspension, planet rotation, erosion & more biomes, animated water
+- **M5 — Fidelity** (in progress) — **distant-galaxy backdrop** ✅ (a deterministic far-field dome of background stars concentrated on the galactic plane + a fullscreen Milky-Way band with dust lanes and a central bulge, drawn behind the streamed star field, with live brightness knobs saved to `tuning.json`); **smooth terrain LOD** ✅ (continuous fractional-octave detail fade + geomorphing between levels + merge hysteresis, so the surface no longer pops/rebuilds across LOD transitions); **planetary rings** ✅ (gas/ice giants get a deterministic banded annulus in their tilted equatorial plane — procedural radial bands with Cassini-like gaps, sunlit and translucent, with the planet casting a real shadow across the ring); **threaded terrain generation** ✅ (patch meshes baked on a background worker pool, uploaded on the render thread, so descending to a surface no longer stalls the frame); **proximity speed limiter** ✅ (continuous distance-based slowdown near stars, planets and moons — unlimited in open space, with anti-tunnelling so you can't skip through a body); **finite star catalog** ✅ (the foreground field is now a pre-generated, spatially-indexed block of 1,000,000 stars with stable decimal catalog numbers, drawn whole each frame as apparent-brightness point sprites, with search-by-number and jump-to-star — a later pass tiles and pages multiple blocks for an effectively unbounded catalog); still to come: per-wheel suspension, planet rotation, erosion & more biomes, animated water

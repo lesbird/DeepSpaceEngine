@@ -39,6 +39,7 @@ public readonly struct Star
 
     public char ClassLetter => "MKGFABO"[(int)Class];
 
-    /// <summary>Catalog designation (8-hex). Planets/moons extend this as star-planet[-moon].</summary>
-    public string Designation => ((uint)Id).ToString("X8");
+    /// <summary>Catalog designation: the star's catalog index in decimal (the number the player
+    /// searches for). Planets/moons extend this as star-planet[-moon].</summary>
+    public string Designation => Id.ToString();
 }

@@ -25,7 +25,7 @@ public sealed class StarOverlay
 
     private readonly List<(double DistSq, Star Star)> _scratch = new();
 
-    public void Draw(Camera camera, StarField field, SolarSystemManager manager)
+    public void Draw(Camera camera, StarCatalog field, SolarSystemManager manager, Star? searchTarget = null)
     {
         var io = ImGui.GetIO();
         Vector2 vp = io.DisplaySize;
@@ -50,6 +50,42 @@ public sealed class StarOverlay
             if (field.HasNearest)
                 DrawNearestMarker(dl, camera, field, cam, m, vp, invOrientation);
         }
+
+        // A searched-for star is flagged in both modes so you can keep it in view while
+        // closing in and entering its system. Star positions are fixed, so the marker
+        // keeps pointing even after the star leaves the render bubble.
+        if (searchTarget.HasValue)
+            DrawSearchMarker(dl, searchTarget.Value, cam, m, vp, invOrientation);
+    }
+
+    private static void DrawSearchMarker(ImDrawListPtr dl, in Star s, in UniversePosition cam,
+        in Matrix4X4<float> m, Vector2 vp, in Quaternion<float> invOrientation)
+    {
+        double distLy = s.Position.DistanceTo(cam) / MathUtil.LightYear;
+        uint hi = Col(255, 215, 90, 255); // amber — distinct from the green "nearest" marker
+        string label = $"TARGET  #{s.Id}   {distLy:0.000} ly";
+
+        Vector3D<float> rel = s.Position.ToCameraRelative(cam);
+        if (Project(rel, m, vp, out Vector2 screen) && OnScreen(screen, vp))
+        {
+            const float r = 18f;
+            DrawBrackets(dl, screen, r, hi);
+            dl.AddCircle(screen, r + 4f, hi, 24, 1.5f);
+            dl.AddText(screen + new Vector2(r + 8, -r), hi, label);
+            return;
+        }
+
+        // Off screen or behind: clamp an arrow to the screen edge pointing toward it.
+        Vector3D<float> viewDir = Vector3D.Transform(rel, invOrientation);
+        Vector2 dir = new(viewDir.X, -viewDir.Y);
+        if (dir.LengthSquared() < 1e-6f) dir = new Vector2(0, 1);
+        dir = Vector2.Normalize(dir);
+
+        Vector2 pos = ClampToEdge(vp * 0.5f, dir, vp, margin: 64f);
+        DrawArrow(dl, pos, dir, hi);
+        Vector2 textPos = Vector2.Clamp(pos - dir * 26f - new Vector2(70, -10),
+            new Vector2(8, 8), vp - new Vector2(240, 24));
+        dl.AddText(textPos, hi, label);
     }
 
     private void DrawSystemReticles(ImDrawListPtr dl, SolarSystem sys,
@@ -128,7 +164,7 @@ public sealed class StarOverlay
         dl.AddText(textPos, hi, label);
     }
 
-    private void DrawNearbyReticles(ImDrawListPtr dl, StarField field, in UniversePosition cam,
+    private void DrawNearbyReticles(ImDrawListPtr dl, StarCatalog field, in UniversePosition cam,
         in Matrix4X4<float> m, Vector2 vp)
     {
         double radiusM = LabelRadiusLy * MathUtil.LightYear;
@@ -153,18 +189,18 @@ public sealed class StarOverlay
             double distLy = Math.Sqrt(_scratch[i].DistSq) / MathUtil.LightYear;
             uint col = StarColor(s, 0xC0);
             dl.AddCircle(screen, 9f, col, 16, 1.5f);
-            dl.AddText(screen + new Vector2(12, -8), col, $"#{(uint)s.Id:X8}");
+            dl.AddText(screen + new Vector2(12, -8), col, $"#{s.Id}");
             dl.AddText(screen + new Vector2(12, 6), Col(170, 190, 220, 200), $"{s.ClassLetter}  {distLy:0.00} ly");
         }
     }
 
-    private static void DrawNearestMarker(ImDrawListPtr dl, Camera camera, StarField field,
+    private static void DrawNearestMarker(ImDrawListPtr dl, Camera camera, StarCatalog field,
         in UniversePosition cam, in Matrix4X4<float> m, Vector2 vp, in Quaternion<float> invOrientation)
     {
         Star s = field.Nearest;
         double distLy = field.NearestDistanceMeters / MathUtil.LightYear;
         uint hi = Col(120, 255, 160, 255);
-        string label = $"NEAREST  #{(uint)s.Id:X8}   {distLy:0.000} ly";
+        string label = $"NEAREST  #{s.Id}   {distLy:0.000} ly";
 
         Vector3D<float> rel = s.Position.ToCameraRelative(cam);
         bool inFront = Project(rel, m, vp, out Vector2 screen) && OnScreen(screen, vp);
