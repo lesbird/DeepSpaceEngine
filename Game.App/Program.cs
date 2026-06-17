@@ -906,7 +906,10 @@ internal static class Program
 
         if (target.AtmosphereComposition.Length > 0)
         {
-            ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.85f, 1f, 1f), "Atmosphere");
+            string press = target.SurfacePressureBar >= 0.01
+                ? $"{target.SurfacePressureBar:0.00} bar"
+                : $"{target.SurfacePressureBar * 1000:0.0} mbar";
+            ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.85f, 1f, 1f), $"Atmosphere  ({press})");
             foreach (Constituent c in target.AtmosphereComposition)
                 ImGui.Text($"  {c.Name,-18} {c.Fraction * 100:0.0}%");
         }

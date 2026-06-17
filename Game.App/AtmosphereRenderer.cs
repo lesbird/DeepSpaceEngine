@@ -62,7 +62,7 @@ uniform vec3  uSunDir;                // normalized, planet -> sun
 uniform float uRp, uRa;               // planet (mean-surface, for density) & atmosphere-top radius
 uniform float uRg;                    // ground/clip radius = lowest terrain (≤ uRp); march reaches here
 uniform vec3  uBetaR;                 // Rayleigh scattering coeff per channel (1/m)
-uniform float uBetaM;                 // Mie scattering coeff (1/m)
+uniform vec3  uBetaM;                 // Mie scattering coeff per channel (1/m) — aerosol-tinted
 uniform float uHr, uHm;               // Rayleigh / Mie scale heights (m)
 uniform float uSunI, uExposure, uMieG, uDebug;
 uniform sampler2D uDepth;             // scene depth (offscreen) for clamping the march to geometry
@@ -291,13 +291,17 @@ void main() {
         Vector3D<float> sunDir = Vector3D.Normalize(sunRel - planetRel);
         Vector3D<float> planetScaled = planetRel * (float)(1.0 / rp); // ~1.0 in magnitude
 
-        // Size-independent optical depth: beta = tau / scaleHeight, tinted by the planet's colour.
+        // Size-independent optical depth: beta = tau / scaleHeight. Rayleigh keeps the λ⁻⁴ blue ratio,
+        // modulated by the composition-derived density and absorption tint (AtmosphereColor).
         float tauR = RayleighStrength * p.AtmosphereDensity;
         Vector3D<float> betaR = new(
             tauR * EarthRayleighRatio.X * p.AtmosphereColor.X / hr,
             tauR * EarthRayleighRatio.Y * p.AtmosphereColor.Y / hr,
             tauR * EarthRayleighRatio.Z * p.AtmosphereColor.Z / hr);
-        float betaM = MieStrength * p.AtmosphereDensity / hm;
+        // Mie is the aerosol/haze term, now per-channel so dust reads ochre and sulphuric haze yellow.
+        float tauM = MieStrength * p.MieDensity;
+        Vector3D<float> betaM = new(
+            tauM * p.MieColor.X / hm, tauM * p.MieColor.Y / hm, tauM * p.MieColor.Z / hm);
 
         _shader.SetVector3("uPlanet", planetScaled);
         _shader.SetVector3("uSunDir", sunDir);
@@ -312,7 +316,7 @@ void main() {
         _shader.SetFloat("uRg", 1.0f - groundFrac);
         _shader.SetFloat("uRa", 1.0f + height);
         _shader.SetVector3("uBetaR", betaR);
-        _shader.SetFloat("uBetaM", betaM);
+        _shader.SetVector3("uBetaM", betaM);
         _shader.SetFloat("uHr", hr);
         _shader.SetFloat("uHm", hm);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);

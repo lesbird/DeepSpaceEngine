@@ -56,6 +56,7 @@ public static class SystemGenerator
             AssignAtmosphere(ref rng, planet);
             planet.SurfaceTempK = (float)EquilibriumTempK(star.Luminosity, aAu);
             ApplyScanData(planet);
+            AtmosphereModel.Derive(planet); // composition + T + g + pressure → atmosphere look
             AssignSurfaceAlbedo(planet);
             // Moons share the parent's distance from the star, so they inherit its temperature.
             planet.Moons = GenerateMoons(ref rng, planet, star.Designation, i + 1, planet.SurfaceTempK);
@@ -116,6 +117,7 @@ public static class SystemGenerator
             };
             AssignMoonAtmosphere(ref rng, moon);
             ApplyScanData(moon);
+            AtmosphereModel.Derive(moon); // composition + T + g + pressure → atmosphere look
             AssignSurfaceAlbedo(moon);
             moons[j] = moon;
         }
@@ -155,23 +157,16 @@ public static class SystemGenerator
     private static void AssignSurfaceAlbedo(CelestialBody b)
         => b.SurfaceAlbedo = b.HasSurface ? new PlanetTerrain(b).AverageAlbedo() : b.Color;
 
-    /// <summary>Multiplies every generated atmosphere shell's thickness — a pure visual-size knob.
-    /// Because the renderer derives the scattering coefficient as optical-depth ÷ scale-height, a
-    /// taller shell stays the same vertical optical depth (a bigger halo, not a denser haze). Applied
-    /// after the RNG draws, so it never perturbs the deterministic generation stream.</summary>
-    private const float AtmosphereShellScale = 2.0f;
-
     /// <summary>Most moons are airless. Only the larger ones have a chance at a thin atmosphere
-    /// (think Titan), scaling with size and capped well below a planet's.</summary>
+    /// (think Titan), at a lower pressure than a planet's. The optical look is derived from the
+    /// scanned composition later by <see cref="AtmosphereModel.Derive"/>.</summary>
     private static void AssignMoonAtmosphere(ref DeterministicRng rng, Moon m)
     {
-        // Habitable ocean moons always carry a breathable, ocean-blue atmosphere.
+        // Habitable ocean moons always carry a breathable atmosphere.
         if (m.Type == PlanetType.Ocean)
         {
             m.HasAtmosphere = true;
-            m.AtmosphereColor = new Vector3D<float>(0.35f, 0.55f, 1.0f);
-            m.AtmosphereHeight = (float)rng.Range(0.020, 0.030) * AtmosphereShellScale;
-            m.AtmosphereDensity = (float)rng.Range(0.9, 1.2);
+            m.SurfacePressureBar = (float)rng.Range(0.7, 1.2);
             return;
         }
 
@@ -180,15 +175,7 @@ public static class SystemGenerator
         if (rng.NextDouble() >= chance) { m.HasAtmosphere = false; return; }
 
         m.HasAtmosphere = true;
-        m.AtmosphereColor = m.Type switch
-        {
-            PlanetType.Lava => new Vector3D<float>(0.80f, 0.35f, 0.18f),
-            PlanetType.Desert => new Vector3D<float>(0.80f, 0.62f, 0.42f),
-            PlanetType.Ice => new Vector3D<float>(0.70f, 0.80f, 0.92f),
-            _ => new Vector3D<float>(0.62f, 0.66f, 0.74f), // rocky: a pale Titan-like haze
-        };
-        m.AtmosphereHeight = (float)rng.Range(0.012, 0.022) * AtmosphereShellScale; // thinner shell than a planet's
-        m.AtmosphereDensity = (float)rng.Range(0.4, 0.8);
+        m.SurfacePressureBar = (float)rng.Range(0.05, 0.6); // thin, Titan-like
     }
 
     /// <summary>
@@ -220,41 +207,31 @@ public static class SystemGenerator
         p.RingRocks = PlanetRing.Generate(p);
     }
 
+    /// <summary>Decide whether a planet has an atmosphere and its surface pressure (bar). The optical
+    /// look (colour/thickness/haze) is derived later from the scanned composition by
+    /// <see cref="AtmosphereModel.Derive"/> — this only sets the physical drivers.</summary>
     private static void AssignAtmosphere(ref DeterministicRng rng, Planet p)
     {
-        float jitterH = (float)rng.Range(0.9, 1.15);
-        float jitterD = (float)rng.Range(0.85, 1.2);
-
+        // Bigger terrestrial worlds hold onto more atmosphere.
+        float size = (float)Math.Clamp(Math.Sqrt(p.RadiusMeters / MathUtil.EarthRadiusM), 0.6, 1.6);
         switch (p.Type)
         {
             case PlanetType.Ocean:
-                p.HasAtmosphere = true; p.AtmosphereColor = new Vector3D<float>(0.35f, 0.55f, 1.0f);
-                p.AtmosphereHeight = 0.035f; p.AtmosphereDensity = 1.3f; break;
-            case PlanetType.Desert:
-                p.HasAtmosphere = true; p.AtmosphereColor = new Vector3D<float>(0.85f, 0.65f, 0.45f);
-                p.AtmosphereHeight = 0.030f; p.AtmosphereDensity = 1.0f; break;
+                p.HasAtmosphere = true; p.SurfacePressureBar = (float)rng.Range(0.8, 1.4) * size; break;
+            case PlanetType.Desert: // Mars-thin through Venus-thick — the variety is deliberate
+                p.HasAtmosphere = true; p.SurfacePressureBar = (float)rng.Range(0.3, 3.0) * size; break;
             case PlanetType.Rocky:
-                p.HasAtmosphere = rng.NextDouble() < 0.6; p.AtmosphereColor = new Vector3D<float>(0.55f, 0.62f, 0.78f);
-                p.AtmosphereHeight = 0.025f; p.AtmosphereDensity = 0.8f; break;
+                p.HasAtmosphere = rng.NextDouble() < 0.6; p.SurfacePressureBar = (float)rng.Range(0.2, 1.2) * size; break;
             case PlanetType.Ice:
-                p.HasAtmosphere = rng.NextDouble() < 0.5; p.AtmosphereColor = new Vector3D<float>(0.65f, 0.78f, 0.92f);
-                p.AtmosphereHeight = 0.022f; p.AtmosphereDensity = 0.6f; break;
+                p.HasAtmosphere = rng.NextDouble() < 0.5; p.SurfacePressureBar = (float)rng.Range(0.05, 0.5) * size; break;
             case PlanetType.Lava:
-                p.HasAtmosphere = rng.NextDouble() < 0.6; p.AtmosphereColor = new Vector3D<float>(0.85f, 0.30f, 0.15f);
-                p.AtmosphereHeight = 0.022f; p.AtmosphereDensity = 0.9f; break;
+                p.HasAtmosphere = rng.NextDouble() < 0.6; p.SurfacePressureBar = (float)rng.Range(1.0, 6.0) * size; break;
             case PlanetType.GasGiant:
-                p.HasAtmosphere = true; p.AtmosphereColor = Brighten(p.Color);
-                p.AtmosphereHeight = 0.060f; p.AtmosphereDensity = 1.6f; break;
+                p.HasAtmosphere = true; p.SurfacePressureBar = (float)rng.Range(60.0, 160.0); break;
             case PlanetType.IceGiant:
-                p.HasAtmosphere = true; p.AtmosphereColor = new Vector3D<float>(0.45f, 0.65f, 0.92f);
-                p.AtmosphereHeight = 0.050f; p.AtmosphereDensity = 1.4f; break;
+                p.HasAtmosphere = true; p.SurfacePressureBar = (float)rng.Range(30.0, 80.0); break;
         }
-        p.AtmosphereHeight *= jitterH * AtmosphereShellScale;
-        p.AtmosphereDensity *= jitterD;
     }
-
-    private static Vector3D<float> Brighten(Vector3D<float> c) => new(
-        Math.Min(1f, c.X * 1.2f + 0.1f), Math.Min(1f, c.Y * 1.2f + 0.1f), Math.Min(1f, c.Z * 1.2f + 0.1f));
 
     /// <summary>Black-body equilibrium temperature (K) at <paramref name="aAu"/> AU from a star of
     /// the given luminosity (≈ 278 K at 1 AU around a Sun-like star), used for the scanner readout

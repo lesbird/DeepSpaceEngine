@@ -41,11 +41,16 @@ public abstract class CelestialBody
     /// for surfaced worlds; equals <see cref="Color"/> for gas/ice giants.</summary>
     public Vector3D<float> SurfaceAlbedo;
 
-    // Atmosphere (a volumetric single-scattering shell; see AtmosphereRenderer).
+    // Atmosphere (a volumetric single-scattering shell; see AtmosphereRenderer). The optical fields
+    // below are DERIVED from the scanned composition + temperature + gravity + surface pressure by
+    // AtmosphereModel.Derive, so the look reflects the chemistry rather than a per-type constant.
     public bool HasAtmosphere;
-    public Vector3D<float> AtmosphereColor;
-    public float AtmosphereHeight;   // shell thickness as a fraction of radius
-    public float AtmosphereDensity;  // optical-depth multiplier
+    public float SurfacePressureBar;  // surface pressure (bar) — drives optical depth + scanner readout
+    public Vector3D<float> AtmosphereColor; // Rayleigh absorption tint (≈white clear gas; cyan for methane)
+    public float AtmosphereHeight;    // shell thickness as a fraction of radius (from the scale height)
+    public float AtmosphereDensity;   // Rayleigh optical-depth scale (pressure × gas refractivity)
+    public Vector3D<float> MieColor;  // aerosol/haze colour (dust ochre, sulphuric yellow, …)
+    public float MieDensity;          // aerosol optical-depth scale (haze gases + suspended surface dust)
 
     // Scan data — deterministic per-body detail surfaced by the in-game scanner (see
     // SystemGenerator.ApplyScanData). Compositions are sorted most-abundant first and sum to ~1.
