@@ -81,6 +81,12 @@ internal static class Program
     private static bool _paused;
     private static double _savedTimeScale;
     private static double _fps;
+    // Rolling FPS over the last N frames (averaged as frames ÷ total time, not a mean of per-frame
+    // rates, so it isn't skewed by the odd very-short/long frame). _frameTimes is a ring of recent dt.
+    private const int FpsWindow = 120;
+    private static readonly double[] _frameTimes = new double[FpsWindow];
+    private static int _frameTimeIdx, _frameTimeCount;
+    private static double _frameTimeSum;
     private static double _renderClock;
     private static bool _smoke;
     private static int _smokeFrames;
@@ -279,7 +285,15 @@ internal static class Program
                 _editType = _terrainTarget.Type;
         }
 
-        _fps = dt > 0 ? 1.0 / dt : 0;
+        // Average the frame rate over the last FpsWindow frames so the readout is steady.
+        if (dt > 0)
+        {
+            _frameTimeSum += dt - _frameTimes[_frameTimeIdx];
+            _frameTimes[_frameTimeIdx] = dt;
+            _frameTimeIdx = (_frameTimeIdx + 1) % FpsWindow;
+            if (_frameTimeCount < FpsWindow) _frameTimeCount++;
+            _fps = _frameTimeSum > 0 ? _frameTimeCount / _frameTimeSum : 0;
+        }
 
         if (_smoke && _smokeFrames == 0 && _systemManager.HasActive)
         {
