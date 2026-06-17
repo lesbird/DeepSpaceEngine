@@ -424,8 +424,8 @@ internal static class Program
             // Rover over the terrain it just drew — same near/far so it shares the depth buffer and
             // the depth-aware atmosphere composites over it correctly.
             if (_driving)
-                _roverRenderer.Render(_camera, _rover.BodyPosition, _rover.Forward, _rover.Up, sunDir,
-                    _terrainRenderer.LastNear, _terrainRenderer.LastFar);
+                _roverRenderer.Render(_camera, _rover.BodyPosition, _rover.Forward, _rover.Up,
+                    _rover.WheelTravel, sunDir, _terrainRenderer.LastNear, _terrainRenderer.LastFar);
         }
 
         // Capture the finished scene into a sampleable colour buffer, then composite the depth-aware
@@ -1012,7 +1012,7 @@ internal static class Program
         {
             double surface = centerDistance - radius;
             double engage = SpeedPolicy.EngageDistance(radius, isStar);
-            cap = Math.Min(cap, SpeedPolicy.Cap(surface, engage));
+            cap = Math.Min(cap, SpeedPolicy.Cap(surface, engage, SpeedPolicy.RateFor(isStar)));
             if (surface < engage) gap = Math.Min(gap, Math.Max(0.0, surface));
         }
 

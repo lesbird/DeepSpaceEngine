@@ -51,6 +51,22 @@ public class SpeedPolicyTests
     }
 
     [Fact]
+    public void Stars_EaseInSooner_ThanBodies()
+    {
+        // Stars use a gentler rate, so at the same distance the cap is lower (you're held slower and
+        // start decelerating sooner), and their zone reaches much farther out.
+        Assert.True(SpeedPolicy.StarApproachRate < SpeedPolicy.ApproachRate);
+        Assert.True(SpeedPolicy.StarEngageRadii > SpeedPolicy.BodyEngageRadii);
+        Assert.Equal(SpeedPolicy.StarApproachRate, SpeedPolicy.RateFor(isStar: true));
+        Assert.Equal(SpeedPolicy.ApproachRate, SpeedPolicy.RateFor(isStar: false));
+
+        double d = 1.0e8; // deep inside, above the floor for both rates
+        double star = SpeedPolicy.Cap(d, Engage, SpeedPolicy.StarApproachRate);
+        double body = SpeedPolicy.Cap(d, Engage, SpeedPolicy.ApproachRate);
+        Assert.True(star < body, $"star cap {star} should be below body cap {body} at the same distance");
+    }
+
+    [Fact]
     public void EngageDistance_ScalesWithRadius_AndStarsReachFarther()
     {
         double r = 6.0e6;

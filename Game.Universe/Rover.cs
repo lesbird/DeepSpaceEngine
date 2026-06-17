@@ -10,10 +10,12 @@ namespace Game.Universe;
 /// recomputes the absolute position as <c>planet.CurrentPosition.Translated(LocalPos)</c> each
 /// frame from the planet's already-advanced position.
 ///
-/// It is deliberately not a full rigid body (no per-wheel suspension — that's a later milestone):
-/// gravity pulls toward the centre, the body snaps to <see cref="RideHeight"/> above the terrain,
-/// throttle/steer drive it across the tangent plane, and it falls off ledges and lands. The terrain
-/// is injected as a height function so the sim is pure and unit-testable with no GL or input.
+/// It is deliberately not a full rigid body: gravity pulls toward the centre, the chassis settles to
+/// <see cref="RideHeight"/> above the terrain through a critically-damped <b>suspension</b> (absorbs
+/// bumps and landings, never bounces), throttle/steer drive it across the tangent plane, and it falls
+/// off ledges and lands. Each wheel reports its own travel (<see cref="WheelTravel"/>) so the renderer
+/// shows it move independently in its well; the body tilt comes from the four-wheel contact plane. The
+/// terrain is injected as a height function so the sim is pure and unit-testable with no GL or input.
 /// </summary>
 public sealed class Rover
 {
@@ -32,6 +34,15 @@ public sealed class Rover
     private const double HalfWidth = 1.05;
     private const double HalfLength = 1.05;
 
+    // Per-wheel suspension (damped-kinematic). The chassis eases to ride height through a critically-
+    // damped spring instead of snapping, so it absorbs bumps and landings and approaches monotonically
+    // (never bounces). Each wheel separately reports how far it sits from its rest position so the
+    // renderer shows independent travel in its well; the body tilt still comes from the contact plane.
+    public const double WheelRadius = 0.45;           // half-height of the wheel box (RoverRenderer)
+    public const double SuspensionCompress = 0.26;    // max upward wheel travel from rest (hitting a bump), m
+    public const double SuspensionDroop = 0.34;       // max downward travel (dropping into a dip / airborne), m
+    private const double SuspensionSmoothTime = 0.16; // chassis settle time, s (critically damped)
+
     private readonly double _radius;
     private readonly double _g;
     private readonly Func<Vector3D<double>, double> _heightAt;
@@ -43,8 +54,19 @@ public sealed class Rover
 
     private Vector3D<double> _forward; // tangent heading (unit)
 
+    private readonly double[] _wheelGround = new double[4]; // last sampled terrain height under each wheel
+    private readonly double[] _wheelTravel = new double[4]; // per-wheel offset from rest (see WheelTravel)
+
     /// <summary>True when the body is resting on (or pressed into) the terrain this step.</summary>
     public bool Grounded { get; private set; }
+
+    /// <summary>
+    /// Per-wheel suspension offset from the rest position (metres): positive = the wheel hangs further
+    /// down (a dip, or airborne), negative = it is pushed up into the chassis (over a bump). Order is
+    /// FR, FL, BR, BL — matching the renderer's wheel layout — so the renderer can drop each wheel into
+    /// its well independently. Clamped to [−<see cref="SuspensionCompress"/>, <see cref="SuspensionDroop"/>].
+    /// </summary>
+    public IReadOnlyList<double> WheelTravel => _wheelTravel;
 
     /// <param name="radius">Planet base radius (m).</param>
     /// <param name="surfaceGravity">Downward acceleration at the surface (m/s²).</param>
@@ -118,30 +140,58 @@ public sealed class Rover
             Velocity = vRad + vTan;
         }
 
-        // Integrate, then resolve against the ground under the wheel footprint.
+        // Integrate, then resolve against the ground through the suspension.
         LocalPos += Velocity * dt;
 
         up = RadialUp;
         double r = LocalPos.Length;
-        double targetR = Footprint(up).groundR + RideHeight;
+        double targetR = Footprint(up).groundR + RideHeight; // also fills _wheelGround for per-wheel travel
         double vr = Vector3D.Dot(Velocity, up);
 
-        // Ground-stick: glue to the surface whenever we're at or just above it and not actively
-        // rising, so the body hugs dips and down-slopes instead of going ballistic over every crest
-        // and floating. The tolerance grows with speed — the faster we drive, the more the ground can
-        // fall away beneath us in a single step. A drop larger than that is a real ledge, so we let
-        // go and fall (and a genuine upward velocity, vr > 0, is never yanked back down).
-        double snapTol = GroundSnap + SpeedMps * dt * 4.0;
-        if (r <= targetR || (vr <= 0.0 && r <= targetR + snapTol))
+        // Wheels still reach the ground while the chassis is within droop of ride height; the tolerance
+        // grows with speed so a fast crest doesn't read as a launch. A larger gap is a real ledge — let
+        // go and fall (an upward velocity is never yanked back down).
+        double reach = targetR + SuspensionDroop + GroundSnap + SpeedMps * dt * 4.0;
+        if (r <= targetR || (r <= reach && vr <= 0.0)) // above ride height + rising = a real launch → fall
         {
-            LocalPos = up * targetR;             // snap to ride height above terrain
-            if (vr < 0.0) Velocity -= up * vr;   // kill only inward velocity (land), keep tangential
+            // Critically-damped spring settles the chassis to ride height: absorbs bumps and landings,
+            // never overshoots upward (no bounce). A hard bump stop keeps wheels from compressing through.
+            SmoothDamp(ref r, targetR, ref vr, SuspensionSmoothTime, dt);
+            double floorR = targetR - SuspensionCompress;
+            if (r < floorR) { r = floorR; if (vr < 0.0) vr = 0.0; }
+            Vector3D<double> tangential = Velocity - up * Vector3D.Dot(Velocity, up);
+            LocalPos = up * r;
+            Velocity = tangential + up * vr;
             Grounded = true;
         }
         else
         {
-            Grounded = false;                    // launched upward, or drove off a real ledge — fall
+            Grounded = false; // launched upward, or drove off a real ledge — fall
         }
+
+        // Per-wheel travel for the renderer: how far each wheel sits from rest given the settled chassis.
+        // Wheel directions are radial, so the heights sampled into _wheelGround above still apply.
+        double rFinal = LocalPos.Length;
+        for (int i = 0; i < 4; i++)
+        {
+            double delta = (rFinal - _radius - _wheelGround[i]) - RideHeight; // + dip (extend), − bump (compress)
+            _wheelTravel[i] = Math.Clamp(delta, -SuspensionCompress, SuspensionDroop);
+        }
+    }
+
+    /// <summary>Critically-damped approach of <paramref name="current"/> toward <paramref name="target"/>
+    /// (Game Programming Gems / Unity SmoothDamp): unconditionally stable for any <paramref name="dt"/>
+    /// and never oscillates, so the chassis settles springily without the snap or the bounce.</summary>
+    private static void SmoothDamp(ref double current, double target, ref double vel, double smoothTime, double dt)
+    {
+        smoothTime = Math.Max(1e-4, smoothTime);
+        double omega = 2.0 / smoothTime;
+        double x = omega * dt;
+        double exp = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+        double change = current - target;
+        double temp = (vel + omega * change) * dt;
+        vel = (vel - omega * temp) * exp;
+        current = target + (change + temp) * exp;
     }
 
     /// <summary>
@@ -171,6 +221,8 @@ public sealed class Rover
         Vector3D<double> dBL = WheelDir(radial, right, fwd, -HalfWidth, -HalfLength);
 
         double hFR = _heightAt(dFR), hFL = _heightAt(dFL), hBR = _heightAt(dBR), hBL = _heightAt(dBL);
+        // Cache per wheel (FR, FL, BR, BL) for the suspension travel computed in Update.
+        _wheelGround[0] = hFR; _wheelGround[1] = hFL; _wheelGround[2] = hBR; _wheelGround[3] = hBL;
         double hMax = Math.Max(Math.Max(hFR, hFL), Math.Max(hBR, hBL));
         double hAvg = 0.25 * (hFR + hFL + hBR + hBL);
         // Lean toward the highest contact so a wheel never sinks below the mesh, but keep some of

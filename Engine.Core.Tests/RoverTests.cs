@@ -70,6 +70,46 @@ public class RoverTests
     }
 
     [Fact]
+    public void Suspension_WheelsTravelIndependentlyOverABump()
+    {
+        // A 0.3 m step under the +X side. With up = +Y and forward = −Z the body's right is +X, so the
+        // right wheels sit on the step and the left wheels in the low ground — they must travel oppositely.
+        var rover = new Rover(R, G, d => d.X > 0 ? 0.3 : 0.0);
+        var up = new Vector3D<double>(0, 1, 0);
+        rover.Seed(up, new Vector3D<double>(0, 0, -1));
+        for (int i = 0; i < 600; i++) rover.Update(1.0 / 60.0, 0, 0, false);
+
+        Assert.True(rover.Grounded);
+        var t = rover.WheelTravel; // FR, FL, BR, BL
+        Assert.True(t[0] < t[1], $"front-right (on the step) should compress vs front-left: {t[0]} vs {t[1]}");
+        Assert.True(t[2] < t[3], $"back-right (on the step) should compress vs back-left: {t[2]} vs {t[3]}");
+        foreach (double v in t)
+            Assert.InRange(v, -Rover.SuspensionCompress - 1e-9, Rover.SuspensionDroop + 1e-9);
+    }
+
+    [Fact]
+    public void Suspension_SettlesWithoutBouncing()
+    {
+        // Drop onto flat ground; once it lands the damped spring must hold it near ride height — it
+        // should not spring back off the surface (the failure mode the suspension is meant to avoid).
+        var rover = FlatRover();
+        var up = new Vector3D<double>(0, 1, 0);
+        rover.Seed(up, new Vector3D<double>(1, 0, 0));
+        rover.LocalPos = up * (R + 8.0);
+
+        for (int i = 0; i < 300; i++) rover.Update(1.0 / 60.0, 0, 0, false); // fall + settle
+
+        double lo = R + Rover.RideHeight - Rover.SuspensionCompress - 0.05;
+        double hi = R + Rover.RideHeight + 0.05;
+        for (int i = 0; i < 300; i++)
+        {
+            rover.Update(1.0 / 60.0, 0, 0, false);
+            Assert.InRange(rover.LocalPos.Length, lo, hi); // never rebounds above ride height, never sinks through
+        }
+        Assert.True(rover.Grounded);
+    }
+
+    [Fact]
     public void Simulation_IsDeterministic()
     {
         var a = FlatRover();

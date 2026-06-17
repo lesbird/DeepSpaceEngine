@@ -41,22 +41,34 @@ void main() {
 
     private readonly GL _gl;
     private readonly Shader _shader;
-    private readonly uint _vao, _vbo, _count;
+    private readonly uint _chassisVao, _chassisVbo, _chassisCount; // chassis + accent + mast (one rigid piece)
+    private readonly uint _wheelVao, _wheelVbo, _wheelCount;        // one wheel, drawn four times with travel
+
+    // Wheel rest layout in the body frame (+X right, +Y up, +Z forward), in renderer order FR, FL, BR, BL
+    // — matching Rover.WheelTravel. Bottom at restY − halfY = −0.75 = −Rover.RideHeight, so a wheel at
+    // zero travel rests on the sampled ground; suspension travel shifts each wheel's Y in its well.
+    private const float RestY = -0.30f;
+    private static readonly Vector3D<float>[] WheelXZ =
+    {
+        new(1.05f, 0f, 1.05f), new(-1.05f, 0f, 1.05f),
+        new(1.05f, 0f, -1.05f), new(-1.05f, 0f, -1.05f),
+    };
 
     public RoverRenderer(GL gl)
     {
         _gl = gl;
         _shader = new Shader(gl, VertexSource, FragmentSource);
-        float[] mesh = BuildMesh();
-        (_vao, _vbo, _count) = MakeBuffer(gl, mesh);
+        (_chassisVao, _chassisVbo, _chassisCount) = MakeBuffer(gl, BuildChassisMesh());
+        (_wheelVao, _wheelVbo, _wheelCount) = MakeBuffer(gl, BuildWheelMesh());
     }
 
     /// <param name="bodyPos">World position of the rover body.</param>
     /// <param name="forward">Heading (driving) direction, world space.</param>
     /// <param name="up">Body up (terrain normal), world space.</param>
+    /// <param name="wheelTravel">Per-wheel suspension offset (FR, FL, BR, BL), from <see cref="Game.Universe.Rover.WheelTravel"/>.</param>
     /// <param name="near">/<param name="far">Must match the terrain pass for a coherent depth buffer.</param>
     public void Render(Camera camera, UniversePosition bodyPos, Vector3D<float> forward, Vector3D<float> up,
-        Vector3D<float> sunDir, float near, float far)
+        IReadOnlyList<double> wheelTravel, Vector3D<float> sunDir, float near, float far)
     {
         Vector3D<float> rel = bodyPos.ToCameraRelative(camera.Position);
 
@@ -79,21 +91,36 @@ void main() {
         _gl.DepthMask(true);
         _shader.Use();
         _shader.SetVector3("uSunDir", sunDir);
+
+        // Chassis (rigid).
         _shader.SetMatrix("uModel", model);
         _shader.SetMatrix("uMVP", model * viewProj);
-        _gl.BindVertexArray(_vao);
-        _gl.DrawArrays(PrimitiveType.Triangles, 0, _count);
+        _gl.BindVertexArray(_chassisVao);
+        _gl.DrawArrays(PrimitiveType.Triangles, 0, _chassisCount);
+
+        // Four wheels, each dropped into its well by its suspension travel (+ = hangs lower). The body-
+        // local offset is pre-multiplied so it rotates with the chassis, then placed by the body model.
+        _gl.BindVertexArray(_wheelVao);
+        for (int i = 0; i < WheelXZ.Length; i++)
+        {
+            float travel = wheelTravel != null && i < wheelTravel.Count ? (float)wheelTravel[i] : 0f;
+            var offset = new Vector3D<float>(WheelXZ[i].X, RestY - travel, WheelXZ[i].Z);
+            Matrix4X4<float> wheelModel = Matrix4X4.CreateTranslation(offset) * model;
+            _shader.SetMatrix("uModel", wheelModel);
+            _shader.SetMatrix("uMVP", wheelModel * viewProj);
+            _gl.DrawArrays(PrimitiveType.Triangles, 0, _wheelCount);
+        }
+
         _gl.BindVertexArray(0);
         _gl.Disable(EnableCap.DepthTest);
     }
 
     // --- mesh (metres, local frame: +X right, +Y up, +Z forward) ---
 
-    private static float[] BuildMesh()
+    private static float[] BuildChassisMesh()
     {
         var v = new List<float>();
         var body = new Vector3D<float>(0.72f, 0.74f, 0.78f);     // light grey chassis
-        var wheel = new Vector3D<float>(0.10f, 0.10f, 0.11f);    // dark tyres
         var mast = new Vector3D<float>(0.45f, 0.47f, 0.50f);     // sensor mast
         var accent = new Vector3D<float>(0.85f, 0.55f, 0.15f);   // front marker (shows heading)
 
@@ -101,18 +128,20 @@ void main() {
         AddBox(v, new Vector3D<float>(0f, 0.15f, 0f), new Vector3D<float>(1.05f, 0.42f, 1.55f), body);
         // Front accent strip at +Z so the driving direction is obvious.
         AddBox(v, new Vector3D<float>(0f, 0.18f, 1.55f), new Vector3D<float>(0.9f, 0.22f, 0.08f), accent);
-        // Four wheels at the corners, sitting below the chassis. Their bottom (wy - halfY = -0.75)
-        // matches Rover.RideHeight + HalfWidth/HalfLength so the wheels rest on the sampled ground.
-        const float wx = 1.05f, wz = 1.05f, wy = -0.30f;
-        var wheelHalf = new Vector3D<float>(0.28f, 0.45f, 0.55f);
-        AddBox(v, new Vector3D<float>(wx, wy, wz), wheelHalf, wheel);
-        AddBox(v, new Vector3D<float>(-wx, wy, wz), wheelHalf, wheel);
-        AddBox(v, new Vector3D<float>(wx, wy, -wz), wheelHalf, wheel);
-        AddBox(v, new Vector3D<float>(-wx, wy, -wz), wheelHalf, wheel);
         // Sensor mast toward the rear.
         AddBox(v, new Vector3D<float>(0f, 1.0f, -0.7f), new Vector3D<float>(0.09f, 0.62f, 0.09f), mast);
         AddBox(v, new Vector3D<float>(0f, 1.7f, -0.7f), new Vector3D<float>(0.22f, 0.07f, 0.22f), mast);
 
+        return v.ToArray();
+    }
+
+    /// <summary>One wheel box centred at the origin (half-height = <see cref="Game.Universe.Rover.WheelRadius"/>),
+    /// drawn four times by <see cref="Render"/> with a per-wheel body-local offset.</summary>
+    private static float[] BuildWheelMesh()
+    {
+        var v = new List<float>();
+        var wheel = new Vector3D<float>(0.10f, 0.10f, 0.11f); // dark tyre
+        AddBox(v, Vector3D<float>.Zero, new Vector3D<float>(0.28f, 0.45f, 0.55f), wheel);
         return v.ToArray();
     }
 
@@ -162,8 +191,10 @@ void main() {
 
     public void Dispose()
     {
-        _gl.DeleteBuffer(_vbo);
-        _gl.DeleteVertexArray(_vao);
+        _gl.DeleteBuffer(_chassisVbo);
+        _gl.DeleteVertexArray(_chassisVao);
+        _gl.DeleteBuffer(_wheelVbo);
+        _gl.DeleteVertexArray(_wheelVao);
         _shader.Dispose();
     }
 }

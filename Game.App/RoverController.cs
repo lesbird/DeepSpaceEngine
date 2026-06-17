@@ -53,6 +53,9 @@ public sealed class RoverController
     public Vector3D<float> Up => ToF(_bodyUp);
     public double SpeedKph => _rover.SpeedMps * 3.6;
 
+    /// <summary>Per-wheel suspension travel (FR, FL, BR, BL) for the renderer's independent wheels.</summary>
+    public IReadOnlyList<double> WheelTravel => _rover.WheelTravel;
+
     /// <summary>
     /// Begin driving on <paramref name="body"/> (a planet or a moon), seeding the rover on the
     /// ground directly below the camera and the heading from where the camera was looking. The
