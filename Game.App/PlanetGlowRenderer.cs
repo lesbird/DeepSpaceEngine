@@ -74,6 +74,14 @@ void main() {
     public float MaxPixelSize = 16f;
     public float Brightness = 1.6f;
 
+    // The active system's sun gets its own, brighter and larger glow so the star still reads as a
+    // bright point from across the system (its catalog dot is suppressed while the system is active).
+    // It fades into the emissive sphere on close approach, exactly like the planet dots.
+    public float StarPixelScale = 30_000f;
+    public float StarMinPixelSize = 6f;
+    public float StarMaxPixelSize = 64f;
+    public float StarBrightness = 2.4f;
+
     public int LastDrawn { get; private set; }
 
     public unsafe PlanetGlowRenderer(GL gl)
@@ -124,6 +132,30 @@ void main() {
         }
 
         LastDrawn = count;
+        Flush(camera, count, viewportHeight, PixelScale, MinPixelSize, MaxPixelSize, Brightness);
+    }
+
+    /// <summary>
+    /// Draw a glow for the active system's sun at its precise position, so the star still reads as a
+    /// bright point from across the system once its catalog dot is suppressed. Brighter and larger
+    /// than the planet dots; fades into the emissive sphere as you close in (same disk-fade handoff,
+    /// which also keeps the single-precision dot offset hidden — it's gone before you're near).
+    /// </summary>
+    public void RenderStar(Camera camera, in UniversePosition position, Vector3D<float> color,
+        double radiusMeters, float viewportHeight)
+    {
+        Vector3D<float> rel = position.ToCameraRelative(camera.Position);
+        _data[0] = rel.X; _data[1] = rel.Y; _data[2] = rel.Z;
+        _data[3] = color.X; _data[4] = color.Y; _data[5] = color.Z;
+        _data[6] = (float)radiusMeters;
+        Flush(camera, 1, viewportHeight, StarPixelScale, StarMinPixelSize, StarMaxPixelSize, StarBrightness);
+    }
+
+    /// <summary>Upload the first <paramref name="count"/> bodies in <see cref="_data"/> and draw them
+    /// as additive, depth-independent glow sprites with the given size/brightness tuning.</summary>
+    private unsafe void Flush(Camera camera, int count, float viewportHeight,
+        float pixelScale, float minSize, float maxSize, float brightness)
+    {
         if (count == 0) return;
 
         _gl.Enable(EnableCap.ProgramPointSize);
@@ -135,14 +167,14 @@ void main() {
         _shader.Use();
         Matrix4X4<float> viewProj = camera.ViewMatrix * camera.ProjectionMatrix;
         _shader.SetMatrix("uViewProj", viewProj);
-        _shader.SetFloat("uPixelScale", PixelScale);
-        _shader.SetFloat("uMinSize", MinPixelSize);
-        _shader.SetFloat("uMaxSize", MaxPixelSize);
+        _shader.SetFloat("uPixelScale", pixelScale);
+        _shader.SetFloat("uMinSize", minSize);
+        _shader.SetFloat("uMaxSize", maxSize);
         _shader.SetFloat("uViewportH", viewportHeight);
         _shader.SetFloat("uTanHalfFov", MathF.Tan(camera.FovRadians * 0.5f));
-        _shader.SetFloat("uFadeStartPx", MaxPixelSize * 0.6f);
-        _shader.SetFloat("uFadeEndPx", MaxPixelSize * 2.75f);
-        _shader.SetFloat("uBrightness", Brightness);
+        _shader.SetFloat("uFadeStartPx", maxSize * 0.6f);
+        _shader.SetFloat("uFadeEndPx", maxSize * 2.75f);
+        _shader.SetFloat("uBrightness", brightness);
 
         _gl.BindVertexArray(_vao);
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _vbo);

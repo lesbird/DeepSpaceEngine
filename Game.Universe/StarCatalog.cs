@@ -4,69 +4,71 @@ using Silk.NET.Maths;
 namespace Game.Universe;
 
 /// <summary>
-/// A finite, pre-generated block of stars with stable integer indices: star #N is
-/// <c>Stars[N]</c>, forever. Unlike the infinite per-cell <see cref="StarField"/>, the
-/// whole block is generated once at startup and never evicted, so a human-meaningful
-/// catalog number can address a specific star and we can fly straight to it.
+/// One block of the tiled star lattice: a fixed-size cube of pre-generated stars with stable indices.
+/// Space is partitioned into a regular lattice of these cubes (see <see cref="StarCatalogPager"/>);
+/// block <c>(bx,by,bz)</c> is centred at <c>blockCoord × side</c> and seeded from its coordinate, so
+/// the whole infinite field is deterministic and any block can be (re)generated on demand without
+/// storing it. A star's global id packs its block and its local index (<see cref="StarId"/>): within a
+/// block the index is stable forever, and the home block (0,0,0) keeps ids 0..Count-1.
 ///
-/// Because positions are fixed, a uniform spatial grid built once answers "stars near the
-/// camera" cheaply (no per-frame regeneration). The block is a cube centred on
-/// <see cref="Origin"/>, sized from the galaxy's stellar density so neighbours sit a few
-/// light-years apart. A later milestone tiles several blocks and pages them by distance;
-/// the index then becomes (blockId, localIndex), but within a block it stays stable.
+/// Positions are fixed, so a uniform spatial grid built once answers "stars near a point" cheaply
+/// (<see cref="Collect"/>). The block size derives from the galaxy's neighbourhood density so a block
+/// holds a realistic number of stars a few light-years apart.
 /// </summary>
-public sealed class StarCatalog : INearestStar
+public sealed class StarCatalog
 {
-    public const int DefaultCount = 1_000_000;
+    /// <summary>Edge length of every lattice block, in light-years. With the default neighbourhood
+    /// density (~0.006 stars/ly³) a block then holds a couple hundred thousand stars.</summary>
+    public const double BlockSideLy = 350.0;
 
     private readonly Star[] _stars;
 
-    // Uniform spatial grid over the cube, stored CSR-style: _cellItems is star indices
-    // grouped by cell; _cellStart[c].._cellStart[c+1] is cell c's slice.
+    // Uniform spatial grid over the cube, stored CSR-style: _cellItems is star indices grouped by
+    // cell; _cellStart[c].._cellStart[c+1] is cell c's slice.
     private readonly int _gridDim;
     private readonly double _cellMeters;
     private readonly double _halfMeters;
     private readonly int[] _cellStart;
     private readonly int[] _cellItems;
 
+    /// <summary>This block's lattice coordinate (integer cube index per axis).</summary>
+    public Vector3D<long> BlockCoord { get; }
     /// <summary>The block's centre (the cube spans ±<see cref="SideMeters"/>/2 about it).</summary>
     public UniversePosition Origin { get; }
     public double SideMeters { get; }
     public IReadOnlyList<Star> Stars => _stars;
     public int Count => _stars.Length;
 
-    /// <summary>Stars within the track radius of the camera (rebuilt each <see cref="Update"/>).</summary>
-    public readonly List<Star> Visible = new();
-
-    public bool HasNearest { get; private set; }
-    public Star Nearest { get; private set; }
-    public double NearestDistanceMeters { get; private set; }
-
-    public StarCatalog(GalaxyModel galaxy, int count = DefaultCount)
-        : this(galaxy, UniversePosition.Origin, count) { }
-
-    public StarCatalog(GalaxyModel galaxy, in UniversePosition origin, int count)
+    /// <summary>Generate the block at <paramref name="blockCoord"/> of the lattice.</summary>
+    public StarCatalog(GalaxyModel galaxy, Vector3D<long> blockCoord)
     {
-        Origin = origin;
-
-        // Size the cube so `count` stars at the galaxy's neighbourhood density fill it; that
-        // yields a realistic mean nearest-neighbour spacing of a few light-years.
-        double sideLy = Math.Cbrt(count / Math.Max(galaxy.BaseDensity, 1e-6));
-        SideMeters = sideLy * MathUtil.LightYear;
+        BlockCoord = blockCoord;
+        SideMeters = BlockSideLy * MathUtil.LightYear;
         _halfMeters = SideMeters * 0.5;
 
-        _stars = Generate(galaxy, count, origin, _halfMeters);
+        double side = SideMeters;
+        Origin = UniversePosition.FromMeters(blockCoord.X * side, blockCoord.Y * side, blockCoord.Z * side);
+
+        // Uniform density → a fixed star count per block (so every block is the same size on the
+        // lattice). Clamp to the id layout's per-block capacity.
+        int count = (int)Math.Round(Math.Max(galaxy.BaseDensity, 1e-6) * BlockSideLy * BlockSideLy * BlockSideLy);
+        count = Math.Clamp(count, 1, StarId.MaxLocal);
+
+        _stars = Generate(galaxy, blockCoord, count, Origin, _halfMeters);
 
         // Grid cells ~6 ly across: a handful of stars each, so a ~25 ly query touches a small
         // neighbourhood of cells.
         _cellMeters = 6.0 * MathUtil.LightYear;
         _gridDim = Math.Max(1, (int)Math.Ceiling(SideMeters / _cellMeters));
-        (_cellStart, _cellItems) = BuildGrid(_stars, origin, _gridDim, _cellMeters, _halfMeters);
+        (_cellStart, _cellItems) = BuildGrid(_stars, Origin, _gridDim, _cellMeters, _halfMeters);
     }
 
-    private static Star[] Generate(GalaxyModel galaxy, int count, in UniversePosition origin, double half)
+    private static Star[] Generate(GalaxyModel galaxy, Vector3D<long> block, int count,
+        in UniversePosition origin, double half)
     {
-        var rng = new DeterministicRng(Hashing.Combine(galaxy.WorldSeed, 0xCA7A106UL));
+        // Seed from the block coordinate so each block is independent yet reproducible.
+        ulong seed = Hashing.HashCell(block.X, block.Y, block.Z, galaxy.WorldSeed);
+        var rng = new DeterministicRng(Hashing.Combine(seed, 0xCA7A106UL));
         var stars = new Star[count];
         for (int i = 0; i < count; i++)
         {
@@ -80,9 +82,10 @@ public sealed class StarCatalog : INearestStar
             StarField.SampleStarType(ref rng, out float temp, out float lum, out float mass,
                 out double radius, out SpectralClass cls);
 
-            // Id == catalog index: the number the player types. Downstream system/belt seeds
-            // run it through Mix64, so sequential indices still produce well-varied systems.
-            stars[i] = new Star((ulong)i, pos, temp, lum, mass, radius, cls);
+            // Global id packs (block, local index): unique and deterministic, so downstream system
+            // and belt seeds (which run it through Mix64) still produce well-varied systems, and the
+            // "find #N" box can unpack it back to a block + index.
+            stars[i] = new Star(StarId.Pack(block, i), pos, temp, lum, mass, radius, cls);
         }
         return stars;
     }
@@ -122,30 +125,33 @@ public sealed class StarCatalog : INearestStar
         return (cx * dim + cy) * dim + cz;
     }
 
-    public bool TryGet(int index, out Star star)
+    /// <summary>Fetch a star by its local index within this block (the low bits of its global id).</summary>
+    public bool TryGetLocal(int localIndex, out Star star)
     {
-        if ((uint)index < (uint)_stars.Length) { star = _stars[index]; return true; }
+        if ((uint)localIndex < (uint)_stars.Length) { star = _stars[localIndex]; return true; }
         star = default;
         return false;
     }
 
     /// <summary>
-    /// Rebuild the nearby-star set within <paramref name="trackRadiusMeters"/> of the camera
-    /// and track the nearest. The full block is always drawn; this only feeds HUD labels,
-    /// system spawning, and the proximity speed limit.
+    /// Append every star within <paramref name="radiusMeters"/> of <paramref name="camera"/> to
+    /// <paramref name="visible"/>, and fold this block's nearest such star into the running
+    /// (<paramref name="bestSq"/>, <paramref name="nearest"/>, <paramref name="hasNearest"/>) so the
+    /// pager can track the nearest across all loaded blocks. Touches only the grid cells the query
+    /// sphere overlaps, so it stays cheap however many blocks are resident.
     /// </summary>
-    public void Update(in UniversePosition camera, double trackRadiusMeters)
+    public void Collect(in UniversePosition camera, double radiusMeters, List<Star> visible,
+        ref double bestSq, ref Star nearest, ref bool hasNearest)
     {
-        Visible.Clear();
-        HasNearest = false;
-        double bestSq = double.MaxValue;
-
+        // The query sphere may not touch this block at all (it's one of several loaded); the grid
+        // clamp below already restricts the scan, and the per-star distance test rejects the rest.
+        double radiusSq = radiusMeters * radiusMeters;
         Vector3D<double> camRel = camera.DeltaMeters(Origin);
+
         int ccx = Axis(camRel.X, _gridDim, _cellMeters, _halfMeters);
         int ccy = Axis(camRel.Y, _gridDim, _cellMeters, _halfMeters);
         int ccz = Axis(camRel.Z, _gridDim, _cellMeters, _halfMeters);
-        int reach = (int)Math.Ceiling(trackRadiusMeters / _cellMeters);
-        double radiusSq = trackRadiusMeters * trackRadiusMeters;
+        int reach = (int)Math.Ceiling(radiusMeters / _cellMeters);
 
         for (int dx = -reach; dx <= reach; dx++)
         {
@@ -166,13 +172,11 @@ public sealed class StarCatalog : INearestStar
                         Star s = _stars[_cellItems[k]];
                         double d2 = s.Position.DistanceSquaredTo(camera);
                         if (d2 > radiusSq) continue;
-                        Visible.Add(s);
-                        if (d2 < bestSq) { bestSq = d2; Nearest = s; HasNearest = true; }
+                        visible.Add(s);
+                        if (d2 < bestSq) { bestSq = d2; nearest = s; hasNearest = true; }
                     }
                 }
             }
         }
-
-        NearestDistanceMeters = HasNearest ? Math.Sqrt(bestSq) : double.MaxValue;
     }
 }

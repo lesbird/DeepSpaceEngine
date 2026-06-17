@@ -25,7 +25,7 @@ public sealed class StarOverlay
 
     private readonly List<(double DistSq, Star Star)> _scratch = new();
 
-    public void Draw(Camera camera, StarCatalog field, SolarSystemManager manager, Star? searchTarget = null)
+    public void Draw(Camera camera, StarCatalogPager field, SolarSystemManager manager, Star? searchTarget = null)
     {
         var io = ImGui.GetIO();
         Vector2 vp = io.DisplaySize;
@@ -164,7 +164,7 @@ public sealed class StarOverlay
         dl.AddText(textPos, hi, label);
     }
 
-    private void DrawNearbyReticles(ImDrawListPtr dl, StarCatalog field, in UniversePosition cam,
+    private void DrawNearbyReticles(ImDrawListPtr dl, StarCatalogPager field, in UniversePosition cam,
         in Matrix4X4<float> m, Vector2 vp)
     {
         double radiusM = LabelRadiusLy * MathUtil.LightYear;
@@ -194,7 +194,7 @@ public sealed class StarOverlay
         }
     }
 
-    private static void DrawNearestMarker(ImDrawListPtr dl, Camera camera, StarCatalog field,
+    private static void DrawNearestMarker(ImDrawListPtr dl, Camera camera, StarCatalogPager field,
         in UniversePosition cam, in Matrix4X4<float> m, Vector2 vp, in Quaternion<float> invOrientation)
     {
         Star s = field.Nearest;

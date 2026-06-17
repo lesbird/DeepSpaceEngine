@@ -24,6 +24,7 @@ public sealed class Rover
     public const double SteerRate = 1.1;    // heading turn rate at full lock, rad/s
     private const double RollingDrag = 0.8; // tangential velocity decay/s when coasting
     private const double BrakeDrag = 3.4;   // stronger decay/s when braking
+    private const double GroundSnap = 0.6;  // base distance the body still sticks to the ground over
 
     // Wheel footprint half-extents (must match RoverRenderer's wheel placement). The body rests
     // on the terrain sampled under these four corners rather than a single centre point, so it sits
@@ -123,16 +124,23 @@ public sealed class Rover
         up = RadialUp;
         double r = LocalPos.Length;
         double targetR = Footprint(up).groundR + RideHeight;
-        if (r <= targetR)
+        double vr = Vector3D.Dot(Velocity, up);
+
+        // Ground-stick: glue to the surface whenever we're at or just above it and not actively
+        // rising, so the body hugs dips and down-slopes instead of going ballistic over every crest
+        // and floating. The tolerance grows with speed — the faster we drive, the more the ground can
+        // fall away beneath us in a single step. A drop larger than that is a real ledge, so we let
+        // go and fall (and a genuine upward velocity, vr > 0, is never yanked back down).
+        double snapTol = GroundSnap + SpeedMps * dt * 4.0;
+        if (r <= targetR || (vr <= 0.0 && r <= targetR + snapTol))
         {
             LocalPos = up * targetR;             // snap to ride height above terrain
-            double vr = Vector3D.Dot(Velocity, up);
             if (vr < 0.0) Velocity -= up * vr;   // kill only inward velocity (land), keep tangential
             Grounded = true;
         }
         else
         {
-            Grounded = false;                    // drove off a ledge — keep falling
+            Grounded = false;                    // launched upward, or drove off a real ledge — fall
         }
     }
 

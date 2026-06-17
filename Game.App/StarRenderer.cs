@@ -94,8 +94,23 @@ void main() {
 }";
 
     private Shader? _catShader;
-    private uint _catVao, _catVbo;
-    private int _catCount;
+
+    // One GPU buffer per resident lattice block, keyed by block coordinate. Mirrors the
+    // StarCatalogPager's loaded set (see SyncBlocks); positions are baked relative to each block's
+    // own origin so the per-frame draw only subtracts the (small) camera-relative-to-block offset.
+    private readonly struct CatBlock
+    {
+        public readonly uint Vao;
+        public readonly uint Vbo;
+        public readonly int Count;
+        public readonly UniversePosition Origin;
+        public CatBlock(uint vao, uint vbo, int count, in UniversePosition origin)
+        { Vao = vao; Vbo = vbo; Count = count; Origin = origin; }
+    }
+    private readonly Dictionary<Vector3D<long>, CatBlock> _catBlocks = new();
+    private readonly HashSet<Vector3D<long>> _desiredScratch = new();
+    private readonly List<Vector3D<long>> _evictScratch = new();
+    private const int CatUploadsPerFrame = 4; // cap block uploads so a burst (e.g. startup) can't stall a frame
 
     /// <summary>Brightness mapping for the catalog draw (tunable). With CatGamma ≈ 0.25 a Sun-like
     /// star stays visible out to tens of light-years and even M-dwarfs show within ~10 ly.</summary>
@@ -193,53 +208,86 @@ void main() {
         _gl.Disable(EnableCap.Blend);
     }
 
-    /// <summary>Upload a finite star block once. Positions are baked relative to the catalog
-    /// origin; the per-frame draw subtracts the camera. Call again only if the block changes.</summary>
-    public unsafe void UploadCatalog(IReadOnlyList<Star> stars, in UniversePosition origin)
+    /// <summary>Mirror the pager's resident block set into per-block GPU buffers: upload any block we
+    /// don't have a buffer for yet (bounded per frame so a burst can't stall), and free buffers for
+    /// blocks that have been evicted. Call once per frame before <see cref="RenderCatalog"/>.</summary>
+    public unsafe void SyncBlocks(IReadOnlyCollection<StarCatalog> loaded)
     {
-        if (_catShader == null)
+        EnsureCatShader();
+
+        // Evict GPU buffers whose block is no longer resident.
+        _desiredScratch.Clear();
+        foreach (StarCatalog block in loaded) _desiredScratch.Add(block.BlockCoord);
+        _evictScratch.Clear();
+        foreach (Vector3D<long> coord in _catBlocks.Keys)
+            if (!_desiredScratch.Contains(coord)) _evictScratch.Add(coord);
+        foreach (Vector3D<long> coord in _evictScratch)
         {
-            _catShader = new Shader(_gl, CatVertexSource, CatFragmentSource);
-            _catVao = _gl.GenVertexArray();
-            _catVbo = _gl.GenBuffer();
-            _gl.BindVertexArray(_catVao);
-            _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _catVbo);
-            uint stride = CatFloatsPerStar * sizeof(float);
-            _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, (void*)0);
-            _gl.EnableVertexAttribArray(0);
-            _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, (void*)(3 * sizeof(float)));
-            _gl.EnableVertexAttribArray(1);
-            _gl.VertexAttribPointer(2, 1, VertexAttribPointerType.Float, false, stride, (void*)(6 * sizeof(float)));
-            _gl.EnableVertexAttribArray(2);
+            CatBlock b = _catBlocks[coord];
+            _gl.DeleteBuffer(b.Vbo);
+            _gl.DeleteVertexArray(b.Vao);
+            _catBlocks.Remove(coord);
         }
 
+        // Upload newly-resident blocks (capped per frame).
+        int uploads = 0;
+        foreach (StarCatalog block in loaded)
+        {
+            if (uploads >= CatUploadsPerFrame) break;
+            if (_catBlocks.ContainsKey(block.BlockCoord)) continue;
+            UploadBlock(block);
+            uploads++;
+        }
+    }
+
+    private void EnsureCatShader()
+    {
+        _catShader ??= new Shader(_gl, CatVertexSource, CatFragmentSource);
+    }
+
+    /// <summary>Bake one block's stars (position relative to its own origin + colour + luminosity)
+    /// into a fresh static VBO. The per-frame draw subtracts the camera-relative-to-origin offset.</summary>
+    private unsafe void UploadBlock(StarCatalog block)
+    {
+        IReadOnlyList<Star> stars = block.Stars;
         var data = new float[stars.Count * CatFloatsPerStar];
         for (int i = 0; i < stars.Count; i++)
         {
             Star s = stars[i];
-            Vector3D<float> p = s.Position.ToCameraRelative(origin); // = position relative to origin
+            Vector3D<float> p = s.Position.ToCameraRelative(block.Origin); // = position relative to origin
             int o = i * CatFloatsPerStar;
             data[o + 0] = p.X; data[o + 1] = p.Y; data[o + 2] = p.Z;
             data[o + 3] = s.Color.X; data[o + 4] = s.Color.Y; data[o + 5] = s.Color.Z;
             data[o + 6] = s.Luminosity;
         }
-        _catCount = stars.Count;
 
-        _gl.BindVertexArray(_catVao);
-        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _catVbo);
+        uint vao = _gl.GenVertexArray();
+        uint vbo = _gl.GenBuffer();
+        _gl.BindVertexArray(vao);
+        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, vbo);
+        uint stride = CatFloatsPerStar * sizeof(float);
+        _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, (void*)0);
+        _gl.EnableVertexAttribArray(0);
+        _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, (void*)(3 * sizeof(float)));
+        _gl.EnableVertexAttribArray(1);
+        _gl.VertexAttribPointer(2, 1, VertexAttribPointerType.Float, false, stride, (void*)(6 * sizeof(float)));
+        _gl.EnableVertexAttribArray(2);
         _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, new ReadOnlySpan<float>(data), BufferUsageARB.StaticDraw);
         _gl.BindVertexArray(0);
+
+        _catBlocks[block.BlockCoord] = new CatBlock(vao, vbo, stars.Count, block.Origin);
     }
 
-    /// <summary>Draw the whole uploaded catalog as apparent-brightness point sprites. The active
-    /// system's sun (by catalog index, since Id == index) is skipped: up close, single-precision
-    /// relative-to-camera puts its dot visibly off from its precisely-rendered sphere, so the
-    /// system pass owns that star instead.</summary>
-    public void RenderCatalog(Camera camera, in UniversePosition origin, int? excludeIndex = null)
+    /// <summary>Draw every resident block as apparent-brightness point sprites. The active system's
+    /// sun (by global id) is skipped in its own block: up close, single-precision relative-to-camera
+    /// puts its dot visibly off from its precisely-rendered sphere, so the system pass owns it.</summary>
+    public void RenderCatalog(Camera camera, ulong? excludeId = null)
     {
-        if (_catShader == null || _catCount == 0) return;
+        if (_catShader == null || _catBlocks.Count == 0) return;
 
-        Vector3D<float> camRel = camera.Position.ToCameraRelative(origin); // camera relative to origin
+        Vector3D<long> exBlock = default;
+        int exLocal = -1;
+        if (excludeId is { } id) StarId.Unpack(id, out exBlock, out exLocal);
 
         _gl.Enable(EnableCap.ProgramPointSize);
         _gl.Enable(EnableCap.Blend);
@@ -250,30 +298,38 @@ void main() {
         _catShader.Use();
         Matrix4X4<float> viewProj = camera.ViewMatrix * camera.ProjectionMatrix;
         _catShader.SetMatrix("uViewProj", viewProj);
-        _catShader.SetVector3("uCamRel", camRel);
         _catShader.SetFloat("uBrightScale", CatBrightScale);
         _catShader.SetFloat("uGamma", CatGamma);
         _catShader.SetFloat("uSizeScale", CatSizeScale);
         _catShader.SetFloat("uMinSize", CatMinSize);
         _catShader.SetFloat("uMaxSize", CatMaxSize);
 
-        _gl.BindVertexArray(_catVao);
-        if (excludeIndex is { } ex && ex >= 0 && ex < _catCount)
+        int drawn = 0;
+        foreach ((Vector3D<long> coord, CatBlock b) in _catBlocks)
         {
-            // Draw the two spans around the excluded star.
-            if (ex > 0) _gl.DrawArrays(PrimitiveType.Points, 0, (uint)ex);
-            int after = _catCount - ex - 1;
-            if (after > 0) _gl.DrawArrays(PrimitiveType.Points, ex + 1, (uint)after);
-        }
-        else
-        {
-            _gl.DrawArrays(PrimitiveType.Points, 0, (uint)_catCount);
+            Vector3D<float> camRel = camera.Position.ToCameraRelative(b.Origin); // camera relative to this block
+            _catShader.SetVector3("uCamRel", camRel);
+            _gl.BindVertexArray(b.Vao);
+
+            if (exLocal >= 0 && exLocal < b.Count && coord == exBlock)
+            {
+                // Draw the two spans around the excluded star (drawn precisely by the system pass).
+                if (exLocal > 0) _gl.DrawArrays(PrimitiveType.Points, 0, (uint)exLocal);
+                int after = b.Count - exLocal - 1;
+                if (after > 0) _gl.DrawArrays(PrimitiveType.Points, exLocal + 1, (uint)after);
+                drawn += b.Count - 1;
+            }
+            else
+            {
+                _gl.DrawArrays(PrimitiveType.Points, 0, (uint)b.Count);
+                drawn += b.Count;
+            }
         }
         _gl.BindVertexArray(0);
 
         _gl.DepthMask(true);
         _gl.Disable(EnableCap.Blend);
-        LastDrawn = _catCount;
+        LastDrawn = drawn;
     }
 
     private void EnsureCapacity(int starCount)
@@ -291,8 +347,12 @@ void main() {
         if (_catShader != null)
         {
             _catShader.Dispose();
-            _gl.DeleteBuffer(_catVbo);
-            _gl.DeleteVertexArray(_catVao);
+            foreach (CatBlock b in _catBlocks.Values)
+            {
+                _gl.DeleteBuffer(b.Vbo);
+                _gl.DeleteVertexArray(b.Vao);
+            }
+            _catBlocks.Clear();
         }
     }
 }

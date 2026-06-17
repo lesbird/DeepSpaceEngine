@@ -271,7 +271,14 @@ void main() {
     if (uDetailStrength > 0.0001 || uMaterialStrength > 0.0001) {
         // Band-limit by the pixel footprint in noise cells: fade the detail out once a pixel spans
         // more than ~a cell, so it adds crisp roughness up close but never shimmers from orbit.
-        float footprint = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        // Anisotropy cap: at a grazing angle (e.g. the ground under the low chase camera while driving)
+        // one axis's derivative explodes while the across-view one stays small; taking the plain max
+        // there culls all detail, so the ground behind the rover goes smooth. Floor the footprint at
+        // the smallest-axis value instead, capping anisotropy at ~5:1, so grazing ground stays textured
+        // while a face-on view (min ≈ max) is unchanged.
+        float fpMax = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        float fpMin = min(min(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        float footprint = max(fpMin, fpMax * 0.2);
         // Band-pass octave stack: each octave shows only while its features span between ~2 px and
         // ~(2/uDetailLowCut) px. So whatever scale a pixel can resolve at THIS distance, an octave
         // covers it — fine grain up close, coarser texture far away — and the ground never collapses
@@ -774,6 +781,65 @@ void main() {
         double patchAng = node.WorldSize * 0.75 / R;
         double heightAng = Math.Sqrt(2.0 * Math.Max(0.0, _terrain.Amplitude) / R);
         return a <= aHorizon + patchAng + heightAng + 0.01;
+    }
+
+    /// <summary>
+    /// Terrain height (metres, signed) at a planet-local unit direction, sampled at the <b>same LOD
+    /// the drawn mesh uses there</b>: it walks to the deepest fully-baked leaf containing the point
+    /// and band-limits <see cref="PlanetTerrain.HeightAt"/> to that leaf's vertex spacing. A vehicle
+    /// placed on this height therefore rests on the visible surface, with no LOD mismatch (sampling
+    /// full detail instead makes it sink into / float above the coarser drawn mesh). Returns false
+    /// when there's no active terrain yet, so the caller can fall back to the raw height field.
+    /// </summary>
+    public bool TrySurfaceHeight(Vector3D<double> localDir, out double height)
+    {
+        height = 0.0;
+        if (_terrain == null || _roots == null) return false;
+
+        DirToFaceUV(localDir, out int face, out double u, out double v);
+        QuadNode node = _roots[face];
+        // Descend only where the renderer actually descends — i.e. where all four children are baked
+        // (Process draws the parent as a coarse stand-in until then), so we match what's on screen.
+        while (node.Children is { } kids && AllChildrenReady(kids))
+        {
+            double um = (node.U0 + node.U1) * 0.5, vm = (node.V0 + node.V1) * 0.5;
+            int idx = (v >= vm ? 2 : 0) + (u >= um ? 1 : 0);
+            node = kids[idx];
+        }
+
+        double spacing = node.WorldSize / GridN;
+        height = _terrain.HeightAt(localDir, spacing);
+        return true;
+    }
+
+    private static bool AllChildrenReady(QuadNode[] children)
+    {
+        foreach (QuadNode c in children) if (c.Patch == null) return false;
+        return true;
+    }
+
+    /// <summary>Cube face + (u,v)∈[0,1] for a direction — the inverse of <see cref="FacePoint"/>.</summary>
+    private static void DirToFaceUV(Vector3D<double> d, out int face, out double u, out double v)
+    {
+        double ax = Math.Abs(d.X), ay = Math.Abs(d.Y), az = Math.Abs(d.Z);
+        double a, b;
+        if (ax >= ay && ax >= az)
+        {
+            if (d.X > 0) { face = 0; a = -d.Z / d.X; b = d.Y / d.X; }       // (1, b, -a)
+            else { face = 1; a = -d.Z / d.X; b = -d.Y / d.X; }             // (-1, b, a)
+        }
+        else if (ay >= ax && ay >= az)
+        {
+            if (d.Y > 0) { face = 2; a = d.X / d.Y; b = -d.Z / d.Y; }       // (a, 1, -b)
+            else { face = 3; a = -d.X / d.Y; b = -d.Z / d.Y; }             // (a, -1, b)
+        }
+        else
+        {
+            if (d.Z > 0) { face = 4; a = d.X / d.Z; b = d.Y / d.Z; }        // (a, b, 1)
+            else { face = 5; a = d.X / d.Z; b = -d.Y / d.Z; }              // (-a, b, -1)
+        }
+        u = Math.Clamp((a + 1.0) * 0.5, 0.0, 1.0);
+        v = Math.Clamp((b + 1.0) * 0.5, 0.0, 1.0);
     }
 
     // --- quadtree ---

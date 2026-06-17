@@ -25,6 +25,7 @@ public sealed class RoverController
     private readonly Camera _camera;
     private readonly IKeyboard _keyboard;
     private readonly IMouse _mouse;
+    private readonly PlanetTerrainRenderer _terrainRenderer;
 
     private CelestialBody _planet = null!;
     private PlanetTerrain _terrain = null!;
@@ -37,11 +38,12 @@ public sealed class RoverController
     /// <summary>True while driving — gates mouse-orbit accumulation.</summary>
     public bool Active;
 
-    public RoverController(Camera camera, IKeyboard keyboard, IMouse mouse)
+    public RoverController(Camera camera, IKeyboard keyboard, IMouse mouse, PlanetTerrainRenderer terrainRenderer)
     {
         _camera = camera;
         _keyboard = keyboard;
         _mouse = mouse;
+        _terrainRenderer = terrainRenderer;
         _mouse.MouseMove += OnMouseMove;
     }
 
@@ -62,7 +64,11 @@ public sealed class RoverController
         _terrain = new PlanetTerrain(body);
 
         double g = Math.Clamp(G * body.MassKg / (body.RadiusMeters * body.RadiusMeters), 0.5, 30.0);
-        _rover = new Rover(body.RadiusMeters, g, _terrain.HeightAt);
+        // Sample the height the RENDERER draws (the LOD/leaf actually on screen), falling back to the
+        // raw height field until the mesh exists — so the body rests on the visible surface, not on a
+        // finer surface the coarse mesh hasn't resolved yet (which made it sink in / float above).
+        _rover = new Rover(body.RadiusMeters, g,
+            d => _terrainRenderer.TrySurfaceHeight(d, out double h) ? h : _terrain.HeightAt(d));
 
         // Direction from the body centre to the camera = the ground point to drop onto.
         Vector3D<double> groundDir = _camera.Position.DeltaMeters(body.CurrentPosition);
@@ -78,7 +84,8 @@ public sealed class RoverController
     public void Update(double dt)
     {
         double throttle = (_keyboard.IsKeyPressed(Key.W) ? 1.0 : 0.0) - (_keyboard.IsKeyPressed(Key.S) ? 1.0 : 0.0);
-        double steer = (_keyboard.IsKeyPressed(Key.D) ? 1.0 : 0.0) - (_keyboard.IsKeyPressed(Key.A) ? 1.0 : 0.0);
+        // A steers left, D steers right (the previous mapping was inverted).
+        double steer = (_keyboard.IsKeyPressed(Key.A) ? 1.0 : 0.0) - (_keyboard.IsKeyPressed(Key.D) ? 1.0 : 0.0);
         bool brake = _keyboard.IsKeyPressed(Key.Space);
 
         _rover.Update(dt, throttle, steer, brake);
