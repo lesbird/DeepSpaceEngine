@@ -155,6 +155,61 @@ public class TerrainTests
     }
 
     [Fact]
+    public void HeightAt2_MatchesTwoSeparateHeightCalls()
+    {
+        // The bake path samples each grid point once with HeightAt2 (fine + parent-coarse in one pass,
+        // sharing the lattice work). That optimisation is only valid if it reproduces what two separate
+        // HeightAt calls would have produced. Sweep every surfaced body across many systems — so the
+        // crater/erosion/ridge layers are all exercised — at the real coarse = 2×fine spacing the baker
+        // uses, and confirm both outputs match (to a sub-millimetre tolerance that swamps the only
+        // difference: float associativity in the ridged layer's single fractional top octave).
+        var dirs = new[]
+        {
+            Vector3D.Normalize(new Vector3D<double>(0.2, 0.9, -0.3)),
+            Vector3D.Normalize(new Vector3D<double>(-0.7, 0.1, 0.6)),
+            Vector3D.Normalize(new Vector3D<double>(0.5, -0.5, 0.5)),
+        };
+        double[] fineSpacings = { 4000.0, 250.0, 12.0, 0.5 };
+
+        int bodies = 0, cratered = 0;
+        for (ulong seed = 1; seed <= 60; seed++)
+        {
+            var field = new StarField(new GalaxyModel(seed));
+            field.Update(UniversePosition.Origin, 8);
+            if (!field.HasNearest) continue;
+
+            foreach (CelestialBody b in SystemGenerator.Generate(field.Nearest).AllBodies())
+            {
+                if (!b.HasSurface) continue;
+                bodies++;
+                var t = new PlanetTerrain(b);
+                if (t.IsCratered) cratered++;
+                // Tight relative tolerance: the only legitimate difference is float associativity in the
+                // ridged layer's single fractional top octave (~1e-15 relative), so 1e-9·amplitude has
+                // enormous margin while still catching a real divergence of even a few centimetres.
+                double tol = 1e-9 * t.Amplitude + 1e-6;
+
+                foreach (var dir in dirs)
+                foreach (double fine in fineSpacings)
+                {
+                    double coarse = fine * 2.0;
+                    t.HeightAt2(dir, fine, coarse, out double hF, out double hC, out double craterF);
+
+                    Assert.True(Math.Abs(hF - t.HeightAt(dir, fine)) <= tol, "HeightAt2 fine diverged");
+                    Assert.True(Math.Abs(hC - t.HeightAt(dir, coarse)) <= tol, "HeightAt2 coarse diverged");
+
+                    // The reused crater value must drive exactly the same albedo as recomputing it.
+                    Vector3D<float> reused = t.ColorAt(dir, hF, 1.0, fine, craterF);
+                    Vector3D<float> fresh = t.ColorAt(dir, hF, 1.0, fine);
+                    Assert.True((reused - fresh).Length < 1e-5f, "crater reuse changed the colour");
+                }
+            }
+        }
+        Assert.True(bodies > 50, "expected to sweep many surfaced bodies");
+        Assert.True(cratered > 0, "expected at least one cratered world in the sweep");
+    }
+
+    [Fact]
     public void Terrain_StylesProduceDiverseRelief()
     {
         // Guard against the "every world is the same hills" regression: across many worlds the

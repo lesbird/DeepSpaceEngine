@@ -76,6 +76,108 @@ public sealed class Noise
         return norm > 0 ? sum / norm : 0;
     }
 
+    /// <summary>Per-octave weight for a fractional octave count: full amplitude below the top octave,
+    /// the leftover fraction at the top, zero beyond. Shared by the dual-cutoff helpers so a single
+    /// noise evaluation can feed two octave counts at once.</summary>
+    private static double OctaveWeight(int i, int full, double frac, double amp)
+        => i < full ? amp : (i == full ? amp * frac : 0.0);
+
+    /// <summary>
+    /// <see cref="Fbm(Vector3D{double}, double, double, double, double)"/> evaluated at TWO octave
+    /// counts in a single pass. A patch needs both its own (fine) height and its parent's (coarse) one
+    /// for geomorphing; because the coarse count is just the fine series truncated by an octave, the
+    /// expensive <see cref="Value"/> lattice samples can be shared — each octave is evaluated once and
+    /// accumulated into both sums with its per-cutoff weight. Bit-identical to two separate calls.
+    /// Requires <paramref name="octFine"/> ≥ <paramref name="octCoarse"/>.
+    /// </summary>
+    public (double fine, double coarse) Fbm2(Vector3D<double> p, double octFine, double octCoarse,
+        double frequency, double lacunarity, double gain)
+    {
+        int fullF = (int)Math.Floor(Math.Max(0.0, octFine)), fullC = (int)Math.Floor(Math.Max(0.0, octCoarse));
+        double fracF = Math.Max(0.0, octFine) - fullF, fracC = Math.Max(0.0, octCoarse) - fullC;
+        double sumF = 0, normF = 0, sumC = 0, normC = 0, amp = 1, f = frequency;
+        for (int i = 0; i <= fullF; i++)
+        {
+            double wF = OctaveWeight(i, fullF, fracF, amp);
+            double wC = OctaveWeight(i, fullC, fracC, amp);
+            if (wF != 0.0 || wC != 0.0)
+            {
+                double n = Value(p.X * f, p.Y * f, p.Z * f);
+                sumF += wF * n; normF += wF;
+                sumC += wC * n; normC += wC;
+            }
+            amp *= gain; f *= lacunarity;
+        }
+        return (normF > 0 ? sumF / normF : 0, normC > 0 ? sumC / normC : 0);
+    }
+
+    /// <summary><see cref="Ridged(Vector3D{double}, double, double, double, double)"/> at two octave
+    /// counts in one pass (see <see cref="Fbm2"/>). The multifractal <c>prev</c> recurrence runs the
+    /// full fine progression; the coarse value just sums fewer of the same octaves. Returns [0,1] each.</summary>
+    public (double fine, double coarse) Ridged2(Vector3D<double> p, double octFine, double octCoarse,
+        double frequency, double lacunarity, double gain)
+    {
+        int fullF = (int)Math.Floor(Math.Max(0.0, octFine)), fullC = (int)Math.Floor(Math.Max(0.0, octCoarse));
+        double fracF = Math.Max(0.0, octFine) - fullF, fracC = Math.Max(0.0, octCoarse) - fullC;
+        double sumF = 0, normF = 0, sumC = 0, normC = 0, amp = 0.5, f = frequency, prev = 1.0;
+        for (int i = 0; i <= fullF; i++)
+        {
+            double n = 1.0 - Math.Abs(Value(p.X * f, p.Y * f, p.Z * f));
+            n *= n; n *= prev;
+            sumF += n * OctaveWeight(i, fullF, fracF, amp); normF += OctaveWeight(i, fullF, fracF, amp);
+            sumC += n * OctaveWeight(i, fullC, fracC, amp); normC += OctaveWeight(i, fullC, fracC, amp);
+            prev = n; amp *= gain; f *= lacunarity;
+        }
+        return (normF > 0 ? Math.Clamp(sumF / normF, 0.0, 1.0) : 0,
+                normC > 0 ? Math.Clamp(sumC / normC, 0.0, 1.0) : 0);
+    }
+
+    /// <summary>
+    /// <see cref="ErodedFbm"/> at two octave counts in one pass. The shared cost is the
+    /// <see cref="ValueD"/> lattice+gradient sample per octave; only the cheap accumulators differ.
+    /// The erosion damping depends on the accumulated gradient, which diverges between the two cutoffs
+    /// at the coarse top octave (it enters at its fraction there), so the coarse gradient/damping are
+    /// tracked separately — keeping the result bit-identical to two independent calls. Returns [-1,1].
+    /// </summary>
+    public (double fine, double coarse) ErodedFbm2(Vector3D<double> p, double octFine, double octCoarse,
+        double frequency, double lacunarity, double gain)
+    {
+        const double k = 1.4;
+        int fullF = (int)Math.Floor(Math.Max(0.0, octFine)), fullC = (int)Math.Floor(Math.Max(0.0, octCoarse));
+        double fracF = Math.Max(0.0, octFine) - fullF, fracC = Math.Max(0.0, octCoarse) - fullC;
+        double sumF = 0, normF = 0, sumC = 0, normC = 0, amp = 1, f = frequency;
+        Vector3D<double> gradF = default, gradC = default;
+        bool coarseActive = true;
+        for (int i = 0; i < fullF; i++)
+        {
+            (double n, Vector3D<double> g) = ValueD(p.X * f, p.Y * f, p.Z * f);
+            gradF += g;
+            double dampF = 1.0 / (1.0 + k * Vector3D.Dot(gradF, gradF));
+            sumF += amp * n * dampF; normF += amp;
+            if (coarseActive)
+            {
+                if (i < fullC) { gradC += g; double d = 1.0 / (1.0 + k * Vector3D.Dot(gradC, gradC)); sumC += amp * n * d; normC += amp; }
+                else { gradC += g * fracC; double d = 1.0 / (1.0 + k * Vector3D.Dot(gradC, gradC)); sumC += amp * fracC * n * d; normC += amp * fracC; coarseActive = false; }
+            }
+            amp *= gain; f *= lacunarity;
+        }
+        if (fracF > 0.0)
+        {
+            (double n, Vector3D<double> g) = ValueD(p.X * f, p.Y * f, p.Z * f);
+            gradF += g * fracF;
+            double dampF = 1.0 / (1.0 + k * Vector3D.Dot(gradF, gradF));
+            sumF += amp * fracF * n * dampF; normF += amp * fracF;
+            // Coarse top octave only lands here in the degenerate case fullC == fullF (both cutoffs in
+            // the same integer bracket); with the usual 2× spacing the coarse top is an earlier octave.
+            if (coarseActive && fullC == fullF)
+            {
+                gradC += g * fracC; double d = 1.0 / (1.0 + k * Vector3D.Dot(gradC, gradC));
+                sumC += amp * fracC * n * d; normC += amp * fracC;
+            }
+        }
+        return (normF > 0 ? sumF / normF : 0, normC > 0 ? sumC / normC : 0);
+    }
+
     private static double SmoothDeriv(double t) => 6.0 * t * (1.0 - t); // d/dt of Smooth
 
     /// <summary>Value noise plus its analytic gradient (∂/∂x, ∂/∂y, ∂/∂z). Value in [-1, 1].

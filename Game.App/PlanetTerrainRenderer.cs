@@ -26,7 +26,17 @@ public sealed class PlanetTerrainRenderer : IDisposable
     // The expensive part of a patch — sampling the height field and building its vertex arrays — runs
     // on a background worker pool (see WorkerLoop). Only the cheap GPU upload happens on the render
     // thread, capped at this many finished patches per frame so a burst of bakes can't stall a frame.
-    private const int UploadsPerFrame = 8;
+    // A single upload is just a VAO/VBO create + one BufferData of ~30 KB, so a few dozen per frame is
+    // cheap; the cap mainly bounds the worst case. Kept generous so a fresh descent's bake backlog
+    // (hundreds of patches) drains in a handful of frames rather than dribbling in at 8/frame.
+    private const int UploadsPerFrame = 32;
+    // Refinement otherwise advances only ONE level per request→bake→upload round-trip: Process won't
+    // queue a node's grandchildren until its children have uploaded, so a deep descent serialises into
+    // dozens of frame-gated round-trips and leaves most worker cores idle early on. Each frame we also
+    // pre-queue the patches along the path toward the focus this many levels past the drawable frontier
+    // — bakes are parent-independent, so queuing them early keeps the whole pool busy and detail lands
+    // in far fewer frames. Bounded (one path per level) so we never queue an exponential subtree.
+    private const int SpeculativeDepth = 6;
     private const int LandFloatsPerVertex = 16; // finePos(3) + coarsePos(3) + fineNrm(3) + coarseNrm(3) + color(3) + relief(1)
     // Coarse anchor for the surface-detail octave stack (~64 m wavelength). The shader runs 8 octaves
     // up from here (×1…×128 → ~64 m down to ~0.5 m) as integer multipliers, so the seamless 4096-cell
@@ -83,7 +93,9 @@ uniform vec3 uSunDir;
 uniform vec3 uPatchCellBase;   // wrapped integer cell base (planet-local), keeps the hash precise
 uniform float uDetailStrength; // detail-normal bump strength (0 = off)
 uniform float uDetailAlbedo;   // albedo break-up amount
-uniform float uDetailLowCut;   // smallest cells-per-pixel an octave shows at (smaller = detail reaches further)
+uniform float uDetailFreq;     // detail-noise cells per metre (mirrors the vertex-shader uniform)
+uniform float uGeomDetailFloor; // metres: finest spacing the baked geometry resolves (its octave budget floor)
+uniform float uDetailLowCut;   // mesh-handoff threshold: octaves coarser than ~this×(effective spacing) fade (geometry carries them)
 uniform float uMaterialStrength; // procedural material breakup: cracks/cavity + mineral tint (0 = off)
 uniform float uSurfaceSpecular;  // close-up specular highlight strength (0 = off)
 uniform float uSurfaceAmbient;   // hemispheric ambient floor (sky/ground fill)
@@ -279,17 +291,28 @@ void main() {
         float fpMax = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
         float fpMin = min(min(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
         float footprint = max(fpMin, fpMax * 0.2);
-        // Band-pass octave stack: each octave shows only while its features span between ~2 px and
-        // ~(2/uDetailLowCut) px. So whatever scale a pixel can resolve at THIS distance, an octave
-        // covers it — fine grain up close, coarser texture far away — and the ground never collapses
-        // to smooth plastic in the mid-distance. The low cut also hands coarse scales back to the
-        // real mesh up close (where geometry already carries them), like the orbital layer's fade.
+        // Band-pass octave stack with TWO independent gates so whatever scale a pixel can resolve at
+        // this distance is covered — fine grain up close, coarser texture far away — without the
+        // ground ever collapsing to smooth plastic:
+        //   (1) fine end — drop octaves smaller than ~a pixel (would shimmer); keyed to the pixel
+        //       footprint, which is correct because aliasing IS a per-pixel phenomenon.
+        //   (2) coarse end — hand an octave back to the real mesh once its wavelength is coarser than
+        //       what the geometry actually resolves (geomorphed geometry already carries those scales).
+        //       Keyed to the MESH resolution, NOT the camera distance — keying it to cells-per-pixel
+        //       made the whole stack slide below the cut as you approached, flattening near ground.
+        //       The resolution is the COARSER of the patch's vertex spacing and the height field's
+        //       octave-budget floor (uGeomDetailFloor): a deeply-subdivided near patch has cm vertex
+        //       spacing but the baked detail saturates metres above that, so without the floor the gate
+        //       would assume the mesh carries cm-scale relief and cull all procedural detail — the
+        //       near-ground blur. Clamping to the floor keeps procedural detail filling that gap.
+        float effSpacing = max(uVertexSpacingDir * uPlanetRadius, uGeomDetailFloor); // metres the mesh truly resolves
+        float meshCellsPerVertex = effSpacing * uDetailFreq;     // base-octave cells per resolved step
         vec3 tangAccum = vec3(0.0);
         float nDetail = 0.0, wsum = 0.0, m = 1.0;
         for (int o = 0; o < 8; o++) {   // 8 octaves: ~64 m (×1) down to ~0.5 m (×128)
-            float c = footprint * m;                                  // this octave's cells per pixel
-            float oct = (1.0 - smoothstep(0.45, 1.3, c))             // anti-alias (drop sub-pixel octaves)
-                      * smoothstep(uDetailLowCut, uDetailLowCut * 3.0, c); // hand coarse scales to geometry
+            float aa = 1.0 - smoothstep(0.45, 1.3, footprint * m);   // (1) anti-alias (drop sub-pixel octaves)
+            float mc = meshCellsPerVertex * m;                       // (2) this octave's cells per mesh vertex
+            float oct = aa * smoothstep(uDetailLowCut, uDetailLowCut * 3.0, mc); // fade coarse scales the mesh carries
             if (oct > 0.0) {
                 vec4 s = detailSample(m);
                 tangAccum += oct * (s.xyz - dot(s.xyz, N) * N);       // tangential component
@@ -421,6 +444,8 @@ void main() {
     private QuadNode[]? _roots;
     private double _detailNoiseFreq; // this frame's detail-normal frequency (set in Render)
     private double _lodFactor = 4.0; // this frame's split-distance factor (snapshot from TerrainTuning)
+    private int _renderFrame;        // increments each Render; leaves stamp it so TrySurfaceHeight finds
+                                     // the patch actually drawn (and the morph it was drawn with)
 
     public int LeafCount { get; private set; }
     public int PatchCount { get; private set; }
@@ -462,8 +487,8 @@ void main() {
         foreach (BuildJob job in _jobQueue.GetConsumingEnumerable())
         {
             if (job.Epoch != Volatile.Read(ref _epoch)) continue;
-            (float[] land, float[] water) = BuildPatchVertices(job.Node, job.Terrain);
-            _ready.Enqueue(new BuildResult(job.Epoch, job.Node, land, water));
+            (float[] land, float[] water, float[] collHF, float[] collHC) = BuildPatchVertices(job.Node, job.Terrain);
+            _ready.Enqueue(new BuildResult(job.Epoch, job.Node, land, water, collHF, collHC));
         }
     }
 
@@ -484,6 +509,8 @@ void main() {
         {
             if (r.Epoch != _epoch || r.Node.Disposed || !r.Node.GenPending) continue;
             r.Node.Patch = new TerrainPatch(_gl, r.Land, r.Water);
+            r.Node.CollHF = r.CollHF;
+            r.Node.CollHC = r.CollHC;
             r.Node.GenPending = false;
             PatchCount++;
             uploads++;
@@ -530,6 +557,7 @@ void main() {
 
         // Snapshot the live LOD aggressiveness once so split, merge and morph all agree this frame.
         _lodFactor = Math.Clamp(TerrainTuning.LodDistanceFactor, 1.0, 32.0);
+        _renderFrame++; // stamp leaves drawn this frame so the vehicle can find the on-screen surface
 
         Matrix4X4<float> proj = FitProjection(camera);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
@@ -543,8 +571,15 @@ void main() {
         _shader.SetFloat("uDetailFreq", (float)_detailNoiseFreq);
         _shader.SetFloat("uDetailStrength", Math.Max(0f, TerrainTuning.DetailNormalStrength));
         _shader.SetFloat("uDetailAlbedo", TerrainTuning.DetailAlbedo);
-        // Larger "range" → smaller low-cut → coarser octaves stay on → detail reaches further out.
-        _shader.SetFloat("uDetailLowCut", 0.16f / Math.Clamp(TerrainTuning.SurfaceDetailRange, 1f, 16f));
+        // Mesh-handoff threshold in octave-cells-per-resolved-step (~0.5 = the Nyquist limit). Octaves
+        // coarser than this are handed to the geometry; finer ones stay procedural. Larger "range" →
+        // lower threshold → coarser octaves stay procedural → detail reaches further past the mesh.
+        _shader.SetFloat("uDetailLowCut", 2.0f / Math.Clamp(TerrainTuning.SurfaceDetailRange, 1f, 16f));
+        // The geometry can't resolve finer than its detail-octave floor, so the handoff must defer to
+        // the COARSER of (patch vertex spacing, this floor). Half the finest geometry wavelength is that
+        // floor in spacing terms (Nyquist); the shader clamps the effective spacing up to it so near
+        // patches tessellated below the floor keep procedural detail instead of going flat.
+        _shader.SetFloat("uGeomDetailFloor", (float)(_terrain!.FinestGeometryWavelength * 0.5));
         _shader.SetFloat("uMaterialStrength", Math.Max(0f, TerrainTuning.MaterialDetail));
         _shader.SetFloat("uSurfaceSpecular", Math.Max(0f, TerrainTuning.SurfaceSpecular));
         _shader.SetFloat("uSurfaceAmbient", Math.Max(0f, TerrainTuning.SurfaceAmbient));
@@ -662,7 +697,9 @@ void main() {
                     Process(c, camera, viewProj);
                 return;
             }
-            // Children still baking — draw this node, refine once they upload.
+            // Children still baking — draw this node as the coarse stand-in, but pre-queue the path
+            // ahead so deeper levels bake in parallel instead of one level per upload round-trip.
+            SpeculativeRefine(node, camera, SpeculativeDepth);
         }
         else if (node.Children != null && dist > splitDist * MergeHysteresis)
         {
@@ -679,6 +716,37 @@ void main() {
         LeafCount++;
     }
 
+    /// <summary>
+    /// Pre-create and queue for baking the patches along the path toward the camera/focus, up to
+    /// <paramref name="depthBudget"/> levels past the drawable frontier. Bakes are independent of their
+    /// parent, so queuing deep patches early lets the whole worker pool work the descent in parallel
+    /// rather than one level per upload round-trip. Walks a SINGLE path per level (the child nearest the
+    /// focus) to keep the queued count linear — <see cref="Process"/> still requests the per-level
+    /// breadth it actually draws. Stops where the LOD no longer wants to split, at max depth, or budget.
+    /// </summary>
+    private void SpeculativeRefine(QuadNode node, Camera camera, int depthBudget)
+    {
+        if (depthBudget <= 0 || node.Level >= MaxLevel) return;
+
+        UniversePosition center = _body!.CurrentPosition.Translated(node.CenterLocal);
+        double dist = camera.Position.DistanceTo(center);
+        if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
+        if (dist >= _lodFactor * node.WorldSize) return; // LOD doesn't want to refine here
+
+        node.Children ??= Split(node);
+        QuadNode? next = null;
+        double best = double.MaxValue;
+        foreach (QuadNode c in node.Children)
+        {
+            if (c.Patch == null && !c.GenPending) RequestGenerate(c); // queue all four (we need them to draw)
+            UniversePosition cc = _body!.CurrentPosition.Translated(c.CenterLocal);
+            double d = camera.Position.DistanceTo(cc);
+            if (FocusPoint is { } f) d = Math.Min(d, f.DistanceTo(cc));
+            if (d < best) { best = d; next = c; }
+        }
+        if (next != null) SpeculativeRefine(next, camera, depthBudget - 1); // continue down the focus path
+    }
+
     private void RenderPatch(QuadNode node, Vector3D<float> rel, in Matrix4X4<float> viewProj, float morph)
     {
         if (node.Patch == null) return;
@@ -686,6 +754,8 @@ void main() {
         _shader.SetMatrix("uMVP", model * viewProj);
         _shader.SetMatrix("uModel", model);
         _shader.SetFloat("uMorph", morph);
+        node.DrawMorph = morph;          // record what the vehicle collision should blend to
+        node.DrawnFrame = _renderFrame;  // this node is a drawn leaf this frame
         SetPatchDetailBase(node);
         node.Patch.Draw(_gl);
         if (node.Patch.HasWater) _waterFrame.Add((node.Patch, rel, node.CenterLocal)); // drawn in the later water pass
@@ -784,12 +854,14 @@ void main() {
     }
 
     /// <summary>
-    /// Terrain height (metres, signed) at a planet-local unit direction, sampled at the <b>same LOD
-    /// the drawn mesh uses there</b>: it walks to the deepest fully-baked leaf containing the point
-    /// and band-limits <see cref="PlanetTerrain.HeightAt"/> to that leaf's vertex spacing. A vehicle
-    /// placed on this height therefore rests on the visible surface, with no LOD mismatch (sampling
-    /// full detail instead makes it sink into / float above the coarser drawn mesh). Returns false
-    /// when there's no active terrain yet, so the caller can fall back to the raw height field.
+    /// Terrain height (metres, signed) at a planet-local unit direction, read from the <b>exact triangle
+    /// mesh that was drawn</b> there last frame — a CPU "collision mesh". It finds the leaf patch the
+    /// renderer drew over this direction (stamped with the current render frame), then bilinearly samples
+    /// that patch's stored per-vertex heights inside the triangle under the point, blending fine→coarse
+    /// by the same geomorph factor the patch was drawn with. So a vehicle rests on precisely the surface
+    /// on screen — no float, and no analytic re-derivation whose result would feed back into the LOD and
+    /// make the body oscillate (drive the focus → refine/merge → height jumps → bounce). Returns false
+    /// when nothing is drawn yet (no baked collision data), so the caller can fall back to the raw field.
     /// </summary>
     public bool TrySurfaceHeight(Vector3D<double> localDir, out double height)
     {
@@ -797,18 +869,31 @@ void main() {
         if (_terrain == null || _roots == null) return false;
 
         DirToFaceUV(localDir, out int face, out double u, out double v);
-        QuadNode node = _roots[face];
-        // Descend only where the renderer actually descends — i.e. where all four children are baked
-        // (Process draws the parent as a coarse stand-in until then), so we match what's on screen.
-        while (node.Children is { } kids && AllChildrenReady(kids))
+        // Walk the u,v path and keep the deepest node drawn as a leaf this frame (its ancestors are
+        // internal/recursed and unstamped; any deeper nodes are speculative and weren't drawn).
+        QuadNode? leaf = null;
+        for (QuadNode node = _roots[face]; ; )
         {
+            if (node.DrawnFrame == _renderFrame) leaf = node;
+            if (node.Children is not { } kids) break;
             double um = (node.U0 + node.U1) * 0.5, vm = (node.V0 + node.V1) * 0.5;
-            int idx = (v >= vm ? 2 : 0) + (u >= um ? 1 : 0);
-            node = kids[idx];
+            node = kids[(v >= vm ? 2 : 0) + (u >= um ? 1 : 0)];
         }
+        if (leaf?.CollHF is not { } hf || leaf.CollHC is not { } hc) return false; // nothing drawn yet
 
-        double spacing = node.WorldSize / GridN;
-        height = _terrain.HeightAt(localDir, spacing);
+        const int n = GridN;
+        double lu = Math.Clamp((u - leaf.U0) / (leaf.U1 - leaf.U0), 0.0, 1.0) * n;
+        double lv = Math.Clamp((v - leaf.V0) / (leaf.V1 - leaf.V0), 0.0, 1.0) * n;
+        int i = Math.Clamp((int)lu, 0, n - 1), j = Math.Clamp((int)lv, 0, n - 1);
+        double fu = lu - i, fv = lv - j;
+        float m = leaf.DrawMorph;
+        // Morphed height at a grid vertex (matches the drawn position = mix(fine, coarse, morph)).
+        double H(int ii, int jj) { int k = ii + jj * (n + 1); return hf[k] + (hc[k] - hf[k]) * m; }
+        double h00 = H(i, j), h10 = H(i + 1, j), h11 = H(i + 1, j + 1), h01 = H(i, j + 1);
+        // The cell's two triangles share the (i,j)-(i+1,j+1) diagonal (matching the baked winding).
+        height = fu >= fv
+            ? h00 * (1.0 - fu) + h10 * (fu - fv) + h11 * fv   // lower-right triangle
+            : h00 * (1.0 - fv) + h01 * (fv - fu) + h11 * fu;  // upper-left triangle
         return true;
     }
 
@@ -875,14 +960,16 @@ void main() {
     /// which must exist before the first frame; all other patches bake on the worker pool.</summary>
     private TerrainPatch GenerateSync(QuadNode node)
     {
-        (float[] land, float[] water) = BuildPatchVertices(node, _terrain!);
+        (float[] land, float[] water, float[] collHF, float[] collHC) = BuildPatchVertices(node, _terrain!);
+        node.CollHF = collHF;
+        node.CollHC = collHC;
         PatchCount++;
         return new TerrainPatch(_gl, land, water);
     }
 
     // Static + terrain-by-parameter: this runs on worker threads, so it must touch no mutable renderer
     // state. PlanetTerrain.HeightAt and Noise are immutable pure reads, safe to call from many threads.
-    private static (float[] land, float[] water) BuildPatchVertices(QuadNode node, PlanetTerrain terrain)
+    private static (float[] land, float[] water, float[] collHF, float[] collHC) BuildPatchVertices(QuadNode node, PlanetTerrain terrain)
     {
         int n = GridN;
         double radius = terrain.Radius;
@@ -906,15 +993,18 @@ void main() {
         var posF = new Vector3D<double>[n + 1, n + 1];
         var posC = new Vector3D<double>[n + 1, n + 1];
         var hgt = new double[n + 1, n + 1]; // fine height drives colour + water
+        var hcg = new double[n + 1, n + 1]; // coarse (parent-resolution) height — kept for collision morph
+        var crat = new double[n + 1, n + 1]; // fine crater value, reused for albedo (no second crater eval)
         for (int gj = -1; gj <= n + 1; gj++)
         for (int gi = -1; gi <= n + 1; gi++)
         {
             double u = node.U0 + (node.U1 - node.U0) * (gi / (double)n);
             double v = node.V0 + (node.V1 - node.V0) * (gj / (double)n);
             Vector3D<double> d = FacePoint(node.Face, u, v);
-            double hF = terrain.HeightAt(d, spacing);
+            // One pass yields both band-limits (fine + parent-coarse) AND the crater value for colour.
+            terrain.HeightAt2(d, spacing, coarseSpacing, out double hF, out double hC, out double craterF);
             Vector3D<double> pF = d * (radius + hF);
-            Vector3D<double> pC = d * (radius + terrain.HeightAt(d, coarseSpacing));
+            Vector3D<double> pC = d * (radius + hC);
             exF[gi + 1, gj + 1] = pF;
             exC[gi + 1, gj + 1] = pC;
             if (gi >= 0 && gi <= n && gj >= 0 && gj <= n)
@@ -923,6 +1013,8 @@ void main() {
                 posF[gi, gj] = pF;
                 posC[gi, gj] = pC;
                 hgt[gi, gj] = hF;
+                hcg[gi, gj] = hC;
+                crat[gi, gj] = craterF;
             }
         }
 
@@ -939,19 +1031,24 @@ void main() {
 
             // Slope = cos(angle from vertical): 1 on flats, → 0 on cliffs. Drives rock vs snow.
             double slope = Vector3D.Dot(nrmF[i, j], outward);
-            col[i, j] = terrain.ColorAt(dir[i, j], hgt[i, j], slope, spacing);
+            col[i, j] = terrain.ColorAt(dir[i, j], hgt[i, j], slope, spacing, crat[i, j]);
             rel[i, j] = (float)terrain.MacroReliefMask(dir[i, j]);
         }
 
-        var v3 = new List<float>((n * n * 6 + n * 16) * LandFloatsPerVertex);
+        // The vertex count is fixed: n×n cells × 2 triangles × 3 verts, plus 4n skirt quads × 6 verts.
+        // Writing straight into one exactly-sized array (no List growth, no ToArray copy) roughly halves
+        // this patch's transient allocation — across hundreds of bakes that's a real cut in GC churn.
+        int landVerts = n * n * 6 + 24 * n;
+        var v3 = new float[landVerts * LandFloatsPerVertex];
+        int w = 0;
         void Emit(Vector3D<double> pF, Vector3D<double> pC, Vector3D<double> nF, Vector3D<double> nC, Vector3D<float> c, float r)
         {
-            v3.Add((float)(pF.X - centerLocal.X)); v3.Add((float)(pF.Y - centerLocal.Y)); v3.Add((float)(pF.Z - centerLocal.Z));
-            v3.Add((float)(pC.X - centerLocal.X)); v3.Add((float)(pC.Y - centerLocal.Y)); v3.Add((float)(pC.Z - centerLocal.Z));
-            v3.Add((float)nF.X); v3.Add((float)nF.Y); v3.Add((float)nF.Z);
-            v3.Add((float)nC.X); v3.Add((float)nC.Y); v3.Add((float)nC.Z);
-            v3.Add(c.X); v3.Add(c.Y); v3.Add(c.Z);
-            v3.Add(r);
+            v3[w++] = (float)(pF.X - centerLocal.X); v3[w++] = (float)(pF.Y - centerLocal.Y); v3[w++] = (float)(pF.Z - centerLocal.Z);
+            v3[w++] = (float)(pC.X - centerLocal.X); v3[w++] = (float)(pC.Y - centerLocal.Y); v3[w++] = (float)(pC.Z - centerLocal.Z);
+            v3[w++] = (float)nF.X; v3[w++] = (float)nF.Y; v3[w++] = (float)nF.Z;
+            v3[w++] = (float)nC.X; v3[w++] = (float)nC.Y; v3[w++] = (float)nC.Z;
+            v3[w++] = c.X; v3[w++] = c.Y; v3[w++] = c.Z;
+            v3[w++] = r;
         }
         void EmitVert(int i, int j) => Emit(posF[i, j], posC[i, j], nrmF[i, j], nrmC[i, j], col[i, j], rel[i, j]);
 
@@ -981,7 +1078,17 @@ void main() {
         for (int j = 0; j < n; j++) { SkirtQuad(0, j, 0, j + 1); SkirtQuad(n, j + 1, n, j); }
         for (int i = 0; i < n; i++) { SkirtQuad(i + 1, 0, i, 0); SkirtQuad(i, n, i + 1, n); }
 
-        return (v3.ToArray(), BuildWaterVertices(node, terrain, dir, hgt, centerLocal, radius));
+        // Flatten the fine/coarse height grids (row-major, i + j*(n+1)) for the collision query.
+        var collHF = new float[(n + 1) * (n + 1)];
+        var collHC = new float[(n + 1) * (n + 1)];
+        for (int j = 0; j <= n; j++)
+        for (int i = 0; i <= n; i++)
+        {
+            collHF[i + j * (n + 1)] = (float)hgt[i, j];
+            collHC[i + j * (n + 1)] = (float)hcg[i, j];
+        }
+
+        return (v3, BuildWaterVertices(node, terrain, dir, hgt, centerLocal, radius), collHF, collHC);
     }
 
     /// <summary>Outward-oriented vertex normal from a centred difference on the extended position
@@ -1137,11 +1244,20 @@ void main() {
         public QuadNode[]? Children;
         public bool GenPending; // a background bake for this node is queued or running
         public bool Disposed;   // node removed from the tree — discard any bake that lands afterwards
+
+        // CPU-side collision mesh: the per-vertex fine and coarse terrain heights (signed, metres above
+        // the base radius) on this patch's (GridN+1)² grid — the same numbers baked into the GPU buffer.
+        // A vehicle samples the triangle under it from these and blends by DrawMorph, so it rests on the
+        // exact surface drawn (no analytic re-derivation that would feed back into the LOD and bounce).
+        public float[]? CollHF, CollHC;
+        public float DrawMorph;  // geomorph factor this patch was last drawn with (fine→coarse blend)
+        public int DrawnFrame = -1; // render-frame index this node was last drawn as a leaf
     }
 
-    // Geometry-only inputs handed to a worker (immutable once created), and the float arrays it returns.
+    // Geometry-only inputs handed to a worker (immutable once created), and the arrays it returns: the
+    // GPU vertex floats plus the per-vertex collision heights (fine/coarse) for the vehicle mesh query.
     private readonly record struct BuildJob(int Epoch, QuadNode Node, PlanetTerrain Terrain);
-    private readonly record struct BuildResult(int Epoch, QuadNode Node, float[] Land, float[] Water);
+    private readonly record struct BuildResult(int Epoch, QuadNode Node, float[] Land, float[] Water, float[] CollHF, float[] CollHC);
 
     private sealed class TerrainPatch
     {

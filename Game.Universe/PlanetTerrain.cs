@@ -191,6 +191,25 @@ public sealed class PlanetTerrain
     /// </summary>
     public double MacroReliefFrequency => _mountainFreq * PlanetTuning.EffectiveFrequency(Type);
 
+    /// <summary>
+    /// Finest surface wavelength (metres) the baked geometry can carry. The detail layer's octave
+    /// budget (MaxDetailOctaves) saturates here, and since DetailGain &gt; 0.5 keeps the lit slope in
+    /// the high octaves, the mesh holds crisp relief right down to this scale and then goes smooth — no
+    /// matter how finely a near patch is tessellated below it. The detail layer outreaches the micro
+    /// layer (far more octaves), so it sets the floor. The renderer hands its procedural surface detail
+    /// off to the geometry no finer than this, so deeply-subdivided near patches (vertex spacing well
+    /// below this) keep their procedural texture instead of going flat.
+    /// </summary>
+    public double FinestGeometryWavelength
+    {
+        get
+        {
+            double fs = PlanetTuning.EffectiveFrequency(Type);
+            double finestFreq = _detailFreq * fs * Math.Pow(2.0, MaxDetailOctaves - 1);
+            return 2.0 * Math.PI * Radius / finestFreq;
+        }
+    }
+
     /// <summary>True if this world is genuinely crater-dominated (airless "cratered" style), as opposed
     /// to a weathered world carrying only a faint residual crater weight. Gates the crater albedo/maria
     /// and the orbital crater shading — so an Ocean/plains world isn't painted (or charged) for craters.</summary>
@@ -295,6 +314,91 @@ public sealed class PlanetTerrain
         // floor. A separate translucent water surface (PlanetTerrainRenderer) sits at SeaLevel,
         // and coastlines emerge naturally where the rugged land crosses it.
         return _baseAmplitude * PlanetTuning.EffectiveRelief(Type) * shape;
+    }
+
+    /// <summary>
+    /// Terrain height at <paramref name="unitDir"/> for BOTH a fine and a coarse band-limit in a single
+    /// pass — what a patch needs for geomorphing (its own surface and its parent's). Because the coarse
+    /// band is the fine octave series truncated by one octave, every layer's expensive lattice samples
+    /// are shared between the two cutoffs (see <see cref="Noise.Fbm2"/> etc.), roughly halving the cost
+    /// versus two <see cref="HeightAt(Vector3D{double}, double)"/> calls — with bit-identical results.
+    /// Also returns the fine crater value so the caller can feed it to <see cref="ColorAt"/> instead of
+    /// re-evaluating the (expensive) crater field a second time for albedo.
+    /// </summary>
+    public void HeightAt2(Vector3D<double> unitDir, double fineSpacing, double coarseSpacing,
+        out double fine, out double coarse, out double craterFine)
+    {
+        craterFine = 0.0;
+        if (!HasSurface) { fine = 0; coarse = 0; return; }
+
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+        double mWeight = _mountainWeight * PlanetTuning.EffectiveMountain(Type);
+
+        // Spacing-independent terms (fixed octave counts) — computed once, shared by both cutoffs.
+        double rugged = Ruggedness(unitDir, fs);                      // [0,1]
+        Vector3D<double> warped = unitDir + DomainWarp(unitDir, fs);  // fixed WarpOctaves
+        double detailGate = _detailFloor + (1.0 - _detailFloor) * rugged;
+
+        // Continents (sets the highland mask, which differs per cutoff since the continents do).
+        (double contF, double contC) = _noise.Fbm2(unitDir,
+            OctavesFor(_continentFreq * fs, fineSpacing, MaxContinentOctaves),
+            OctavesFor(_continentFreq * fs, coarseSpacing, MaxContinentOctaves),
+            _continentFreq * fs, 2.0, ContinentGain);
+        double maskF = Smoothstep(-0.2, 0.4, contF), maskC = Smoothstep(-0.2, 0.4, contC);
+
+        // Ridged mountains on the warped highlands.
+        (double mtnF, double mtnC) = _noise.Ridged2(warped,
+            OctavesFor(_mountainFreq * fs, fineSpacing, MaxMountainOctaves),
+            OctavesFor(_mountainFreq * fs, coarseSpacing, MaxMountainOctaves),
+            _mountainFreq * fs, 2.0, MountainGain);
+
+        // High-frequency erosive detail.
+        (double detF, double detC) = _noise.ErodedFbm2(unitDir,
+            OctavesFor(_detailFreq * fs, fineSpacing, MaxDetailOctaves),
+            OctavesFor(_detailFreq * fs, coarseSpacing, MaxDetailOctaves),
+            _detailFreq * fs, 2.0, DetailGain);
+
+        // Fine micro-relief (skip the layer entirely when no cutoff resolves it — #6 per-patch gate).
+        double microW = MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale);
+        double microF = 0.0, microC = 0.0;
+        if (microW > 0.0)
+        {
+            double mgF = LayerGate(_microFreq * fs, fineSpacing), mgC = LayerGate(_microFreq * fs, coarseSpacing);
+            if (mgF > 0.0 || mgC > 0.0)
+            {
+                (double mfF, double mfC) = _noise.Fbm2(unitDir,
+                    OctavesFor(_microFreq * fs, fineSpacing, MaxMicroOctaves),
+                    OctavesFor(_microFreq * fs, coarseSpacing, MaxMicroOctaves),
+                    _microFreq * fs, 2.0, MicroGain);
+                microF = mfF * mgF * detailGate;
+                microC = mfC * mgC * detailGate;
+            }
+        }
+
+        // Impact craters (dual gate, shared 3×3×3 work). craterFine is reused for albedo by the caller.
+        double craterW = _craterWeight * PlanetTuning.EffectiveCraterScale(Type);
+        double craterC = 0.0;
+        if (craterW > 0.0)
+        {
+            (craterFine, craterC) = CraterField2(unitDir, fs, fineSpacing, coarseSpacing);
+        }
+
+        // Sedimentary strata: fixed-octave, LOD-independent — identical for both cutoffs.
+        double strata = 0.0;
+        if (_strataWeight > 0.0)
+        {
+            var sp2 = unitDir + new Vector3D<double>(8.2, 71.5, 3.6);
+            double low = _noise.Fbm(sp2, 4, _strataFreq * fs, 2.0, 0.5);
+            strata = Terrace(low, _strataSteps, _strataSharp);
+        }
+
+        double scale = _baseAmplitude * PlanetTuning.EffectiveRelief(Type);
+        fine = scale * (ContinentWeight * contF + mWeight * mtnF * maskF * rugged
+                        + DetailWeight * detF * detailGate + microW * microF
+                        + craterW * craterFine + _strataWeight * strata);
+        coarse = scale * (ContinentWeight * contC + mWeight * mtnC * maskC * rugged
+                        + DetailWeight * detC * detailGate + microW * microC
+                        + craterW * craterC + _strataWeight * strata);
     }
 
     // --- terrain style ---
@@ -404,6 +508,66 @@ public sealed class PlanetTerrain
         return (minBowl + maxRim) * gate;
     }
 
+    /// <summary>
+    /// <see cref="CraterField"/> at a fine and a coarse band-limit in one pass. The 3×3×3 cellular
+    /// accumulation (the expensive part) is spacing-independent, so it's evaluated once per octave and
+    /// only the LOD gate differs between the two cutoffs. The coarsest octave resolves first, so if even
+    /// it is gated out at the coarse spacing the whole field is skipped (#6 per-patch early-out).
+    /// </summary>
+    private (double fine, double coarse) CraterField2(Vector3D<double> unitDir, double freqScale,
+        double fineSpacing, double coarseSpacing)
+    {
+        double freq0 = _craterFreqA * 0.5;
+        // Coarsest octave opens earliest; if it's dark for the coarser spacing, nothing finer survives.
+        if (LayerGate(freq0 * freqScale, coarseSpacing) <= 0.0 && LayerGate(freq0 * freqScale, fineSpacing) <= 0.0)
+            return (0.0, 0.0);
+
+        double density = Math.Clamp(_craterDensity * PlanetTuning.EffectiveCraterDensity(Type), 0.0, 1.0);
+        double freq = freq0, weight = 1.0, sumF = 0.0, sumC = 0.0, wsum = 0.0;
+        for (int o = 0; o < CraterOctaves; o++)
+        {
+            (double lf, double lc) = CraterLayer2(unitDir, freq * freqScale, CraterSalt(o), fineSpacing, coarseSpacing, density);
+            sumF += weight * lf; sumC += weight * lc; wsum += weight;
+            freq *= CraterLacunarity; weight *= CraterDepthFalloff;
+        }
+        return (sumF / wsum, sumC / wsum);
+    }
+
+    /// <summary>One crater size class for two band-limits: the bowl/rim accumulation is computed once
+    /// and scaled by each cutoff's LOD gate (see <see cref="CraterLayer"/>).</summary>
+    private (double fine, double coarse) CraterLayer2(Vector3D<double> unitDir, double freq, ulong salt,
+        double fineSpacing, double coarseSpacing, double density)
+    {
+        double gateF = LayerGate(freq, fineSpacing), gateC = LayerGate(freq, coarseSpacing);
+        if (gateF <= 0.0 && gateC <= 0.0) return (0.0, 0.0);
+
+        Vector3D<double> p = unitDir * freq;
+        long xi = (long)Math.Floor(p.X), yi = (long)Math.Floor(p.Y), zi = (long)Math.Floor(p.Z);
+
+        double minBowl = 0.0, maxRim = 0.0;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            (double fx, double fy, double fz, double rand) = _noise.CellFeature(xi + dx, yi + dy, zi + dz, salt);
+            if (rand > density) continue;
+            double radius = 0.22 + 0.28 * Frac(rand * 7.3 + 0.19);
+
+            double ex = p.X - fx, ey = p.Y - fy, ez = p.Z - fz;
+            double t = Math.Sqrt(ex * ex + ey * ey + ez * ez) / radius;
+            if (t >= 1.5) continue;
+
+            double bowl = -(1.0 - Smoothstep(0.0, 0.85, Math.Min(t, 1.0)));
+            double e = (t - 0.95) / 0.12;
+            double rim = CraterRimFrac * Math.Exp(-0.5 * e * e);
+
+            if (bowl < minBowl) minBowl = bowl;
+            if (rim > maxRim) maxRim = rim;
+        }
+        double raw = minBowl + maxRim;
+        return (raw * gateF, raw * gateC);
+    }
+
     /// <summary>Smoothly fade a feature class in as the patch resolves it: 0 until a feature spans a
     /// few samples, 1 once it spans many. Continuous in spacing, so LOD never pops the craters in.</summary>
     private double LayerGate(double freq, double sampleSpacing)
@@ -492,6 +656,16 @@ public sealed class PlanetTerrain
     /// cliffs — so steep faces read as bare rock and snow settles on gentle ground / cold latitudes.
     /// </summary>
     public Vector3D<float> ColorAt(Vector3D<double> dir, double height, double slope, double sampleSpacing)
+        => ColorCore(dir, height, slope, sampleSpacing, 0.0, craterKnown: false);
+
+    /// <summary>As <see cref="ColorAt(Vector3D{double}, double, double, double)"/> but reusing a crater
+    /// value already evaluated by <see cref="HeightAt2"/>, so the bake path samples the (expensive)
+    /// crater field once per vertex for both geometry and albedo instead of twice.</summary>
+    public Vector3D<float> ColorAt(Vector3D<double> dir, double height, double slope, double sampleSpacing, double craterValue)
+        => ColorCore(dir, height, slope, sampleSpacing, craterValue, craterKnown: true);
+
+    private Vector3D<float> ColorCore(Vector3D<double> dir, double height, double slope, double sampleSpacing,
+        double craterValue, bool craterKnown)
     {
         double amplitude = Amplitude;
 
@@ -514,8 +688,10 @@ public sealed class PlanetTerrain
         }
 
         Vector3D<float> land = LandBand(dir, height, amplitude, slope);
+        if (!IsCratered) return land;
         // Airless cratered worlds get crater-floor/rim albedo and maria provinces over the bare land.
-        return IsCratered ? RegolithAlbedo(land, dir, sampleSpacing) : land;
+        double cr = craterKnown ? craterValue : CraterField(dir, PlanetTuning.EffectiveFrequency(Type), sampleSpacing);
+        return RegolithAlbedo(land, dir, cr);
     }
 
     /// <summary>
@@ -525,14 +701,14 @@ public sealed class PlanetTerrain
     /// surface — relief alone goes flat on coarse far patches, but the maria term is low-frequency
     /// enough to survive there. Strengths are live (TerrainTuning); a colour change needs a rebuild.
     /// </summary>
-    private Vector3D<float> RegolithAlbedo(Vector3D<float> col, Vector3D<double> dir, double sampleSpacing)
+    private Vector3D<float> RegolithAlbedo(Vector3D<float> col, Vector3D<double> dir, double crater)
     {
         double fs = PlanetTuning.EffectiveFrequency(Type);
 
         float ca = Math.Max(0f, TerrainTuning.CraterAlbedo);
         if (ca > 0f)
         {
-            double cr = CraterField(dir, fs, sampleSpacing);               // [-1, rim]
+            double cr = crater;                                            // [-1, rim] (precomputed by the caller)
             float dark = (float)Math.Max(0.0, -cr);                        // 0 at rim → 1 deep floor
             float bright = (float)(Math.Max(0.0, cr) / CraterRimFrac);     // 0 → 1 at the rim crest
             col *= 1f - 0.45f * ca * dark;                                 // darker, dust-pooled floors
