@@ -206,6 +206,7 @@ void main() { FragColor = uColor; }";
     private readonly Mesh _sphere;
     private readonly Mesh _orbit;
     private readonly Mesh _ring;
+    private readonly uint _dummyTex; // 1×1 placeholder for the map sampler units when no surface map is bound
 
     public SystemRenderer(GL gl)
     {
@@ -216,6 +217,22 @@ void main() { FragColor = uColor; }";
         _sphere = Primitives.BuildSphere(gl, stacks: 24, slices: 48);
         _orbit = Primitives.BuildCircleLine(gl, segments: 128);
         _ring = Primitives.BuildRingAnnulus(gl, segments: 256);
+
+        // A 1×1 white texture to bind to the map sampler units (uAlbedoMap/uNormalMap) when a body has no
+        // baked surface map: the samplers are unused then (uHasMap = 0) but must still reference a COMPLETE
+        // texture, or macOS GL logs "unloadable texture, using zero texture" for the empty unit.
+        _dummyTex = gl.GenTexture();
+        gl.BindTexture(TextureTarget.Texture2D, _dummyTex);
+        unsafe
+        {
+            Span<byte> px = stackalloc byte[] { 255, 255, 255, 255 };
+            fixed (byte* p = px)
+                gl.TexImage2D(TextureTarget.Texture2D, 0, (int)InternalFormat.Rgba8, 1, 1, 0,
+                    PixelFormat.Rgba, PixelType.UnsignedByte, p);
+        }
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Nearest);
+        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
+        gl.BindTexture(TextureTarget.Texture2D, 0);
     }
 
     public void Render(Camera camera, SolarSystem system, CelestialBody? terrainBody = null,
@@ -234,14 +251,15 @@ void main() { FragColor = uColor; }";
         // --- Sun (emissive) ---
         _planetShader.Use();
         _planetShader.SetVector3("uSunCenter", sunRel);
-        if (map is { Ready: true })
-        {
-            _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, map.AlbedoTex);
-            _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, map.NormalTex);
-            _planetShader.SetInt("uAlbedoMap", 0);
-            _planetShader.SetInt("uNormalMap", 1);
-            _gl.ActiveTexture(TextureUnit.Texture0);
-        }
+        // Bind the surface map (focused body) or a complete 1×1 placeholder to the map sampler units, so the
+        // samplers always reference a valid texture even when a body draws with uHasMap = 0 (no warning).
+        uint albedoTex = map is { Ready: true } ? map.AlbedoTex : _dummyTex;
+        uint normalTex = map is { Ready: true } ? map.NormalTex : _dummyTex;
+        _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, albedoTex);
+        _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, normalTex);
+        _planetShader.SetInt("uAlbedoMap", 0);
+        _planetShader.SetInt("uNormalMap", 1);
+        _gl.ActiveTexture(TextureUnit.Texture0);
         DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f, SurfaceParams.None, useMap: false);
 
         // --- Planets + moons (lit) ---
@@ -402,5 +420,6 @@ void main() { FragColor = uColor; }";
         _sphere.Dispose();
         _orbit.Dispose();
         _ring.Dispose();
+        _gl.DeleteTexture(_dummyTex);
     }
 }
