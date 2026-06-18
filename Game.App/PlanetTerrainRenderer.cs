@@ -444,11 +444,14 @@ uniform float uGridN;       // cells per patch edge (= GridN)
 uniform vec4 uRect;         // (u0, v0, u1, v1) of this patch on the cube face
 uniform int uFace;
 uniform vec2 uTileOrigin;   // this patch's tile origin (texels) in the atlas
+uniform float uDetailFreq;  // detail-noise cells per metre (for the fragment detail layer)
+uniform vec3 uPatchFracBase;// fract(patchCentre * detailFreq) — integer part travels in uPatchCellBase
 uniform sampler2D uHeight;
 out vec3 vWorld;
 out vec3 vDir;
 out vec3 vNormal;           // smooth surface normal from the height field (planet-local)
 out float vElev;            // morphed height (for albedo)
+out vec3 vNoiseCoord;       // planet-stable, precise fractional noise coordinate for the detail layer
 
 vec3 facePoint(int f, float u, float v) {
     float a = u * 2.0 - 1.0, b = v * 2.0 - 1.0;
@@ -487,6 +490,8 @@ void main() {
     vWorld = (uModel * vec4(posRel, 1.0)).xyz;
     vDir = aDir;
     vElev = h;
+    // Precise, swim-free noise coordinate (integer part travels in uPatchCellBase) for the detail layer.
+    vNoiseCoord = uPatchFracBase + posRel * uDetailFreq;
     gl_Position = uMVP * vec4(posRel, 1.0);
 }";
 
@@ -495,14 +500,55 @@ in vec3 vWorld;
 in vec3 vDir;
 in vec3 vNormal;
 in float vElev;
+in vec3 vNoiseCoord;
 uniform vec3 uSunDir;
 uniform float uAmbient;
-uniform float uScale;       // relief amplitude (metres), to normalise elevation for the albedo ramp
+uniform float uScale;            // relief amplitude (metres), to normalise elevation for the albedo ramp
+// Fragment detail layer (shared design with the CPU terrain shader).
+uniform vec3 uPatchCellBase;     // wrapped integer cell base (planet-local), keeps the hash precise
+uniform float uDetailFreq;       // detail-noise cells per metre
+uniform float uDetailStrength;   // detail-normal bump strength (0 = off)
+uniform float uDetailAlbedo;     // albedo break-up amount
+uniform float uDetailLowCut;     // mesh-handoff threshold (octave-cells per resolved step)
+uniform float uMaterialStrength; // cracks/cavity + mineral tint (0 = off)
+uniform float uSurfaceSpecular;  // close-up specular highlight strength
+uniform float uVertexSpacingDir; // this patch's vertex spacing / planet radius
+uniform float uPlanetRadius;     // metres
+uniform float uGeomDetailFloor;  // finest spacing the baked geometry resolves (metres)
 out vec4 FragColor;
+
+float hash13(vec3 p) {
+    p = mod(p, 4096.0);
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+float vnoise(vec3 base, vec3 nc) {
+    vec3 c = base + floor(nc);
+    vec3 f = fract(nc);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(c),               n100 = hash13(c + vec3(1,0,0));
+    float n010 = hash13(c + vec3(0,1,0)), n110 = hash13(c + vec3(1,1,0));
+    float n001 = hash13(c + vec3(0,0,1)), n101 = hash13(c + vec3(1,0,1));
+    float n011 = hash13(c + vec3(0,1,1)), n111 = hash13(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+vec4 detailSample(float m) {
+    vec3 bm = uPatchCellBase * m;
+    vec3 sc = vNoiseCoord * m;
+    float e = 0.15;
+    float n0 = vnoise(bm, sc);
+    float nx = vnoise(bm, sc + vec3(e, 0.0, 0.0));
+    float ny = vnoise(bm, sc + vec3(0.0, e, 0.0));
+    float nz = vnoise(bm, sc + vec3(0.0, 0.0, e));
+    return vec4(vec3(nx - n0, ny - n0, nz - n0) / e, n0);
+}
+
 void main() {
     vec3 N = normalize(vNormal);
     vec3 up = normalize(vDir);
-    float diff = max(dot(N, normalize(uSunDir)), 0.0);
     float slope = clamp(dot(N, up), 0.0, 1.0);               // 1 on flats → 0 on cliffs
     float elev = clamp(vElev / max(1.0, uScale) * 0.5 + 0.5, 0.0, 1.0);
 
@@ -513,8 +559,47 @@ void main() {
     vec3 col = mix(rock, snow, smoothstep(0.60, 0.80, elev) * smoothstep(0.55, 0.85, slope));
     col = mix(cliff, col, smoothstep(0.40, 0.70, slope));    // steep faces → bare cliff
 
-    float ambient = uAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up)); // hemispheric fill
-    FragColor = vec4(col * (ambient + 0.95 * diff), 1.0);
+    // Close-up detail: a band-passed multi-octave noise gives per-pixel normal bump + material breakup
+    // below the mesh resolution (handed off to the geometry above it). Same scheme as the CPU shader.
+    if (uDetailStrength > 0.0001 || uMaterialStrength > 0.0001) {
+        float fpMax = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        float fpMin = min(min(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
+        float footprint = max(fpMin, fpMax * 0.2);
+        float effSpacing = max(uVertexSpacingDir * uPlanetRadius, uGeomDetailFloor);
+        float meshCellsPerVertex = effSpacing * uDetailFreq;
+        vec3 tangAccum = vec3(0.0);
+        float nDetail = 0.0, wsum = 0.0, m = 1.0;
+        for (int o = 0; o < 8; o++) {
+            float aa = 1.0 - smoothstep(0.45, 1.3, footprint * m);
+            float mc = meshCellsPerVertex * m;
+            float oct = aa * smoothstep(uDetailLowCut, uDetailLowCut * 3.0, mc);
+            if (oct > 0.0) {
+                vec4 s = detailSample(m);
+                tangAccum += oct * (s.xyz - dot(s.xyz, N) * N);
+                nDetail += oct * (s.w - 0.5) * 2.0;
+                wsum += oct;
+            }
+            m *= 2.0;
+        }
+        float baseFade = clamp(wsum, 0.0, 1.0);
+        if (wsum > 0.0) {
+            nDetail = nDetail / wsum;
+            N = normalize(N - uDetailStrength * tangAccum);
+            float steep = 1.0 - slope;
+            col *= 1.0 + uDetailAlbedo * nDetail * baseFade;
+            float crack = smoothstep(0.25, -0.1, nDetail);
+            col *= 1.0 - uMaterialStrength * baseFade * crack * (0.35 + 0.65 * steep);
+            col += uMaterialStrength * baseFade * 0.04 * nDetail * vec3(0.6, 0.5, 0.4);
+        }
+    }
+
+    // Lighting: hemispheric ambient + diffuse + a subtle specular so the detail normals catch the sun.
+    vec3 V = normalize(-vWorld);
+    float diff = max(dot(N, normalize(uSunDir)), 0.0);
+    float ambient = uAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up));
+    vec3 Hh = normalize(normalize(uSunDir) + V);
+    float spec = uSurfaceSpecular * pow(max(dot(N, Hh), 0.0), 30.0) * diff;
+    FragColor = vec4(col * (ambient + 0.95 * diff) + vec3(spec), 1.0);
 }";
 
     // Ocean swell waves (planet-local). The CPU phase base and the shader's spatial term share these,
@@ -860,7 +945,7 @@ void main() {
         _shader.SetFloat("uMorph", morph);
         node.DrawMorph = morph;          // record what the vehicle collision should blend to
         node.DrawnFrame = _renderFrame;  // this node is a drawn leaf this frame
-        SetPatchDetailBase(node);
+        SetPatchDetailBase(_shader, node);
         node.Patch.Draw(_gl);
         if (node.Patch.HasWater) _waterFrame.Add((node.Patch, rel, node.CenterLocal)); // drawn in the later water pass
     }
@@ -907,6 +992,18 @@ void main() {
         _gpuShader.SetFloat("uAmbient", Math.Max(0f, TerrainTuning.SurfaceAmbient));
         _gpuShader.SetFloat("uScale", (float)_terrain!.GpuParams().Scale); // elevation normaliser for albedo
         _gpuShader.SetFloat("uGridN", GridN);
+
+        // Fragment detail layer (same knobs/scheme as the CPU shader).
+        _detailNoiseFreq = DetailBaseFreq * Math.Max(0.01f, TerrainTuning.DetailNormalScale);
+        _gpuShader.SetFloat("uDetailFreq", (float)_detailNoiseFreq);
+        _gpuShader.SetFloat("uDetailStrength", Math.Max(0f, TerrainTuning.DetailNormalStrength));
+        _gpuShader.SetFloat("uDetailAlbedo", TerrainTuning.DetailAlbedo);
+        _gpuShader.SetFloat("uDetailLowCut", 2.0f / Math.Clamp(TerrainTuning.SurfaceDetailRange, 1f, 16f));
+        _gpuShader.SetFloat("uMaterialStrength", Math.Max(0f, TerrainTuning.MaterialDetail));
+        _gpuShader.SetFloat("uSurfaceSpecular", Math.Max(0f, TerrainTuning.SurfaceSpecular));
+        _gpuShader.SetFloat("uPlanetRadius", (float)_terrain.Radius);
+        _gpuShader.SetFloat("uGeomDetailFloor", (float)(_terrain.FinestGeometryWavelength * 0.5));
+
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _tileCache!.HeightTexture);
         _gpuShader.SetInt("uHeight", 0);
@@ -995,6 +1092,7 @@ void main() {
         _gpuShader.SetInt("uFace", node.Face);
         (int tox, int toy) = _tileCache.TileOrigin(layer);
         _gpuShader.SetVector2("uTileOrigin", new Vector2D<float>(tox, toy));
+        SetPatchDetailBase(_gpuShader, node); // uPatchCellBase/uPatchFracBase/uVertexSpacingDir for the detail layer
         node.DrawMorph = morph;
         node.DrawnFrame = _renderFrame;
         _gl.BindVertexArray(node.BaseVao);
@@ -1138,19 +1236,20 @@ void main() {
     /// seamless, swim-free noise coordinate from this plus the (small, precise) patch-relative vertex
     /// position — so detail neither slides as you move nor seams at patch boundaries.
     /// </summary>
-    private void SetPatchDetailBase(QuadNode node)
+    private void SetPatchDetailBase(Shader shader, QuadNode node)
     {
         double freq = _detailNoiseFreq;
         Vector3D<double> c = node.CenterLocal;
         double fx = Math.Floor(c.X * freq), fy = Math.Floor(c.Y * freq), fz = Math.Floor(c.Z * freq);
-        _shader.SetVector3("uPatchCellBase", new Vector3D<float>(WrapCell(fx), WrapCell(fy), WrapCell(fz)));
-        _shader.SetVector3("uPatchFracBase", new Vector3D<float>(
+        shader.SetVector3("uPatchCellBase", new Vector3D<float>(WrapCell(fx), WrapCell(fy), WrapCell(fz)));
+        shader.SetVector3("uPatchFracBase", new Vector3D<float>(
             (float)(c.X * freq - fx), (float)(c.Y * freq - fy), (float)(c.Z * freq - fz)));
 
         // Orbital macro relief needs the patch centre (to rebuild the surface direction) and this
         // patch's vertex spacing in direction units (so the shader knows what the mesh already shows).
-        _shader.SetVector3("uPatchCenter", new Vector3D<float>((float)c.X, (float)c.Y, (float)c.Z));
-        _shader.SetFloat("uVertexSpacingDir", (float)(node.WorldSize / GridN / _terrain!.Radius));
+        // (uPatchCenter is unused by the GPU shader — setting an absent uniform is a harmless no-op.)
+        shader.SetVector3("uPatchCenter", new Vector3D<float>((float)c.X, (float)c.Y, (float)c.Z));
+        shader.SetFloat("uVertexSpacingDir", (float)(node.WorldSize / GridN / _terrain!.Radius));
     }
 
     /// <summary>Wrap an integer cell index into [0, 4096) (matching the shader's hash period).</summary>
