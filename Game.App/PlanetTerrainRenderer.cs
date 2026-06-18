@@ -504,6 +504,10 @@ in vec3 vNoiseCoord;
 uniform vec3 uSunDir;
 uniform float uAmbient;
 uniform float uScale;            // relief amplitude (metres), to normalise elevation for the albedo ramp
+// Biome / colour (per-pixel port of ColorAt / LandBand).
+uniform vec3 uBaseColor, uRock, uSnow, uCliff, uLowland;
+uniform float uSnowLine, uCliffThreshold, uCliffStrength, uSurfaceTempK, uHasLife;
+uniform float uMoistureFreq, uMoistureBias, uAmplitude;
 // Fragment detail layer (shared design with the CPU terrain shader).
 uniform vec3 uPatchCellBase;     // wrapped integer cell base (planet-local), keeps the hash precise
 uniform float uDetailFreq;       // detail-noise cells per metre
@@ -546,18 +550,59 @@ vec4 detailSample(float m) {
     return vec4(vec3(nx - n0, ny - n0, nz - n0) / e, n0);
 }
 
+// Low-frequency value noise over a direction (coords stay small → a plain hash is precise).
+float vnoise3(vec3 p) {
+    vec3 c = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(c),               n100 = hash13(c + vec3(1,0,0));
+    float n010 = hash13(c + vec3(0,1,0)), n110 = hash13(c + vec3(1,1,0));
+    float n001 = hash13(c + vec3(0,0,1)), n101 = hash13(c + vec3(1,0,1));
+    float n011 = hash13(c + vec3(0,1,1)), n111 = hash13(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+float fbm3(vec3 p, float freq) {
+    float s = 0.0, a = 1.0, f = freq, n = 0.0;
+    for (int i = 0; i < 4; i++) { s += a * (vnoise3(p * f) * 2.0 - 1.0); n += a; a *= 0.5; f *= 2.0; }
+    return s / n;
+}
+
+// Climate + elevation + slope albedo (per-pixel port of PlanetTerrain.LandBand / BiomeGround).
+vec3 biomeColor(vec3 dir, float elevM, float slope) {
+    float tBase = clamp((uSurfaceTempK - 215.0) / 105.0, 0.0, 1.0);
+    float lat = abs(dir.y);
+    float elevAbove = max(0.0, elevM / uAmplitude);
+    float temp = clamp(tBase - 0.55 * pow(lat, 1.3) - 0.55 * elevAbove, 0.0, 1.0);
+    float moist = clamp(0.5 + 0.5 * fbm3(dir + vec3(17.3, 5.9, 42.1), uMoistureFreq) + uMoistureBias, 0.0, 1.0);
+
+    vec3 temperate = uBaseColor * uLowland;
+    vec3 substrate = temp < 0.5 ? mix(vec3(0.78,0.82,0.86), temperate, temp / 0.5)
+                                : mix(temperate, vec3(0.80,0.62,0.40), (temp - 0.5) / 0.5);
+    vec3 ground = substrate;
+    if (uHasLife > 0.5) {
+        vec3 veg;
+        if (temp < 0.35)      veg = mix(vec3(0.45,0.46,0.34), vec3(0.20,0.42,0.18), smoothstep(0.15, 0.35, temp));
+        else if (temp < 0.7)  veg = mix(vec3(0.48,0.56,0.28), vec3(0.20,0.42,0.18), moist);
+        else                  veg = mix(substrate, vec3(0.12,0.40,0.15), moist);
+        float lush = smoothstep(0.12, 0.35, temp) * smoothstep(0.25, 0.6, moist);
+        ground = mix(substrate, veg, lush);
+    }
+
+    float t = clamp((elevM / uAmplitude + 0.3) / 1.3, 0.0, 1.0);
+    vec3 band = mix(ground, uRock, smoothstep(0.0, uSnowLine, t));
+    float coldSnow = 1.0 - smoothstep(0.06, 0.24, temp);
+    float elevSnow = smoothstep(uSnowLine, min(1.0, uSnowLine + 0.22), t);
+    band = mix(band, uSnow, clamp(max(coldSnow, elevSnow), 0.0, 1.0));
+    float steep = 1.0 - smoothstep(uCliffThreshold - 0.135, uCliffThreshold + 0.135, slope);
+    return mix(band, uCliff, steep * uCliffStrength);
+}
+
 void main() {
     vec3 N = normalize(vNormal);
     vec3 up = normalize(vDir);
     float slope = clamp(dot(N, up), 0.0, 1.0);               // 1 on flats → 0 on cliffs
-    float elev = clamp(vElev / max(1.0, uScale) * 0.5 + 0.5, 0.0, 1.0);
-
-    // Procedural albedo (first cut): rock, snow on high & gentle ground, dark bare rock on cliffs.
-    vec3 rock  = vec3(0.42, 0.40, 0.37);
-    vec3 snow  = vec3(0.90, 0.92, 0.96);
-    vec3 cliff = vec3(0.26, 0.24, 0.22);
-    vec3 col = mix(rock, snow, smoothstep(0.60, 0.80, elev) * smoothstep(0.55, 0.85, slope));
-    col = mix(cliff, col, smoothstep(0.40, 0.70, slope));    // steep faces → bare cliff
+    vec3 col = biomeColor(up, vElev, slope);
 
     // Close-up detail: a band-passed multi-octave noise gives per-pixel normal bump + material breakup
     // below the mesh resolution (handed off to the geometry above it). Same scheme as the CPU shader.
@@ -990,8 +1035,24 @@ void main() {
         _gpuShader!.Use();
         _gpuShader.SetVector3("uSunDir", sunDir);
         _gpuShader.SetFloat("uAmbient", Math.Max(0f, TerrainTuning.SurfaceAmbient));
-        _gpuShader.SetFloat("uScale", (float)_terrain!.GpuParams().Scale); // elevation normaliser for albedo
+        PlanetTerrain.GpuTerrainParams gp = _terrain!.GpuParams();
+        _gpuShader.SetFloat("uScale", (float)gp.Scale); // elevation normaliser for albedo
         _gpuShader.SetFloat("uGridN", GridN);
+
+        // Biome / colour (per-pixel albedo, mirroring ColorAt/LandBand).
+        _gpuShader.SetVector3("uBaseColor", gp.BaseColor);
+        _gpuShader.SetVector3("uRock", gp.Rock);
+        _gpuShader.SetVector3("uSnow", gp.Snow);
+        _gpuShader.SetVector3("uCliff", gp.Cliff);
+        _gpuShader.SetVector3("uLowland", gp.Lowland);
+        _gpuShader.SetFloat("uSnowLine", gp.SnowLine);
+        _gpuShader.SetFloat("uCliffThreshold", gp.CliffThreshold);
+        _gpuShader.SetFloat("uCliffStrength", gp.CliffStrength);
+        _gpuShader.SetFloat("uSurfaceTempK", gp.SurfaceTempK);
+        _gpuShader.SetFloat("uHasLife", gp.HasLife);
+        _gpuShader.SetFloat("uMoistureFreq", (float)gp.MoistureFreq);
+        _gpuShader.SetFloat("uMoistureBias", (float)gp.MoistureBias);
+        _gpuShader.SetFloat("uAmplitude", (float)Math.Max(1.0, gp.Amplitude));
 
         // Fragment detail layer (same knobs/scheme as the CPU shader).
         _detailNoiseFreq = DetailBaseFreq * Math.Max(0.01f, TerrainTuning.DetailNormalScale);
@@ -1643,15 +1704,32 @@ void main() {
         // Altitude above the LOCAL terrain under the camera, not the base radius — otherwise
         // standing on high ground (a mountain / raised continent) inflates the altitude by that
         // elevation and pushes the near plane far out, clipping the rover and nearby surface.
+        // Altitude above the LOCAL terrain under the camera. The GPU path samples the GPU terrain's own
+        // height (a different hash than HeightAt), so the near plane fits the surface actually drawn —
+        // basing it on the CPU HeightAt instead either clips close terrain or wrecks the depth precision.
         Vector3D<double> camDir = camera.Position.DeltaMeters(_body.CurrentPosition);
         double surfaceR = _terrain!.Radius;
         if (camDir.LengthSquared > 0)
-            surfaceR += _terrain.HeightAt(Vector3D.Normalize(camDir));
+        {
+            Vector3D<double> nadir = Vector3D.Normalize(camDir);
+            if (TerrainTuning.GpuTerrain)
+                // Sample at a coarse reference spacing so the CPU mirror only evaluates the low-frequency
+                // octaves where float (GPU) and double (CPU) agree — the high octaves diverge at the float
+                // precision edge and would mis-size the near plane. Matches the GPU's stable surface.
+                surfaceR += _terrain.GpuHeightAt(nadir, _terrain.Radius * 5e-5);
+            else
+                surfaceR += _terrain.HeightAt(nadir);
+        }
         double alt = Math.Max(1.0, camToCenter - surfaceR);
 
         double horizon = Math.Sqrt(alt * alt + 2 * _terrain.Radius * alt);
         double far = horizon * 1.25 + 5000.0;
-        double near = Math.Clamp(alt * 0.25, 0.2, far * 0.5);
+        // alt × 0.25 assumes the nearest geometry is straight down; but looking toward the horizon, the
+        // foreground terrain rises much closer than `alt`, so a quarter-altitude near plane slices through
+        // it. The GPU path uses a far smaller fraction (the far plane is the true horizon, so the depth
+        // precision is still fine), keeping the close terrain inside the near plane.
+        double nearFactor = TerrainTuning.GpuTerrain ? 0.04 : 0.25;
+        double near = Math.Clamp(alt * nearFactor, 0.2, far * 0.5);
         near = Math.Max(near, far / 5.0e5);
         LastNear = (float)near; LastFar = (float)far;
         return MatrixHelper.PerspectiveGL(camera.FovRadians, camera.AspectRatio, (float)near, (float)far);

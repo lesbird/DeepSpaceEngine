@@ -53,6 +53,9 @@ uniform float uScale;      // metres of relief (height = scale * shape)
 uniform vec3 uOctFine;     // (continent, mountain, detail) octave counts at the fine band-limit
 uniform vec3 uOctCoarse;   // ... at the parent (coarse) band-limit
 uniform float uTexelN;     // texels per tile edge — snap each texel to its mesh-vertex (u,v) so seams match
+uniform float uWarpFreq, uWarpStrength;            // domain warp (bends the mountain ranges)
+uniform float uRuggedFreq, uRuggedLo, uRuggedHi;   // regional ruggedness mask: flat plains vs rugged highlands
+uniform float uDetailFloor;                        // min detail roughness in the flattest regions
 layout(location = 0) out vec4 oHeight;
 
 const int MaxOct = 32;
@@ -119,12 +122,28 @@ float ridged(vec3 dir, float freq, float oct, float gain) {
     return norm > 0.0 ? clamp(sum / norm, 0.0, 1.0) : 0.0;
 }
 
+// Regional ruggedness in [0,1]: 0 = flat plains here, 1 = rugged highlands (low-frequency, fixed octaves).
+float ruggedness(vec3 dir) {
+    float r = fbm(dir + vec3(53.1, 12.7, 91.3), uRuggedFreq, 4.0, 0.5);
+    return smoothstep(uRuggedLo, uRuggedHi, 0.5 + 0.5 * r);
+}
+// A low-frequency noise offset that bends mountain ranges organically (fixed octaves).
+vec3 domainWarp(vec3 dir) {
+    float wx = fbm(dir, uWarpFreq, 3.0, 0.5);
+    float wy = fbm(dir + vec3(31.4, 11.7, 5.2), uWarpFreq, 3.0, 0.5);
+    float wz = fbm(dir + vec3(-7.1, 23.9, 17.3), uWarpFreq, 3.0, 0.5);
+    return vec3(wx, wy, wz) * uWarpStrength;
+}
+
 float shape(vec3 dir, vec3 oct) {
     float cont = fbm(dir, uFreq.x, oct.x, uGain.x);     // broad continents / basins
+    float rugged = ruggedness(dir);                     // where rugged terrain belongs
     float mask = smoothstep(-0.2, 0.4, cont);           // highlands carry the mountains
-    float mtn  = ridged(dir, uFreq.y, oct.y, uGain.y);
+    vec3 warped = dir + domainWarp(dir);                // bend the ranges
+    float mtn  = ridged(warped, uFreq.y, oct.y, uGain.y);
     float det  = fbm(dir, uFreq.z, oct.z, uGain.z);      // high-frequency roughness
-    return uWeight.x * cont + uWeight.y * mtn * mask + uWeight.z * det;
+    float detailGate = uDetailFloor + (1.0 - uDetailFloor) * rugged; // calmer detail on plains
+    return uWeight.x * cont + uWeight.y * mtn * mask * rugged + uWeight.z * det * detailGate;
 }
 
 void main() {
@@ -183,6 +202,12 @@ void main() {
         _shader.SetVector3("uOctFine", octFine);
         _shader.SetVector3("uOctCoarse", octCoarse);
         _shader.SetFloat("uTexelN", cache.TileSize);
+        _shader.SetFloat("uWarpFreq", (float)p.WarpFreq);
+        _shader.SetFloat("uWarpStrength", (float)p.WarpStrength);
+        _shader.SetFloat("uRuggedFreq", (float)p.RuggedFreq);
+        _shader.SetFloat("uRuggedLo", (float)p.RuggedLo);
+        _shader.SetFloat("uRuggedHi", (float)p.RuggedHi);
+        _shader.SetFloat("uDetailFloor", (float)p.DetailFloor);
 
         // Render the noise into the tile, then restore exactly the framebuffer + viewport that were bound
         // (the scene FBO mid-render): generation can run inside the terrain pass, so it must leave no trace.

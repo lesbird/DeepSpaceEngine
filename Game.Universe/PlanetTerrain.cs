@@ -410,26 +410,48 @@ public sealed class PlanetTerrain
     /// it bit-for-bit. Frequencies are in noise-cells over the unit sphere; <c>Scale</c> is metres of
     /// relief (so a shader height = Scale × shape). Layer weights/gains mirror <see cref="HeightAt"/>.
     /// </summary>
-    public readonly record struct GpuTerrainParams(
-        double Radius, ulong Seed,
-        double ContinentFreq, double MountainFreq, double DetailFreq,
-        double ContinentWeight, double MountainWeight, double DetailWeight,
-        double ContinentGain, double MountainGain, double DetailGain,
-        double WarpFreq, double WarpStrength, double Scale,
-        int MaxContinentOctaves, int MaxMountainOctaves, int MaxDetailOctaves);
+    public struct GpuTerrainParams
+    {
+        public double Radius;
+        public ulong Seed;
+        public double ContinentFreq, MountainFreq, DetailFreq;
+        public double ContinentWeight, MountainWeight, DetailWeight;
+        public double ContinentGain, MountainGain, DetailGain;
+        public double WarpFreq, WarpStrength, Scale;
+        public double RuggedFreq, RuggedLo, RuggedHi, DetailFloor; // regional ruggedness mask
+        public int MaxContinentOctaves, MaxMountainOctaves, MaxDetailOctaves;
+
+        // Biome / colour (for the per-pixel albedo in the render shader, mirroring ColorAt/LandBand).
+        public Vector3D<float> BaseColor, Rock, Snow, Cliff, Lowland;
+        public float SnowLine, CliffThreshold, CliffStrength, SurfaceTempK;
+        public float HasLife;               // 1 = supports vegetation (liquid water + atmosphere)
+        public double MoistureFreq, MoistureBias, Amplitude;
+    }
 
     /// <summary>Snapshot the generation parameters for the GPU tile path (see <see cref="GpuTerrainParams"/>).</summary>
     public GpuTerrainParams GpuParams()
     {
         double fs = PlanetTuning.EffectiveFrequency(Type);
-        return new GpuTerrainParams(
-            Radius, Seed,
-            _continentFreq * fs, _mountainFreq * fs, _detailFreq * fs,
-            ContinentWeight, _mountainWeight * PlanetTuning.EffectiveMountain(Type), DetailWeight,
-            ContinentGain, MountainGain, DetailGain,
-            _warpFreq * fs, _warpStrength,
-            _baseAmplitude * PlanetTuning.EffectiveRelief(Type),
-            MaxContinentOctaves, MaxMountainOctaves, MaxDetailOctaves);
+        return new GpuTerrainParams
+        {
+            Radius = Radius, Seed = Seed,
+            ContinentFreq = _continentFreq * fs, MountainFreq = _mountainFreq * fs, DetailFreq = _detailFreq * fs,
+            ContinentWeight = ContinentWeight, MountainWeight = _mountainWeight * PlanetTuning.EffectiveMountain(Type),
+            DetailWeight = DetailWeight,
+            ContinentGain = ContinentGain, MountainGain = MountainGain, DetailGain = DetailGain,
+            WarpFreq = _warpFreq * fs, WarpStrength = _warpStrength,
+            RuggedFreq = _ruggedFreq * fs, RuggedLo = _ruggedLo, RuggedHi = _ruggedHi, DetailFloor = _detailFloor,
+            Scale = _baseAmplitude * PlanetTuning.EffectiveRelief(Type),
+            MaxContinentOctaves = MaxContinentOctaves, MaxMountainOctaves = MaxMountainOctaves,
+            MaxDetailOctaves = MaxDetailOctaves,
+            BaseColor = _baseColor, Rock = PlanetTuning.EffectiveRock(Type), Snow = PlanetTuning.EffectiveSnow(Type),
+            Cliff = PlanetTuning.EffectiveCliff(Type), Lowland = PlanetTuning.EffectiveLowland(Type),
+            SnowLine = PlanetTuning.EffectiveSnowLine(Type),
+            CliffThreshold = PlanetTuning.EffectiveCliffThreshold(Type),
+            CliffStrength = PlanetTuning.EffectiveCliffStrength(Type),
+            SurfaceTempK = _surfaceTempK, HasLife = _hasLife ? 1f : 0f,
+            MoistureFreq = _moistureFreq, MoistureBias = _moistureBias, Amplitude = Amplitude,
+        };
     }
 
     /// <summary>Fractional fBm octave count a patch with the given vertex spacing can show without
@@ -437,6 +459,110 @@ public sealed class PlanetTerrain
     /// returns the full budget.</summary>
     public double OctavesForSpacing(double baseFreq, double sampleSpacing, int max)
         => OctavesFor(baseFreq, sampleSpacing, max);
+
+    // --- GPU-path height mirror -----------------------------------------------------------------
+    // A CPU re-implementation of the GPU tile generator's height (TerrainTileGenerator's GLSL), so the
+    // camera near/far fit and the rover can know the actual GPU surface height (the GPU uses a different
+    // hash than HeightAt, so HeightAt does NOT describe the GPU terrain). Mirrors the same hash/noise/
+    // octave-clamp; double here vs float on the GPU, so it matches to a fraction of a noise cell —
+    // ample for the near plane and good enough for vehicle placement.
+
+    private const double GpuFloatSafeFreq = 700_000.0; // mirror of TerrainTileGenerator.FloatSafeFreq
+
+    /// <summary>Height (metres, signed) of the GPU-generated terrain at a unit direction, band-limited to
+    /// <paramref name="sampleSpacing"/> (0 = full). Mirrors the generation shader; see the region note.</summary>
+    public double GpuHeightAt(Vector3D<double> unitDir, double sampleSpacing)
+    {
+        if (!HasSurface) return 0.0;
+        GpuTerrainParams p = GpuParams();
+        Vector3D<double> seed = GpuSeedOffset(p.Seed);
+        double oc = GpuOctClamp(p.ContinentFreq, sampleSpacing, p.MaxContinentOctaves);
+        double om = GpuOctClamp(p.MountainFreq, sampleSpacing, p.MaxMountainOctaves);
+        double od = GpuOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
+
+        double cont = GpuFbm(unitDir, p.ContinentFreq, oc, p.ContinentGain, seed);
+        double rugged = Smoothstep(p.RuggedLo, p.RuggedHi,
+            0.5 + 0.5 * GpuFbm(unitDir + new Vector3D<double>(53.1, 12.7, 91.3), p.RuggedFreq, 4.0, 0.5, seed));
+        double mask = Smoothstep(-0.2, 0.4, cont);
+        Vector3D<double> warped = unitDir + GpuDomainWarp(unitDir, p, seed);
+        double mtn = GpuRidged(warped, p.MountainFreq, om, p.MountainGain, seed);
+        double det = GpuFbm(unitDir, p.DetailFreq, od, p.DetailGain, seed);
+        double detailGate = p.DetailFloor + (1.0 - p.DetailFloor) * rugged;
+        double shape = p.ContinentWeight * cont + p.MountainWeight * mtn * mask * rugged
+                     + p.DetailWeight * det * detailGate;
+        return p.Scale * shape;
+    }
+
+    private double GpuOctClamp(double baseFreq, double spacing, int max)
+    {
+        double lod = OctavesFor(baseFreq, spacing, max); // same LOD band-limit as the GPU generator
+        double safe = Math.Floor(Math.Log2(GpuFloatSafeFreq / Math.Max(1.0, baseFreq))) + 1.0;
+        return Math.Max(0.0, Math.Min(lod, safe));
+    }
+
+    private static Vector3D<double> GpuSeedOffset(ulong seed) => new(
+        (seed & 1023) / 1024.0, ((seed >> 10) & 1023) / 1024.0, ((seed >> 20) & 1023) / 1024.0);
+
+    private static double GpuFract(double x) => x - Math.Floor(x);
+
+    private static double GpuHash13(Vector3D<double> p, Vector3D<double> seed)
+    {
+        p = new Vector3D<double>(Mod(p.X, 8192.0), Mod(p.Y, 8192.0), Mod(p.Z, 8192.0)) + seed;
+        p = new Vector3D<double>(GpuFract(p.X * 0.1031), GpuFract(p.Y * 0.1031), GpuFract(p.Z * 0.1031));
+        double d = p.X * (p.Y + 33.33) + p.Y * (p.Z + 33.33) + p.Z * (p.X + 33.33); // dot(p, p.yzx + 33.33)
+        p += new Vector3D<double>(d, d, d);
+        return GpuFract((p.X + p.Y) * p.Z);
+    }
+
+    private static double Mod(double a, double b) => a - b * Math.Floor(a / b);
+
+    private static double GpuVNoise(Vector3D<double> q, Vector3D<double> seed)
+    {
+        Vector3D<double> c = new(Math.Floor(q.X), Math.Floor(q.Y), Math.Floor(q.Z));
+        Vector3D<double> f = q - c;
+        f = new Vector3D<double>(f.X * f.X * (3 - 2 * f.X), f.Y * f.Y * (3 - 2 * f.Y), f.Z * f.Z * (3 - 2 * f.Z));
+        double n000 = GpuHash13(c, seed), n100 = GpuHash13(c + new Vector3D<double>(1, 0, 0), seed);
+        double n010 = GpuHash13(c + new Vector3D<double>(0, 1, 0), seed), n110 = GpuHash13(c + new Vector3D<double>(1, 1, 0), seed);
+        double n001 = GpuHash13(c + new Vector3D<double>(0, 0, 1), seed), n101 = GpuHash13(c + new Vector3D<double>(1, 0, 1), seed);
+        double n011 = GpuHash13(c + new Vector3D<double>(0, 1, 1), seed), n111 = GpuHash13(c + new Vector3D<double>(1, 1, 1), seed);
+        double x00 = Lerp1(n000, n100, f.X), x10 = Lerp1(n010, n110, f.X);
+        double x01 = Lerp1(n001, n101, f.X), x11 = Lerp1(n011, n111, f.X);
+        return Lerp1(Lerp1(x00, x10, f.Y), Lerp1(x01, x11, f.Y), f.Z);
+    }
+
+    private static double Lerp1(double a, double b, double t) => a + (b - a) * t;
+
+    private static double GpuFbm(Vector3D<double> dir, double freq, double oct, double gain, Vector3D<double> seed)
+    {
+        if (oct <= 0.0) return 0.0;
+        int full = (int)Math.Floor(oct);
+        double frac = oct - full, sum = 0, amp = 1, f = freq, norm = 0;
+        for (int i = 0; i < 32 && i < full; i++) { sum += amp * (GpuVNoise(dir * f, seed) * 2.0 - 1.0); norm += amp; amp *= gain; f *= 2.0; }
+        if (frac > 0.0) { sum += amp * frac * (GpuVNoise(dir * f, seed) * 2.0 - 1.0); norm += amp * frac; }
+        return norm > 0 ? sum / norm : 0;
+    }
+
+    private static double GpuRidged(Vector3D<double> dir, double freq, double oct, double gain, Vector3D<double> seed)
+    {
+        if (oct <= 0.0) return 0.0;
+        int full = (int)Math.Floor(oct);
+        double frac = oct - full, sum = 0, amp = 0.5, f = freq, prev = 1.0, norm = 0;
+        for (int i = 0; i < 32 && i < full; i++)
+        {
+            double n = 1.0 - Math.Abs(GpuVNoise(dir * f, seed) * 2.0 - 1.0); n *= n; n *= prev;
+            sum += n * amp; norm += amp; prev = n; amp *= gain; f *= 2.0;
+        }
+        if (frac > 0.0) { double n = 1.0 - Math.Abs(GpuVNoise(dir * f, seed) * 2.0 - 1.0); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
+        return norm > 0 ? Math.Clamp(sum / norm, 0.0, 1.0) : 0;
+    }
+
+    private static Vector3D<double> GpuDomainWarp(Vector3D<double> dir, GpuTerrainParams p, Vector3D<double> seed)
+    {
+        double wx = GpuFbm(dir, p.WarpFreq, 3.0, 0.5, seed);
+        double wy = GpuFbm(dir + new Vector3D<double>(31.4, 11.7, 5.2), p.WarpFreq, 3.0, 0.5, seed);
+        double wz = GpuFbm(dir + new Vector3D<double>(-7.1, 23.9, 17.3), p.WarpFreq, 3.0, 0.5, seed);
+        return new Vector3D<double>(wx, wy, wz) * p.WarpStrength;
+    }
 
     // --- terrain style ---
 
