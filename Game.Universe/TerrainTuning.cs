@@ -12,6 +12,14 @@ namespace Game.Universe;
 /// </summary>
 public static class TerrainTuning
 {
+    /// <summary>
+    /// Opt-in switch to the experimental <b>GPU tile-generation</b> terrain path (procedural height/
+    /// normal/albedo baked into texture tiles on the GPU and displaced via vertex texture fetch),
+    /// instead of the default CPU worker-pool bake. Off by default so the proven CPU path stays the
+    /// fallback while the GPU path is brought up and A/B-compared. Toggling rebuilds the active terrain.
+    /// </summary>
+    public static bool GpuTerrain = false;
+
     /// <summary>Scales overall relief height (and <see cref="PlanetTerrain.Amplitude"/> with it).</summary>
     public static float ReliefScale = 1.0f;
 

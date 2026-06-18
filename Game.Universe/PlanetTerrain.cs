@@ -29,6 +29,7 @@ public sealed class PlanetTerrain
     public readonly double Radius;
     public readonly bool HasSurface;
     public readonly PlanetType Type;
+    public readonly ulong Seed; // body seed — also salts the GPU generator's hash so worlds differ
 
     private readonly Noise _noise;
     private readonly double _baseAmplitude;    // seeded max relief (metres) before ReliefScale
@@ -114,6 +115,7 @@ public sealed class PlanetTerrain
         Radius = body.RadiusMeters;
         Type = body.Type;
         HasSurface = body.HasSurface;
+        Seed = body.Seed;
         _baseColor = body.Color;
 
         var rng = new DeterministicRng(Hashing.Combine(body.Seed, 0x7E44A1u));
@@ -400,6 +402,41 @@ public sealed class PlanetTerrain
                         + DetailWeight * detC * detailGate + microW * microC
                         + craterW * craterC + _strataWeight * strata);
     }
+
+    /// <summary>
+    /// The deterministic parameters the GPU tile generator needs to reproduce this world's terrain in a
+    /// shader (the live <see cref="TerrainTuning"/> multipliers already folded in). The GPU path uses its
+    /// own GLSL hash, so the result has the same <i>character</i> as the CPU terrain rather than matching
+    /// it bit-for-bit. Frequencies are in noise-cells over the unit sphere; <c>Scale</c> is metres of
+    /// relief (so a shader height = Scale × shape). Layer weights/gains mirror <see cref="HeightAt"/>.
+    /// </summary>
+    public readonly record struct GpuTerrainParams(
+        double Radius, ulong Seed,
+        double ContinentFreq, double MountainFreq, double DetailFreq,
+        double ContinentWeight, double MountainWeight, double DetailWeight,
+        double ContinentGain, double MountainGain, double DetailGain,
+        double WarpFreq, double WarpStrength, double Scale,
+        int MaxContinentOctaves, int MaxMountainOctaves, int MaxDetailOctaves);
+
+    /// <summary>Snapshot the generation parameters for the GPU tile path (see <see cref="GpuTerrainParams"/>).</summary>
+    public GpuTerrainParams GpuParams()
+    {
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+        return new GpuTerrainParams(
+            Radius, Seed,
+            _continentFreq * fs, _mountainFreq * fs, _detailFreq * fs,
+            ContinentWeight, _mountainWeight * PlanetTuning.EffectiveMountain(Type), DetailWeight,
+            ContinentGain, MountainGain, DetailGain,
+            _warpFreq * fs, _warpStrength,
+            _baseAmplitude * PlanetTuning.EffectiveRelief(Type),
+            MaxContinentOctaves, MaxMountainOctaves, MaxDetailOctaves);
+    }
+
+    /// <summary>Fractional fBm octave count a patch with the given vertex spacing can show without
+    /// aliasing (public so the GPU generator clamps octaves identically to the CPU path). Spacing ≤ 0
+    /// returns the full budget.</summary>
+    public double OctavesForSpacing(double baseFreq, double sampleSpacing, int max)
+        => OctavesFor(baseFreq, sampleSpacing, max);
 
     // --- terrain style ---
 

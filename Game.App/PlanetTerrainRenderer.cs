@@ -417,6 +417,60 @@ void main() {
     private readonly Shader _waterShader;
     private readonly List<(TerrainPatch patch, Vector3D<float> rel, Vector3D<double> centerLocal)> _waterFrame = new();
 
+    // --- experimental GPU tile path (TerrainTuning.GpuTerrain) ---
+    // A shared per-patch base-sphere mesh (CPU, no noise → precision-safe, center-relative) is displaced
+    // in the vertex shader by a height TILE generated on the GPU (TerrainTileGenerator → TerrainTileCache).
+    // Lazily created on first GPU use so the CPU path costs nothing. Phase 3 shades with a flat geometric
+    // normal + a simple slope tint to validate geometry/LOD/precision; per-pixel normal/albedo tiles and
+    // collision readback follow in later phases.
+    private const int GpuTileGensPerFrame = 16; // budget like UploadsPerFrame, so a descent can't stall a frame
+    private TerrainTileCache? _tileCache;
+    private TerrainTileGenerator? _tileGen;
+    private Shader? _gpuShader;
+    private long _nextTileId = 1;
+    private int _gpuGenBudget;
+
+    private const string GpuVertexSource = @"#version 410 core
+layout(location = 0) in vec3 aBasePos;   // R*(dir - centerDir): patch-centre-relative, small & precise
+layout(location = 1) in vec3 aDir;       // outward unit direction at this vertex
+layout(location = 2) in vec2 aTexel;     // (i, j) texel of this vertex in the height tile
+layout(location = 3) in float aSkirt;    // 1 = skirt vertex (dropped below the surface to hide LOD cracks)
+uniform mat4 uMVP;
+uniform mat4 uModel;        // camera-relative patch-centre translation
+uniform float uMorph;       // geomorph fine→coarse blend
+uniform float uSkirtDepth;
+uniform vec2 uTileOrigin;   // this patch's tile origin (texels) in the atlas
+uniform sampler2D uHeight;
+out vec3 vWorld;
+out vec3 vDir;
+void main() {
+    vec2 hfc = texelFetch(uHeight, ivec2(int(uTileOrigin.x) + int(aTexel.x), int(uTileOrigin.y) + int(aTexel.y)), 0).rg;
+    float h = mix(hfc.x, hfc.y, uMorph);
+    if (aSkirt > 0.5) h -= uSkirtDepth;
+    vec3 posRel = aBasePos + aDir * h;     // base sphere (small) + radial displacement (small) — float-safe
+    vWorld = (uModel * vec4(posRel, 1.0)).xyz;
+    vDir = aDir;
+    gl_Position = uMVP * vec4(posRel, 1.0);
+}";
+
+    private const string GpuFragmentSource = @"#version 410 core
+in vec3 vWorld;
+in vec3 vDir;
+uniform vec3 uSunDir;
+uniform float uAmbient;
+out vec4 FragColor;
+void main() {
+    // Phase 3: flat geometric normal from the screen-space derivative of the displaced position (proves
+    // the relief is real). Per-pixel normal/albedo tiles replace this in the next phase.
+    vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+    vec3 up = normalize(vDir);
+    if (dot(N, up) < 0.0) N = -N;
+    float diff = max(dot(N, normalize(uSunDir)), 0.0);
+    float slope = clamp(dot(N, up), 0.0, 1.0);           // 1 on flats → 0 on cliffs
+    vec3 col = mix(vec3(0.40, 0.38, 0.36), vec3(0.56, 0.55, 0.52), slope);
+    FragColor = vec4(col * (uAmbient + 0.95 * diff), 1.0);
+}";
+
     // Ocean swell waves (planet-local). The CPU phase base and the shader's spatial term share these,
     // so they must be the single source of truth — passed to the shader as uniforms each frame.
     private static readonly Vector3D<double>[] WaveDir =
@@ -530,7 +584,8 @@ void main() {
         for (int f = 0; f < 6; f++)
         {
             _roots[f] = MakeNode(f, 0, 0, 0, 1, 1);
-            _roots[f].Patch = GenerateSync(_roots[f]); // roots eager so render never has a hole
+            if (TerrainTuning.GpuTerrain) EnsureDrawableGpu(_roots[f], force: true);
+            else _roots[f].Patch = GenerateSync(_roots[f]); // roots eager so render never has a hole
         }
     }
 
@@ -547,7 +602,8 @@ void main() {
         for (int f = 0; f < 6; f++)
         {
             _roots[f] = MakeNode(f, 0, 0, 0, 1, 1);
-            _roots[f].Patch = GenerateSync(_roots[f]);
+            if (TerrainTuning.GpuTerrain) EnsureDrawableGpu(_roots[f], force: true);
+            else _roots[f].Patch = GenerateSync(_roots[f]);
         }
     }
 
@@ -562,6 +618,8 @@ void main() {
         Matrix4X4<float> proj = FitProjection(camera);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
         ExtractFrustum(viewProj);
+
+        if (TerrainTuning.GpuTerrain) { RenderGpu(camera, viewProj, sunDir); return; }
 
         _gl.Enable(EnableCap.DepthTest);
         _gl.DepthMask(true);
@@ -761,6 +819,255 @@ void main() {
         if (node.Patch.HasWater) _waterFrame.Add((node.Patch, rel, node.CenterLocal)); // drawn in the later water pass
     }
 
+    // ============================ GPU tile path (TerrainTuning.GpuTerrain) ============================
+
+    private void EnsureGpuResources()
+    {
+        // Tile = vertex grid res. Pool sized above a deep descent's drawn-leaf count (CPU mode reaches
+        // ~1100 drawn + frontier), so the working set fits without thrashing; AllocateLayer fails soft if
+        // it's ever exceeded. ~17² RG32F × 4096 ≈ 9 MB.
+        _tileCache ??= new TerrainTileCache(_gl, GridN + 1, 4096);
+        _tileGen ??= new TerrainTileGenerator(_gl);
+        _gpuShader ??= new Shader(_gl, GpuVertexSource, GpuFragmentSource);
+    }
+
+    /// <summary>Render the active planet via the GPU tile path. Mirrors <see cref="Process"/>'s split/
+    /// merge/cull, but each node draws a shared base-sphere mesh displaced by its GPU-generated height
+    /// tile (geomorphing fine→coarse in the vertex shader). No worker pool — tiles generate on the render
+    /// thread, budgeted per frame.</summary>
+    private void RenderGpu(Camera camera, in Matrix4X4<float> viewProj, Vector3D<float> sunDir)
+    {
+        EnsureGpuResources();
+        _gpuGenBudget = GpuTileGensPerFrame;
+
+        // Pass 1 — GENERATION: walk the tree deciding split/merge and generate any tiles needed this
+        // frame (each Generate binds the cache FBO). Generation is fully separated from drawing so it can
+        // never leak the fullscreen noise pass onto the scene. Capture the scene framebuffer + viewport
+        // first and hard-restore them once afterwards — robust regardless of per-call FBO state.
+        Span<int> sceneFbo = stackalloc int[1];
+        Span<int> sceneVp = stackalloc int[4];
+        _gl.GetInteger(GetPName.DrawFramebufferBinding, sceneFbo);
+        _gl.GetInteger(GetPName.Viewport, sceneVp);
+        foreach (QuadNode root in _roots!) EnsureSubtreeGpu(root, camera);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, (uint)sceneFbo[0]);
+        _gl.Viewport(sceneVp[0], sceneVp[1], (uint)sceneVp[2], (uint)sceneVp[3]);
+
+        // Pass 2 — DRAW: no generation, so the scene pass is never disturbed. Only resident tiles draw.
+        _gl.Enable(EnableCap.DepthTest);
+        _gl.DepthMask(true);
+        _gpuShader!.Use();
+        _gpuShader.SetVector3("uSunDir", sunDir);
+        _gpuShader.SetFloat("uAmbient", Math.Max(0f, TerrainTuning.SurfaceAmbient));
+        _gl.ActiveTexture(TextureUnit.Texture0);
+        _gl.BindTexture(TextureTarget.Texture2D, _tileCache!.HeightTexture);
+        _gpuShader.SetInt("uHeight", 0);
+
+        LeafCount = 0;
+        foreach (QuadNode root in _roots!) DrawSubtreeGpu(root, camera, viewProj);
+        _gl.Disable(EnableCap.DepthTest);
+    }
+
+    /// <summary>Standard split/merge/cull state for a node (shared by the ensure and draw passes so they
+    /// make identical decisions).</summary>
+    private void NodeState(QuadNode node, Camera camera, out Vector3D<float> rel, out bool visible,
+        out double dist, out double splitDist)
+    {
+        UniversePosition center = _body!.CurrentPosition.Translated(node.CenterLocal);
+        rel = center.ToCameraRelative(camera.Position);
+        float boundR = (float)(node.WorldSize * 0.75 + _terrain!.Amplitude + 50.0);
+        visible = IsNodeVisible(node, rel, boundR, camera);
+        dist = camera.Position.DistanceTo(center);
+        if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
+        splitDist = _lodFactor * node.WorldSize;
+    }
+
+    /// <summary>Pass 1: decide split/merge and generate the tiles the draw pass will need (no drawing).</summary>
+    private void EnsureSubtreeGpu(QuadNode node, Camera camera)
+    {
+        NodeState(node, camera, out _, out bool visible, out double dist, out double splitDist);
+        bool wantSplit = visible && node.Level < MaxLevel && dist < splitDist;
+
+        if (wantSplit)
+        {
+            node.Children ??= Split(node);
+            bool allReady = true;
+            foreach (QuadNode c in node.Children)
+                if (!EnsureDrawableGpu(c, force: false)) allReady = false;
+            if (allReady)
+            {
+                foreach (QuadNode c in node.Children) EnsureSubtreeGpu(c, camera);
+                return;
+            }
+        }
+        else if (node.Children != null && dist > splitDist * MergeHysteresis)
+        {
+            DisposeChildren(node);
+        }
+
+        if (visible) EnsureDrawableGpu(node, force: false); // the stand-in the draw pass will use
+    }
+
+    /// <summary>Pass 2: draw the patches the ensure pass settled on, using only resident tiles.</summary>
+    private void DrawSubtreeGpu(QuadNode node, Camera camera, in Matrix4X4<float> viewProj)
+    {
+        NodeState(node, camera, out Vector3D<float> rel, out bool visible, out double dist, out double splitDist);
+        bool wantSplit = visible && node.Level < MaxLevel && dist < splitDist;
+
+        if (wantSplit && node.Children != null)
+        {
+            bool allReady = true;
+            foreach (QuadNode c in node.Children)
+                if (_tileCache!.TryGetLayer(c.TileId, _renderFrame) < 0 || c.BaseVao == 0) allReady = false;
+            if (allReady)
+            {
+                foreach (QuadNode c in node.Children) DrawSubtreeGpu(c, camera, in viewProj);
+                return;
+            }
+        }
+
+        if (!visible) return;
+        float morph = (float)Smoothstep(splitDist, 2.0 * splitDist, dist);
+        RenderPatchGpu(node, rel, viewProj, morph);
+        LeafCount++;
+    }
+
+    private void RenderPatchGpu(QuadNode node, Vector3D<float> rel, in Matrix4X4<float> viewProj, float morph)
+    {
+        int layer = _tileCache!.TryGetLayer(node.TileId, _renderFrame);
+        if (layer < 0 || node.BaseVao == 0) return; // not resident this frame (budget) — parent stands in
+        Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
+        _gpuShader!.SetMatrix("uMVP", model * viewProj);
+        _gpuShader.SetMatrix("uModel", model);
+        _gpuShader.SetFloat("uMorph", morph);
+        _gpuShader.SetFloat("uSkirtDepth", (float)(node.WorldSize * 0.06 + 60.0));
+        (int tox, int toy) = _tileCache.TileOrigin(layer);
+        _gpuShader.SetVector2("uTileOrigin", new Vector2D<float>(tox, toy));
+        node.DrawMorph = morph;
+        node.DrawnFrame = _renderFrame;
+        _gl.BindVertexArray(node.BaseVao);
+        unsafe { _gl.DrawElements(PrimitiveType.Triangles, node.BaseIndexCount, DrawElementsType.UnsignedInt, null); }
+        _gl.BindVertexArray(0);
+    }
+
+    /// <summary>Ensure a node has its base mesh and a resident height tile so it can be drawn this frame.
+    /// The base mesh is built once (cheap, no noise). The tile is (re)generated when absent — always for
+    /// <paramref name="force"/> (roots), otherwise only while the per-frame generation budget lasts.
+    /// Returns true if the node is drawable now.</summary>
+    private bool EnsureDrawableGpu(QuadNode node, bool force)
+    {
+        EnsureGpuResources(); // SetBody/Rebuild can reach here before the first RenderGpu created them
+        if (node.BaseVao == 0) BuildBaseMesh(node);
+
+        int layer = _tileCache!.TryGetLayer(node.TileId, _renderFrame);
+        if (layer >= 0) return true;
+        if (!force && _gpuGenBudget <= 0) return false;
+        if (!force) _gpuGenBudget--;
+
+        layer = _tileCache.AllocateLayer(node.TileId, _renderFrame);
+        if (layer < 0) return false; // pool full of tiles needed this frame — parent stands in this frame
+        double spacing = node.WorldSize / GridN;
+        _tileGen!.Generate(_tileCache, layer, node.Face, node.U0, node.V0, node.U1, node.V1,
+            _terrain!.GpuParams(), _terrain, spacing, spacing * 2.0);
+        return true;
+    }
+
+    /// <summary>Build the patch's base-sphere mesh (no noise): per-vertex centre-relative position
+    /// <c>R·(dir−centreDir)</c> (computed in double for precision), the outward direction, the height-tile
+    /// texel, and a skirt flag. Skirts hang the patch edges down to hide T-junction cracks. Uploaded to a
+    /// per-node VAO/VBO/EBO; the GPU height tile supplies the relief via vertex texture fetch.</summary>
+    private unsafe void BuildBaseMesh(QuadNode node)
+    {
+        int n = GridN;
+        double radius = _terrain!.Radius;
+        Vector3D<double> centerLocal = node.CenterLocal;
+
+        const int stride = 9; // basePos(3) + dir(3) + texel(2) + skirt(1)
+        int gridVerts = (n + 1) * (n + 1);
+        var verts = new List<float>(gridVerts * stride * 2);
+
+        void AddVert(Vector3D<double> dir, int ti, int tj, float skirt)
+        {
+            Vector3D<double> basePos = dir * radius - centerLocal;
+            verts.Add((float)basePos.X); verts.Add((float)basePos.Y); verts.Add((float)basePos.Z);
+            verts.Add((float)dir.X); verts.Add((float)dir.Y); verts.Add((float)dir.Z);
+            verts.Add(ti); verts.Add(tj); verts.Add(skirt);
+        }
+
+        var dirGrid = new Vector3D<double>[n + 1, n + 1];
+        for (int j = 0; j <= n; j++)
+        for (int i = 0; i <= n; i++)
+        {
+            double u = node.U0 + (node.U1 - node.U0) * (i / (double)n);
+            double v = node.V0 + (node.V1 - node.V0) * (j / (double)n);
+            Vector3D<double> dir = FacePoint(node.Face, u, v);
+            dirGrid[i, j] = dir;
+            AddVert(dir, i, j, 0f);
+        }
+
+        var idx = new List<uint>(n * n * 6 + n * 24);
+        uint Vid(int i, int j) => (uint)(i + j * (n + 1));
+        for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++)
+        {
+            idx.Add(Vid(i, j)); idx.Add(Vid(i + 1, j)); idx.Add(Vid(i + 1, j + 1));
+            idx.Add(Vid(i, j)); idx.Add(Vid(i + 1, j + 1)); idx.Add(Vid(i, j + 1));
+        }
+
+        // Skirts: along each edge, a row of dropped duplicates connected to the edge vertices.
+        void Skirt(IReadOnlyList<(int i, int j)> edge)
+        {
+            int start = verts.Count / stride;
+            foreach ((int i, int j) in edge) AddVert(dirGrid[i, j], i, j, 1f); // dropped in the shader
+            for (int k = 0; k < edge.Count - 1; k++)
+            {
+                uint e0 = Vid(edge[k].i, edge[k].j), e1 = Vid(edge[k + 1].i, edge[k + 1].j);
+                uint s0 = (uint)(start + k), s1 = (uint)(start + k + 1);
+                idx.Add(e0); idx.Add(e1); idx.Add(s1);
+                idx.Add(e0); idx.Add(s1); idx.Add(s0);
+            }
+        }
+        var bottom = new List<(int, int)>(); var top = new List<(int, int)>();
+        var left = new List<(int, int)>(); var right = new List<(int, int)>();
+        for (int i = 0; i <= n; i++) { bottom.Add((i, 0)); top.Add((i, n)); }
+        for (int j = 0; j <= n; j++) { left.Add((0, j)); right.Add((n, j)); }
+        Skirt(bottom); Skirt(top); Skirt(left); Skirt(right);
+
+        float[] vArr = verts.ToArray();
+        uint[] iArr = idx.ToArray();
+
+        uint vao = _gl.GenVertexArray();
+        _gl.BindVertexArray(vao);
+        uint vbo = _gl.GenBuffer();
+        _gl.BindBuffer(BufferTargetARB.ArrayBuffer, vbo);
+        _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, vArr, BufferUsageARB.StaticDraw);
+        uint ebo = _gl.GenBuffer();
+        _gl.BindBuffer(BufferTargetARB.ElementArrayBuffer, ebo);
+        _gl.BufferData<uint>(BufferTargetARB.ElementArrayBuffer, iArr, BufferUsageARB.StaticDraw);
+
+        uint st = stride * sizeof(float);
+        _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, st, (void*)0);
+        _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, st, (void*)(3 * sizeof(float)));
+        _gl.VertexAttribPointer(2, 2, VertexAttribPointerType.Float, false, st, (void*)(6 * sizeof(float)));
+        _gl.VertexAttribPointer(3, 1, VertexAttribPointerType.Float, false, st, (void*)(8 * sizeof(float)));
+        for (uint a = 0; a < 4; a++) _gl.EnableVertexAttribArray(a);
+        _gl.BindVertexArray(0);
+
+        node.BaseVao = vao; node.BaseVbo = vbo; node.BaseEbo = ebo;
+        node.BaseIndexCount = (uint)iArr.Length;
+    }
+
+    private void DisposeGpuNode(QuadNode node)
+    {
+        if (node.BaseVao != 0)
+        {
+            _gl.DeleteVertexArray(node.BaseVao);
+            _gl.DeleteBuffer(node.BaseVbo);
+            _gl.DeleteBuffer(node.BaseEbo);
+            node.BaseVao = node.BaseVbo = node.BaseEbo = 0;
+        }
+        _tileCache?.Release(node.TileId);
+    }
+
     /// <summary>Per-patch swell phase base for wave <paramref name="i"/>: (2π/λ)·(direction·patchCentre),
     /// reduced mod 2π in double so the shader can add the small patch-relative offset without losing
     /// precision or seaming between patches.</summary>
@@ -939,6 +1246,7 @@ void main() {
             U0 = u0, V0 = v0, U1 = u1, V1 = v1,
             CenterLocal = centerDir * _terrain!.Radius,
             WorldSize = _terrain.Radius * 1.5707963 * (u1 - u0),
+            TileId = _nextTileId++, // unique key into the GPU tile cache (GPU path only)
         };
     }
 
@@ -1212,6 +1520,7 @@ void main() {
         node.Disposed = true;
         if (node.Children != null) { foreach (QuadNode c in node.Children) DisposeNode(c); node.Children = null; }
         if (node.Patch != null) { node.Patch.Dispose(_gl); node.Patch = null; PatchCount--; }
+        if (node.BaseVao != 0 || _tileCache != null) DisposeGpuNode(node); // GPU-path resources, if any
     }
 
     private void DisposeTree()
@@ -1222,6 +1531,7 @@ void main() {
         foreach (QuadNode r in _roots) DisposeNode(r);
         _roots = null;
         PatchCount = 0;
+        _tileCache?.Clear(); // every GPU layer is now free (nodes released above)
     }
 
     public void Dispose()
@@ -1232,6 +1542,9 @@ void main() {
         DisposeTree();
         _shader.Dispose();
         _waterShader.Dispose();
+        _tileCache?.Dispose();
+        _tileGen?.Dispose();
+        _gpuShader?.Dispose();
     }
 
     private sealed class QuadNode
@@ -1252,6 +1565,10 @@ void main() {
         public float[]? CollHF, CollHC;
         public float DrawMorph;  // geomorph factor this patch was last drawn with (fine→coarse blend)
         public int DrawnFrame = -1; // render-frame index this node was last drawn as a leaf
+
+        // GPU tile path: a unique cache key + the per-node base-sphere mesh (height comes from the tile).
+        public long TileId;
+        public uint BaseVao, BaseVbo, BaseEbo, BaseIndexCount;
     }
 
     // Geometry-only inputs handed to a worker (immutable once created), and the arrays it returns: the
