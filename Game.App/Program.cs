@@ -736,9 +736,9 @@ internal static class Program
             ? $"editing {_editType}-only override"
             : "editing global defaults (all types without an override)");
 
-        // Experimental GPU tile-generation terrain path (off = the proven CPU bake). Toggling rebuilds
-        // the active terrain in the chosen mode so the two can be A/B-compared.
-        if (ImGui.Checkbox("GPU terrain (experimental)", ref TerrainTuning.GpuTerrain)) terrainDirty = true;
+        // GPU tile-generation terrain path (default; uncheck = the CPU worker-pool bake fallback). Toggling
+        // rebuilds the active terrain in the chosen mode so the two can be A/B-compared.
+        if (ImGui.Checkbox("GPU terrain (default; uncheck for CPU)", ref TerrainTuning.GpuTerrain)) terrainDirty = true;
 
         // Bind each control to the override profile when enabled, else the global default.
         if (ImGui.CollapsingHeader("Terrain", ImGuiTreeNodeFlags.DefaultOpen))

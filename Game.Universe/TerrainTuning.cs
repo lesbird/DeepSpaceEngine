@@ -13,12 +13,13 @@ namespace Game.Universe;
 public static class TerrainTuning
 {
     /// <summary>
-    /// Opt-in switch to the experimental <b>GPU tile-generation</b> terrain path (procedural height/
-    /// normal/albedo baked into texture tiles on the GPU and displaced via vertex texture fetch),
-    /// instead of the default CPU worker-pool bake. Off by default so the proven CPU path stays the
-    /// fallback while the GPU path is brought up and A/B-compared. Toggling rebuilds the active terrain.
+    /// Selects the <b>GPU tile-generation</b> terrain path (procedural height/normal/albedo baked into
+    /// texture tiles on the GPU and displaced via vertex texture fetch). <b>On by default</b> — it carries
+    /// continents, mountains, eroded detail, craters/maria, water and the matching orbital relief. The CPU
+    /// worker-pool bake remains as a fallback (uncheck the HUD toggle to A/B-compare). Toggling rebuilds the
+    /// active terrain.
     /// </summary>
-    public static bool GpuTerrain = false;
+    public static bool GpuTerrain = true;
 
     /// <summary>Scales overall relief height (and <see cref="PlanetTerrain.Amplitude"/> with it).</summary>
     public static float ReliefScale = 1.0f;
@@ -83,9 +84,11 @@ public static class TerrainTuning
 
     // --- Orbital macro-relief (the fragment-shader layer that makes mountain ranges read from space) ---
     // Geometry is correctly band-limited to a smooth silhouette at orbital distance, so this relief
-    // lives entirely in the lighting normal and albedo: multi-octave noise over the planet direction,
-    // anti-aliased by the pixel footprint and faded out as the real mesh resolves the same scales up
-    // close. All three are read live by the terrain shader — no rebuild needed.
+    // lives entirely in the lighting normal and albedo. On the GPU tile path it evaluates the SAME warped
+    // ridged-mountain field the tiles bake, over just the octaves between the coarse mesh's vertex spacing
+    // and the pixel footprint — so the mountains seen from orbit are the real ones and the band fades to
+    // zero as the mesh resolves them (seamless handoff, no separate noise field). All three are read live
+    // by the terrain shader — no rebuild needed. (The CPU path still uses its own approximate noise field.)
 
     /// <summary>Strength of the orbital macro-relief normal shading (mountain ranges catching the sun
     /// from space); 0 = off.</summary>
@@ -94,6 +97,8 @@ public static class TerrainTuning
     /// <summary>How much the macro relief darkens valleys / lightens ridges in albedo (0 = none).</summary>
     public static float OrbitalReliefAlbedo = 0.2f;
 
-    /// <summary>Scales the macro-relief base frequency; &gt;1 = finer ranges. Live (no rebuild).</summary>
+    /// <summary>GPU path: scales the pixel-footprint octave reach (&gt;1 reveals the relief a touch finer/
+    /// earlier on approach; the match still holds because it only widens the band, capped at the mountain
+    /// octave budget). CPU path: scales the approximate relief's base frequency. Live (no rebuild).</summary>
     public static float OrbitalReliefScale = 1.0f;
 }

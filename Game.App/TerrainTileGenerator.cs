@@ -20,10 +20,10 @@ namespace Game.App;
 /// features; finer roughness comes from the per-pixel detail shader (the same one the CPU path uses).
 /// This is the heightmap-plus-detail-texture split SpaceEngine uses.</para>
 ///
-/// <para><b>Scope (first cut).</b> Continents (fBm) + ridged mountains on the highland mask + detail
-/// (fBm). Domain warp, erosion, craters, micro-relief and strata are not ported yet — the silhouette is
-/// right; full parity with <see cref="PlanetTerrain.HeightAt"/> follows. The GPU uses its own GLSL hash,
-/// so the look has the same character as the CPU terrain rather than matching it bit-for-bit.</para>
+/// <para><b>Scope.</b> Continents (fBm) + ridged mountains on the highland mask + domain warp + regional
+/// ruggedness + eroded detail (slope-damped fBm) + impact craters. Micro-relief and strata are not ported.
+/// The GPU uses its own GLSL hash, so the look has the same character as the CPU terrain rather than
+/// matching it bit-for-bit.</para>
 /// </summary>
 public sealed class TerrainTileGenerator : IDisposable
 {
@@ -31,6 +31,127 @@ public sealed class TerrainTileGenerator : IDisposable
     /// ~2^23 / 10 the fractional cell position is lost. Octaves past this are clamped off (and covered by
     /// the per-pixel detail shader instead).</summary>
     public const double FloatSafeFreq = 700_000.0;
+
+    /// <summary>
+    /// The terrain noise/field GLSL — hash, value noise, fBm, ridged multifractal, regional ruggedness,
+    /// domain warp, and the LOD octave count — exposed as a SHARED module so the render shader can evaluate
+    /// the EXACT field this generator bakes (the per-pixel orbital macro-relief that matches the real
+    /// mountains). The functions take an explicit <c>seed</c> (vec3) instead of reading a uniform, so they
+    /// drop into any shader; <c>tf</c>-prefixed to avoid clashing with a host shader's own helpers. The math
+    /// is identical to the inline functions in <see cref="FragmentSource"/> and the C# mirror in
+    /// <c>PlanetTerrain.GpuHeightAt</c> — <b>keep all three in sync</b>.
+    /// </summary>
+    public const string FieldGlsl = @"
+float tfHash(vec3 c, vec3 seed) {
+    c = mod(c, 8192.0) + seed;
+    c = fract(c * 0.1031);
+    c += dot(c, c.yzx + 33.33);
+    return fract((c.x + c.y) * c.z);
+}
+float tfVnoise(vec3 p, vec3 seed) {
+    vec3 c = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = tfHash(c, seed),               n100 = tfHash(c + vec3(1,0,0), seed);
+    float n010 = tfHash(c + vec3(0,1,0), seed), n110 = tfHash(c + vec3(1,1,0), seed);
+    float n001 = tfHash(c + vec3(0,0,1), seed), n101 = tfHash(c + vec3(1,0,1), seed);
+    float n011 = tfHash(c + vec3(0,1,1), seed), n111 = tfHash(c + vec3(1,1,1), seed);
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z) * 2.0 - 1.0;
+}
+float tfFbm(vec3 dir, float freq, float oct, float gain, vec3 seed) {
+    if (oct <= 0.0) return 0.0;
+    int full = int(floor(oct));
+    float frac = oct - float(full);
+    float sum = 0.0, amp = 1.0, f = freq, norm = 0.0;
+    for (int i = 0; i < 32; i++) {
+        if (i >= full) break;
+        sum += amp * tfVnoise(dir * f, seed); norm += amp; amp *= gain; f *= 2.0;
+    }
+    if (frac > 0.0) { sum += amp * frac * tfVnoise(dir * f, seed); norm += amp * frac; }
+    return norm > 0.0 ? sum / norm : 0.0;
+}
+float tfRidged(vec3 dir, float freq, float oct, float gain, vec3 seed) {
+    if (oct <= 0.0) return 0.0;
+    int full = int(floor(oct));
+    float frac = oct - float(full);
+    float sum = 0.0, amp = 0.5, f = freq, prev = 1.0, norm = 0.0;
+    for (int i = 0; i < 32; i++) {
+        if (i >= full) break;
+        float n = 1.0 - abs(tfVnoise(dir * f, seed)); n *= n; n *= prev;
+        sum += n * amp; norm += amp; prev = n; amp *= gain; f *= 2.0;
+    }
+    if (frac > 0.0) { float n = 1.0 - abs(tfVnoise(dir * f, seed)); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
+    return norm > 0.0 ? clamp(sum / norm, 0.0, 1.0) : 0.0;
+}
+float tfRuggedness(vec3 dir, float rfreq, float rlo, float rhi, vec3 seed) {
+    float r = tfFbm(dir + vec3(53.1, 12.7, 91.3), rfreq, 4.0, 0.5, seed);
+    return smoothstep(rlo, rhi, 0.5 + 0.5 * r);
+}
+vec3 tfDomainWarp(vec3 dir, float wfreq, float wstr, vec3 seed) {
+    float wx = tfFbm(dir, wfreq, 3.0, 0.5, seed);
+    float wy = tfFbm(dir + vec3(31.4, 11.7, 5.2), wfreq, 3.0, 0.5, seed);
+    float wz = tfFbm(dir + vec3(-7.1, 23.9, 17.3), wfreq, 3.0, 0.5, seed);
+    return vec3(wx, wy, wz) * wstr;
+}
+// Fractional fBm/ridged octave count a vertex spacing resolves, clamped to the layer budget AND the
+// float-safe ceiling — mirrors PlanetTerrain.OctavesFor + TerrainTileGenerator.OctClamp.
+float tfOctFor(float baseFreq, float spacingM, float maxOct, float radius) {
+    if (spacingM <= 0.0) return maxOct;
+    float maxFreq = 3.14159265 * radius / spacingM;
+    float lod = (maxFreq <= baseFreq) ? 1.0 : clamp(log2(maxFreq / baseFreq) + 1.0, 1.0, maxOct);
+    float safe = floor(log2(700000.0 / max(1.0, baseFreq))) + 1.0;
+    return max(0.0, min(lod, safe));
+}
+// Impact-crater cascade — same field as the generator's craterField, returning BOTH the value (.w, in
+// ≈[-1, rim]) and its analytic gradient w.r.t. dir (.xyz) in a SINGLE 3×3×3 pass. The orbital relief needs
+// the gradient for its normal; computing it analytically here (each bowl/rim is an analytic function of the
+// distance to its crater centre) avoids the 3-4 extra full-cascade taps a finite difference would cost —
+// the cascade is the dominant per-pixel cost, so one pass instead of four is the difference between
+// interactive and a slideshow. The min/max combiner gives a continuous value with mild gradient kinks where
+// the dominant crater switches — acceptable for a lighting hint.
+vec4 tfCraterFieldN(vec3 dir, float baseFreq, float octCount, float density, vec3 seed) {
+    if (octCount <= 0.0) return vec4(0.0);
+    const float wnorm = 2.6094;
+    float sumV = 0.0; vec3 sumG = vec3(0.0);
+    float freq = baseFreq, weight = 1.0;
+    for (int o = 0; o < 10; o++) {
+        float ofade = clamp(octCount - float(o), 0.0, 1.0);
+        if (ofade > 0.0) {
+            vec3 p = dir * freq;
+            vec3 ip = floor(p);
+            float salt = float(o) * 17.0;
+            float minBowl = 0.0, maxRim = 0.0;
+            vec3 minBowlG = vec3(0.0), maxRimG = vec3(0.0);  // gradients w.r.t. p
+            for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                vec3 c = ip + vec3(float(dx), float(dy), float(dz));
+                float ex = tfHash(c + vec3(salt), seed);
+                if (ex > density) continue;
+                vec3 jit = vec3(tfHash(c + vec3(salt + 1.7), seed), tfHash(c + vec3(salt + 9.1), seed), tfHash(c + vec3(salt + 4.3), seed));
+                float radius = 0.22 + 0.28 * fract(ex * 7.3 + 0.19);
+                vec3 d = p - (c + jit);
+                float dist = length(d);
+                float t = dist / radius;
+                if (t >= 1.5) continue;
+                vec3 dtdp = d / (dist * radius + 1e-9);           // dt/dp
+                float bowl = 0.0, dBowl = 0.0;                    // bowl(t) and d(bowl)/dt
+                if (t < 0.85) { float u = t / 0.85; bowl = u * u * (3.0 - 2.0 * u) - 1.0; dBowl = 6.0 * u * (1.0 - u) / 0.85; }
+                float e = (t - 0.95) / 0.12;
+                float rim = 0.28 * exp(-0.5 * e * e);
+                float dRim = rim * (-e) / 0.12;                   // d(rim)/dt
+                if (bowl < minBowl) { minBowl = bowl; minBowlG = dBowl * dtdp; }
+                if (rim > maxRim)   { maxRim = rim;   maxRimG = dRim * dtdp; }
+            }
+            sumV += weight * ofade * (minBowl + maxRim);
+            sumG += weight * ofade * (minBowlG + maxRimG) * freq; // d/d(dir) = d/dp · (dp/ddir = freq)
+        }
+        freq *= 1.9; weight *= 0.62;
+    }
+    return vec4(sumG / wnorm, sumV / wnorm);
+}
+";
 
     private const string VertexSource = @"#version 410 core
 out vec2 vUV;
@@ -56,6 +177,8 @@ uniform float uTexelN;     // texels per tile edge — snap each texel to its me
 uniform float uWarpFreq, uWarpStrength;            // domain warp (bends the mountain ranges)
 uniform float uRuggedFreq, uRuggedLo, uRuggedHi;   // regional ruggedness mask: flat plains vs rugged highlands
 uniform float uDetailFloor;                        // min detail roughness in the flattest regions
+uniform float uCraterWeight, uCraterDensity, uCraterFreq; // impact craters (0 weight = none)
+uniform float uCraterOctFine, uCraterOctCoarse;    // crater size classes resolved at each band-limit
 layout(location = 0) out vec4 oHeight;
 
 const int MaxOct = 32;
@@ -107,6 +230,53 @@ float fbm(vec3 dir, float freq, float oct, float gain) {
     return norm > 0.0 ? sum / norm : 0.0;
 }
 
+// Value noise in [-1,1] (.x) plus its analytic gradient w.r.t. the input (.yzw), for the erosion damping.
+// Mirrors PlanetTerrain Noise.ValueD: trilinear of the 8 corner hashes, gradient via the smoothstep
+// derivative (6t(1-t)). The value is scaled to [-1,1], so the gradient carries the matching factor 2.
+vec4 vnoiseD(vec3 p) {
+    vec3 c = floor(p), ff = fract(p);
+    vec3 u = ff * ff * (3.0 - 2.0 * ff);
+    vec3 du = 6.0 * ff * (1.0 - ff);
+    float n000 = hash(c),               n100 = hash(c + vec3(1,0,0));
+    float n010 = hash(c + vec3(0,1,0)), n110 = hash(c + vec3(1,1,0));
+    float n001 = hash(c + vec3(0,0,1)), n101 = hash(c + vec3(1,0,1));
+    float n011 = hash(c + vec3(0,1,1)), n111 = hash(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, u.x), x10 = mix(n010, n110, u.x);
+    float x01 = mix(n001, n101, u.x), x11 = mix(n011, n111, u.x);
+    float y0 = mix(x00, x10, u.y), y1 = mix(x01, x11, u.y);
+    float val = mix(y0, y1, u.z);
+    float dfu = mix(mix(n100 - n000, n110 - n010, u.y), mix(n101 - n001, n111 - n011, u.y), u.z);
+    float dfv = mix(x10 - x00, x11 - x01, u.z);
+    float dfw = y1 - y0;
+    return vec4(val * 2.0 - 1.0, 2.0 * vec3(dfu * du.x, dfv * du.y, dfw * du.z));
+}
+
+// Erosive fBm in ~[-1,1]: ordinary fBm, but each octave is damped by 1/(1 + k·|Σgrad|²) — so detail is
+// suppressed where the accumulated slope is already steep, carving smooth valley floors with roughness
+// riding the shoulders/ridges (a cheap erosion model). Mirrors PlanetTerrain Noise.ErodedFbm (k = 1.4).
+float erodedFbm(vec3 dir, float freq, float oct, float gain) {
+    if (oct <= 0.0) return 0.0;
+    const float k = 1.4;
+    int full = int(floor(oct));
+    float frac = oct - float(full);
+    float sum = 0.0, amp = 1.0, f = freq, norm = 0.0;
+    vec3 gradSum = vec3(0.0);
+    for (int i = 0; i < MaxOct; i++) {
+        if (i >= full) break;
+        vec4 ng = vnoiseD(dir * f);
+        gradSum += ng.yzw;
+        float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
+        sum += amp * ng.x * damp; norm += amp; amp *= gain; f *= 2.0;
+    }
+    if (frac > 0.0) {
+        vec4 ng = vnoiseD(dir * f);
+        gradSum += ng.yzw * frac;
+        float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
+        sum += amp * frac * ng.x * damp; norm += amp * frac;
+    }
+    return norm > 0.0 ? sum / norm : 0.0;
+}
+
 // Fractional-octave ridged multifractal in [0,1] (creases at zero crossings, detail riding ridges).
 float ridged(vec3 dir, float freq, float oct, float gain) {
     if (oct <= 0.0) return 0.0;
@@ -135,13 +305,51 @@ vec3 domainWarp(vec3 dir) {
     return vec3(wx, wy, wz) * uWarpStrength;
 }
 
+// Impact-crater cascade in ≈[-1, rim]: 10 size classes of a 3×3×3 cellular bowl+rim field (one crater
+// per cell, combined by deepest-bowl / highest-rim), the top class faded in by octCount's fraction so the
+// craters geomorph as the tile resolves finer. Normalised by the FULL cascade weight (so a coarse tile
+// reads a shallow basin and a deep tile the full pit), matching the CPU CraterField.
+float craterField(vec3 dir, float baseFreq, float octCount, float density) {
+    if (octCount <= 0.0) return 0.0;
+    const float wnorm = 2.6094;  // Σ_{o=0..9} 0.62^o
+    float sum = 0.0, freq = baseFreq, weight = 1.0;
+    for (int o = 0; o < 10; o++) {
+        float ofade = clamp(octCount - float(o), 0.0, 1.0);
+        if (ofade > 0.0) {
+            vec3 p = dir * freq;
+            vec3 ip = floor(p);
+            float salt = float(o) * 17.0;
+            float minBowl = 0.0, maxRim = 0.0;
+            for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                vec3 c = ip + vec3(float(dx), float(dy), float(dz));
+                float ex = hash(c + vec3(salt));
+                if (ex > density) continue;                  // only some cells bear a crater
+                vec3 jit = vec3(hash(c + vec3(salt + 1.7)), hash(c + vec3(salt + 9.1)), hash(c + vec3(salt + 4.3)));
+                float radius = 0.22 + 0.28 * fract(ex * 7.3 + 0.19);
+                float t = length(p - (c + jit)) / radius;
+                if (t >= 1.5) continue;
+                float bowl = -(1.0 - smoothstep(0.0, 0.85, min(t, 1.0)));  // depressed floor
+                float e = (t - 0.95) / 0.12;
+                float rim = 0.28 * exp(-0.5 * e * e);                       // raised rim ring
+                minBowl = min(minBowl, bowl);
+                maxRim = max(maxRim, rim);
+            }
+            sum += weight * ofade * (minBowl + maxRim);
+        }
+        freq *= 1.9; weight *= 0.62;
+    }
+    return sum / wnorm;
+}
+
 float shape(vec3 dir, vec3 oct) {
     float cont = fbm(dir, uFreq.x, oct.x, uGain.x);     // broad continents / basins
     float rugged = ruggedness(dir);                     // where rugged terrain belongs
     float mask = smoothstep(-0.2, 0.4, cont);           // highlands carry the mountains
     vec3 warped = dir + domainWarp(dir);                // bend the ranges
     float mtn  = ridged(warped, uFreq.y, oct.y, uGain.y);
-    float det  = fbm(dir, uFreq.z, oct.z, uGain.z);      // high-frequency roughness
+    float det  = erodedFbm(dir, uFreq.z, oct.z, uGain.z); // high-frequency roughness, slope-damped (eroded)
     float detailGate = uDetailFloor + (1.0 - uDetailFloor) * rugged; // calmer detail on plains
     return uWeight.x * cont + uWeight.y * mtn * mask * rugged + uWeight.z * det * detailGate;
 }
@@ -157,9 +365,17 @@ void main() {
     float u = mix(uRect.x, uRect.z, (gi - 1.0) / gridN);
     float v = mix(uRect.y, uRect.w, (gj - 1.0) / gridN);
     vec3 dir = facePoint(uFace, u, v);
-    float hFine   = uScale * shape(dir, uOctFine);
-    float hCoarse = uScale * shape(dir, uOctCoarse);
-    oHeight = vec4(hFine, hCoarse, 0.0, 1.0);
+    // Craters are baked geometry (added to the height) AND carried in B/A so the render shader can tint
+    // crater floors/rims without re-evaluating the field. craterFine geomorphs to craterCoarse via the
+    // same morph the heights use; weight 0 on worlds without craters leaves B/A at zero (no tint).
+    float craterFine = 0.0, craterCoarse = 0.0;
+    if (uCraterWeight > 0.0) {
+        craterFine   = craterField(dir, uCraterFreq, uCraterOctFine,   uCraterDensity);
+        craterCoarse = craterField(dir, uCraterFreq, uCraterOctCoarse, uCraterDensity);
+    }
+    float hFine   = uScale * (shape(dir, uOctFine)   + uCraterWeight * craterFine);
+    float hCoarse = uScale * (shape(dir, uOctCoarse) + uCraterWeight * craterCoarse);
+    oHeight = vec4(hFine, hCoarse, craterFine, craterCoarse);
 }";
 
     private readonly GL _gl;
@@ -208,6 +424,11 @@ void main() {
         _shader.SetFloat("uRuggedLo", (float)p.RuggedLo);
         _shader.SetFloat("uRuggedHi", (float)p.RuggedHi);
         _shader.SetFloat("uDetailFloor", (float)p.DetailFloor);
+        _shader.SetFloat("uCraterWeight", (float)p.CraterWeight);
+        _shader.SetFloat("uCraterDensity", (float)p.CraterDensity);
+        _shader.SetFloat("uCraterFreq", (float)p.CraterFreq);
+        _shader.SetFloat("uCraterOctFine", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingFine) : 0.0));
+        _shader.SetFloat("uCraterOctCoarse", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingCoarse) : 0.0));
 
         // Render the noise into the tile, then restore exactly the framebuffer + viewport that were bound
         // (the scene FBO mid-render): generation can run inside the terrain pass, so it must leave no trace.

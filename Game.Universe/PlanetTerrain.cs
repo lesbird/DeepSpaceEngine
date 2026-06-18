@@ -421,6 +421,12 @@ public sealed class PlanetTerrain
         public double RuggedFreq, RuggedLo, RuggedHi, DetailFloor; // regional ruggedness mask
         public int MaxContinentOctaves, MaxMountainOctaves, MaxDetailOctaves;
 
+        // Impact craters (airless worlds): a cellular bowl+rim cascade baked into the height tile, plus
+        // crater-floor/rim and maria albedo. CraterFreq is the coarsest (basin) frequency; the cascade
+        // climbs from there. Weight 0 → the world has no craters (the GPU path skips the whole field).
+        public double CraterWeight, CraterDensity, CraterFreq;
+        public float IsCratered;             // 1 = crater albedo + maria apply (genuinely cratered world)
+
         // Biome / colour (for the per-pixel albedo in the render shader, mirroring ColorAt/LandBand).
         public Vector3D<float> BaseColor, Rock, Snow, Cliff, Lowland;
         public float SnowLine, CliffThreshold, CliffStrength, SurfaceTempK;
@@ -444,6 +450,10 @@ public sealed class PlanetTerrain
             Scale = _baseAmplitude * PlanetTuning.EffectiveRelief(Type),
             MaxContinentOctaves = MaxContinentOctaves, MaxMountainOctaves = MaxMountainOctaves,
             MaxDetailOctaves = MaxDetailOctaves,
+            CraterWeight = _craterWeight * PlanetTuning.EffectiveCraterScale(Type),
+            CraterDensity = Math.Clamp(_craterDensity * PlanetTuning.EffectiveCraterDensity(Type), 0.0, 1.0),
+            CraterFreq = _craterFreqA * 0.5 * fs,
+            IsCratered = IsCratered ? 1f : 0f,
             BaseColor = _baseColor, Rock = PlanetTuning.EffectiveRock(Type), Snow = PlanetTuning.EffectiveSnow(Type),
             Cliff = PlanetTuning.EffectiveCliff(Type), Lowland = PlanetTuning.EffectiveLowland(Type),
             SnowLine = PlanetTuning.EffectiveSnowLine(Type),
@@ -459,6 +469,23 @@ public sealed class PlanetTerrain
     /// returns the full budget.</summary>
     public double OctavesForSpacing(double baseFreq, double sampleSpacing, int max)
         => OctavesFor(baseFreq, sampleSpacing, max);
+
+    /// <summary>Fractional crater-octave count the GPU generator should bake at this vertex spacing: the
+    /// sum of each crater size class's smooth LOD gate (coarse basins open first, finer pits fade in on
+    /// approach), capped at <see cref="CraterOctaves"/>. The shader loops 10 octaves and fades the top
+    /// one by the fraction, so coarse tiles carry shallow basins and deep tiles the full cascade — the
+    /// crater geomorph. Mirrors <see cref="CraterField"/>'s per-octave <see cref="LayerGate"/>.</summary>
+    public double CraterOctavesForSpacing(double sampleSpacing)
+    {
+        double freq = _craterFreqA * 0.5 * PlanetTuning.EffectiveFrequency(Type);
+        double oct = 0.0;
+        for (int o = 0; o < CraterOctaves; o++)
+        {
+            oct += LayerGate(freq, sampleSpacing);
+            freq *= CraterLacunarity;
+        }
+        return oct;
+    }
 
     // --- GPU-path height mirror -----------------------------------------------------------------
     // A CPU re-implementation of the GPU tile generator's height (TerrainTileGenerator's GLSL), so the
@@ -487,11 +514,63 @@ public sealed class PlanetTerrain
         float mask = SmoothstepF(-0.2f, 0.4f, cont);
         Vector3D<float> warped = dir + GpuDomainWarp(dir, p, seed);
         float mtn = GpuRidged(warped, (float)p.MountainFreq, om, (float)p.MountainGain, seed);
-        float det = GpuFbm(dir, (float)p.DetailFreq, od, (float)p.DetailGain, seed);
+        float det = GpuErodedFbm(dir, (float)p.DetailFreq, od, (float)p.DetailGain, seed);
         float detailGate = (float)p.DetailFloor + (1f - (float)p.DetailFloor) * rugged;
         float shape = (float)p.ContinentWeight * cont + (float)p.MountainWeight * mtn * mask * rugged
                     + (float)p.DetailWeight * det * detailGate;
+        if (p.CraterWeight > 0.0)
+        {
+            float crater = GpuCraterField(dir, (float)p.CraterFreq,
+                (float)CraterOctavesForSpacing(sampleSpacing), (float)p.CraterDensity, seed);
+            shape += (float)p.CraterWeight * crater;
+        }
         return p.Scale * shape;
+    }
+
+    /// <summary>Float mirror of the GPU generator's GLSL crater cascade (see <c>TerrainTileGenerator</c>):
+    /// a 3×3×3 cellular bowl+rim field over 10 size classes, the top one faded by <paramref name="octCount"/>'s
+    /// fraction, normalised by the full-cascade weight sum. In ≈[-1, rim]. Lets the rover/near-plane know the
+    /// real baked crater surface.</summary>
+    private static float GpuCraterField(Vector3D<float> dir, float baseFreq, float octCount, float density, Vector3D<float> seed)
+    {
+        if (octCount <= 0f) return 0f;
+        const float wnorm = 2.6094f; // Σ_{o=0..9} 0.62^o — the full cascade weight, so coarse tiles read shallow
+        float sum = 0f, freq = baseFreq, weight = 1f;
+        for (int o = 0; o < 10; o++)
+        {
+            float ofade = Math.Clamp(octCount - o, 0f, 1f);
+            if (ofade > 0f)
+            {
+                Vector3D<float> p = dir * freq;
+                var ip = new Vector3D<float>(MathF.Floor(p.X), MathF.Floor(p.Y), MathF.Floor(p.Z));
+                float salt = o * 17f;
+                float minBowl = 0f, maxRim = 0f;
+                for (int dz = -1; dz <= 1; dz++)
+                for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    var c = ip + new Vector3D<float>(dx, dy, dz);
+                    float ex = GpuHash13(c + new Vector3D<float>(salt, salt, salt), seed);
+                    if (ex > density) continue;
+                    var jit = new Vector3D<float>(
+                        GpuHash13(c + new Vector3D<float>(salt + 1.7f, salt + 1.7f, salt + 1.7f), seed),
+                        GpuHash13(c + new Vector3D<float>(salt + 9.1f, salt + 9.1f, salt + 9.1f), seed),
+                        GpuHash13(c + new Vector3D<float>(salt + 4.3f, salt + 4.3f, salt + 4.3f), seed));
+                    float radius = 0.22f + 0.28f * GpuFractF(ex * 7.3f + 0.19f);
+                    Vector3D<float> e = p - (c + jit);
+                    float t = MathF.Sqrt(e.X * e.X + e.Y * e.Y + e.Z * e.Z) / radius;
+                    if (t >= 1.5f) continue;
+                    float bowl = -(1f - SmoothstepF(0f, 0.85f, MathF.Min(t, 1f)));
+                    float er = (t - 0.95f) / 0.12f;
+                    float rim = 0.28f * MathF.Exp(-0.5f * er * er);
+                    minBowl = MathF.Min(minBowl, bowl);
+                    maxRim = MathF.Max(maxRim, rim);
+                }
+                sum += weight * ofade * (minBowl + maxRim);
+            }
+            freq *= 1.9f; weight *= 0.62f;
+        }
+        return sum / wnorm;
     }
 
     private double GpuOctClamp(double baseFreq, double spacing, int max)
@@ -541,6 +620,56 @@ public sealed class PlanetTerrain
         float frac = oct - full, sum = 0, amp = 1, f = freq, norm = 0;
         for (int i = 0; i < 32 && i < full; i++) { sum += amp * (GpuVNoise(dir * f, seed) * 2f - 1f); norm += amp; amp *= gain; f *= 2f; }
         if (frac > 0f) { sum += amp * frac * (GpuVNoise(dir * f, seed) * 2f - 1f); norm += amp * frac; }
+        return norm > 0f ? sum / norm : 0f;
+    }
+
+    /// <summary>Value noise in [-1,1] plus its analytic gradient (mirrors the gen shader's <c>vnoiseD</c>):
+    /// trilinear of the 8 corner hashes, gradient via the smoothstep derivative. Value + gradient both
+    /// scaled to the [-1,1] range (factor 2).</summary>
+    private static (float val, Vector3D<float> grad) GpuVNoiseD(Vector3D<float> q, Vector3D<float> seed)
+    {
+        var c = new Vector3D<float>(MathF.Floor(q.X), MathF.Floor(q.Y), MathF.Floor(q.Z));
+        var ff = q - c;
+        var u = new Vector3D<float>(ff.X * ff.X * (3f - 2f * ff.X), ff.Y * ff.Y * (3f - 2f * ff.Y), ff.Z * ff.Z * (3f - 2f * ff.Z));
+        var du = new Vector3D<float>(6f * ff.X * (1f - ff.X), 6f * ff.Y * (1f - ff.Y), 6f * ff.Z * (1f - ff.Z));
+        float n000 = GpuHash13(c, seed), n100 = GpuHash13(c + new Vector3D<float>(1, 0, 0), seed);
+        float n010 = GpuHash13(c + new Vector3D<float>(0, 1, 0), seed), n110 = GpuHash13(c + new Vector3D<float>(1, 1, 0), seed);
+        float n001 = GpuHash13(c + new Vector3D<float>(0, 0, 1), seed), n101 = GpuHash13(c + new Vector3D<float>(1, 0, 1), seed);
+        float n011 = GpuHash13(c + new Vector3D<float>(0, 1, 1), seed), n111 = GpuHash13(c + new Vector3D<float>(1, 1, 1), seed);
+        float x00 = LerpF(n000, n100, u.X), x10 = LerpF(n010, n110, u.X);
+        float x01 = LerpF(n001, n101, u.X), x11 = LerpF(n011, n111, u.X);
+        float y0 = LerpF(x00, x10, u.Y), y1 = LerpF(x01, x11, u.Y);
+        float val = LerpF(y0, y1, u.Z);
+        float dfu = LerpF(LerpF(n100 - n000, n110 - n010, u.Y), LerpF(n101 - n001, n111 - n011, u.Y), u.Z);
+        float dfv = LerpF(x10 - x00, x11 - x01, u.Z);
+        float dfw = y1 - y0;
+        return (val * 2f - 1f, new Vector3D<float>(2f * dfu * du.X, 2f * dfv * du.Y, 2f * dfw * du.Z));
+    }
+
+    /// <summary>Erosive fBm in ~[-1,1], each octave damped by 1/(1+k·|Σgrad|²) so detail fades on steep
+    /// slopes — carved valley floors, roughness on ridges. Mirrors the gen shader's <c>erodedFbm</c> and
+    /// PlanetTerrain Noise.ErodedFbm (k = 1.4).</summary>
+    private static float GpuErodedFbm(Vector3D<float> dir, float freq, float oct, float gain, Vector3D<float> seed)
+    {
+        if (oct <= 0f) return 0f;
+        const float k = 1.4f;
+        int full = (int)MathF.Floor(oct);
+        float frac = oct - full, sum = 0, amp = 1, f = freq, norm = 0;
+        var gradSum = new Vector3D<float>(0, 0, 0);
+        for (int i = 0; i < 32 && i < full; i++)
+        {
+            (float n, Vector3D<float> g) = GpuVNoiseD(dir * f, seed);
+            gradSum += g;
+            float damp = 1f / (1f + k * Vector3D.Dot(gradSum, gradSum));
+            sum += amp * n * damp; norm += amp; amp *= gain; f *= 2f;
+        }
+        if (frac > 0f)
+        {
+            (float n, Vector3D<float> g) = GpuVNoiseD(dir * f, seed);
+            gradSum += g * frac;
+            float damp = 1f / (1f + k * Vector3D.Dot(gradSum, gradSum));
+            sum += amp * frac * n * damp; norm += amp * frac;
+        }
         return norm > 0f ? sum / norm : 0f;
     }
 

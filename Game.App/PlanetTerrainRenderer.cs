@@ -427,6 +427,10 @@ void main() {
     private TerrainTileCache? _tileCache;
     private TerrainTileGenerator? _tileGen;
     private Shader? _gpuShader;
+    private Shader? _gpuWaterShader;
+    // Ocean leaves collected during the GPU draw pass, drawn in a later translucent water pass (like the
+    // CPU _waterFrame). Each carries the node (for its tile/morph/phase) and its camera-relative offset.
+    private readonly List<(QuadNode node, Vector3D<float> rel)> _gpuWaterFrame = new();
     private long _nextTileId = 1;
     private int _gpuGenBudget;
 
@@ -460,6 +464,7 @@ out vec3 vWorld;
 out vec3 vDir;
 out vec3 vNormal;           // smooth surface normal from the height field (planet-local)
 out float vElev;            // morphed height (for albedo)
+out float vCrater;          // morphed crater value (B/A of the tile) for crater-floor/rim albedo
 out vec3 vNoiseCoord;       // planet-stable, precise fractional noise coordinate for the detail layer
 
 vec3 facePoint(int f, float u, float v) {
@@ -478,7 +483,9 @@ float H(ivec2 t) { vec2 hfc = texelFetch(uHeight, t, 0).rg; return mix(hfc.x, hf
 
 void main() {
     ivec2 o = ivec2(int(uTileOrigin.x), int(uTileOrigin.y)) + ivec2(int(aTexel.x), int(aTexel.y));
-    float h   = H(o);
+    vec4 hba  = texelFetch(uHeight, o, 0);
+    float h   = mix(hba.r, hba.g, uMorph);
+    vCrater   = mix(hba.b, hba.a, uMorph);                      // crater value, geomorphed like the height
     float hu1 = H(o + ivec2(1, 0)), hu0 = H(o - ivec2(1, 0));   // guard ring makes these valid at edges
     float hv1 = H(o + ivec2(0, 1)), hv0 = H(o - ivec2(0, 1));
 
@@ -504,15 +511,38 @@ void main() {
     gl_Position = uMVP * vec4(posRel, 1.0);
 }";
 
-    private const string GpuFragmentSource = @"#version 410 core
+    // Composed at startup: header (ins/uniforms/detail helpers) + the shared terrain field module
+    // (TerrainTileGenerator.FieldGlsl, so the orbital relief evaluates the EXACT baked field) + body.
+    private static readonly string GpuFragmentSource = GpuFragmentHeaderSrc + TerrainTileGenerator.FieldGlsl + GpuFragmentBodySrc;
+
+    private const string GpuFragmentHeaderSrc = @"#version 410 core
 in vec3 vWorld;
 in vec3 vDir;
 in vec3 vNormal;
 in float vElev;
+in float vCrater;
 in vec3 vNoiseCoord;
 uniform vec3 uSunDir;
 uniform float uAmbient;
 uniform float uScale;            // relief amplitude (metres), to normalise elevation for the albedo ramp
+// Airless regolith albedo (cratered worlds): crater-floor/rim tint from the baked crater value, plus
+// low-frequency maria provinces. Live (per-pixel) — no rebuild needed unlike the CPU path.
+uniform float uIsCratered;       // 1 = apply crater/maria albedo
+uniform float uCraterAlbedo;     // crater floor-dark / rim-bright strength
+uniform float uMariaStrength;    // basaltic-plains darkening strength
+uniform float uMariaFreq;        // low maria province frequency (continentFreq * 0.6)
+// Orbital macro-relief: the SAME warped ridged-mountain field the gen shader bakes, evaluated per-pixel
+// over the octaves the coarse far mesh can't carry (between its vertex spacing and the pixel footprint) —
+// so the mountains seen from orbit are the real ones, and the band fades to zero as the mesh resolves them.
+uniform vec3  uSeedR;            // gen seed offset (same as the tile generator's uSeed)
+uniform float uReliefStrength;   // normal-bump strength (0 = off)
+uniform float uReliefAlbedo;     // valley-dark / ridge-light albedo amount
+uniform float uReliefScale;      // pixel-footprint octave reach (>1 shows relief a touch finer/earlier)
+uniform float uContFreqR, uContGainR;  uniform float uContMaxOctR;
+uniform float uMtnFreqR, uMtnWeightR, uMtnGainR; uniform float uMtnMaxOctR;
+uniform float uWarpFreqR, uWarpStrR;
+uniform float uRuggedFreqR, uRuggedLoR, uRuggedHiR;
+uniform float uCraterFreqR, uCraterWeightR, uCraterDensityR; // crater relief (airless worlds; uIsCratered gates)
 // Biome / colour (per-pixel port of ColorAt / LandBand).
 uniform vec3 uBaseColor, uRock, uSnow, uCliff, uLowland;
 uniform float uSnowLine, uCliffThreshold, uCliffStrength, uSurfaceTempK, uHasLife;
@@ -528,6 +558,8 @@ uniform float uSurfaceSpecular;  // close-up specular highlight strength
 uniform float uVertexSpacingDir; // this patch's vertex spacing / planet radius
 uniform float uPlanetRadius;     // metres
 uniform float uGeomDetailFloor;  // finest spacing the baked geometry resolves (metres)
+uniform float uReliefMeshK;      // lodFactor * GridN — converts camera distance → effective mesh spacing
+uniform float uPixelArc;         // radians per pixel (vertical FOV / viewport height) — fwidth-free footprint
 out vec4 FragColor;
 
 float hash13(vec3 p) {
@@ -576,7 +608,9 @@ float fbm3(vec3 p, float freq) {
     for (int i = 0; i < 4; i++) { s += a * (vnoise3(p * f) * 2.0 - 1.0); n += a; a *= 0.5; f *= 2.0; }
     return s / n;
 }
+";
 
+    private const string GpuFragmentBodySrc = @"
 // Climate + elevation + slope albedo (per-pixel port of PlanetTerrain.LandBand / BiomeGround).
 vec3 biomeColor(vec3 dir, float elevM, float slope) {
     float tBase = clamp((uSurfaceTempK - 215.0) / 105.0, 0.0, 1.0);
@@ -613,6 +647,24 @@ void main() {
     float slope = clamp(dot(N, up), 0.0, 1.0);               // 1 on flats → 0 on cliffs
     vec3 col = biomeColor(up, vElev, slope);
 
+    // Airless regolith: dark dust-pooled crater floors + bright rims/ejecta (from the baked crater value),
+    // then low-frequency maria provinces (darker basaltic plains that survive at coarse far LOD). Port of
+    // PlanetTerrain.RegolithAlbedo; the crater geometry itself is already baked into the mesh.
+    if (uIsCratered > 0.5) {
+        if (uCraterAlbedo > 0.0) {
+            float dark   = max(0.0, -vCrater);               // 0 at rim → 1 deep floor
+            float bright = max(0.0,  vCrater) / 0.28;        // 0 → 1 at the rim crest
+            col *= 1.0 - 0.45 * uCraterAlbedo * dark;
+            col *= 1.0 + 0.30 * uCraterAlbedo * bright;
+        }
+        if (uMariaStrength > 0.0) {
+            float m = fbm3(up + vec3(23.7, 88.1, 4.3), uMariaFreq);
+            float maria = smoothstep(0.08, 0.5, m);
+            vec3 mare = vec3(col.r * 0.55, col.g * 0.56, col.b * 0.60);  // darker, faintly cooler
+            col = mix(col, mare, maria * uMariaStrength);
+        }
+    }
+
     // Close-up detail: a band-passed multi-octave noise gives per-pixel normal bump + material breakup
     // below the mesh resolution (handed off to the geometry above it). Same scheme as the CPU shader.
     if (uDetailStrength > 0.0001 || uMaterialStrength > 0.0001) {
@@ -647,6 +699,81 @@ void main() {
         }
     }
 
+    // Orbital macro-relief: shade the REAL warped ridged-mountain field the tiles bake (so the mountains
+    // seen from orbit are exactly the ones you land in), faded in by how much finer a pixel resolves than
+    // the coarse mesh (`fade` = pixel octaves − mesh octaves). At orbit the smooth coarse mesh shows little,
+    // so the field carries the look; as you descend the mesh resolves those scales and `fade` → 0, so the
+    // geometry takes over with no double image. Albedo uses the field VALUE (punchy, ridges light / valleys
+    // dark); the normal uses its tangential gradient (adds form). Both scale with the sliders.
+    if (uReliefStrength > 0.0 || uReliefAlbedo > 0.0) {
+        // Everything here is driven by the CAMERA DISTANCE (length(vWorld)) and a per-frame radians-per-pixel
+        // constant — NOT fwidth(). fwidth is the screen-space derivative of the interpolated direction; it is
+        // faceted per-triangle and STEPS across an LOD-level boundary (big coarse triangles vs small fine
+        // ones), which stepped the normal-gradient finite difference into a hard shading line along the LOD
+        // ring. Distance is continuous across every patch/LOD boundary, so the relief is now seam-free.
+        float dist   = length(vWorld);
+        float meshSp = max(dist / max(uReliefMeshK, 1e-3), 1e-3);            // mesh resolution (dist/(lodFactor·GridN))
+        float pixSp  = max(dist * uPixelArc / max(0.01, uReliefScale), 1e-3); // pixel footprint on the surface (m)
+
+        // MOUNTAIN band — highland-masked ridged field. Faded by ABSOLUTE mesh resolution: full while the
+        // mesh is coarse, off once it resolves the significant octaves (gain falloff ⇒ ~done by meshOct≈6,
+        // long before the float-safe ceiling). Fading over [1,6] hands off to geometry + the close-up detail
+        // layer before the surface; lingering kept relief at ~80% at 400 km, carving hard facets. (A
+        // pixel-vs-mesh GAP never closes — the quadtree keeps the mesh ~constant octaves behind the pixel.)
+        float mMeshOct  = tfOctFor(uMtnFreqR, meshSp, uMtnMaxOctR, uPlanetRadius);
+        float mFieldOct = min(tfOctFor(uMtnFreqR, pixSp, uMtnMaxOctR, uPlanetRadius), uMtnMaxOctR);
+        float cont = tfFbm(up, uContFreqR, uContMaxOctR, uContGainR, uSeedR);
+        float mask = smoothstep(-0.2, 0.4, cont);                            // mountains live on highlands
+        float rug  = tfRuggedness(up, uRuggedFreqR, uRuggedLoR, uRuggedHiR, uSeedR);
+        float mAmp = (1.0 - smoothstep(1.0, 6.0, mMeshOct)) * uMtnWeightR * mask * rug; // faded mountain amplitude
+
+        // CRATER band — covers the whole airless body (no highland mask). From afar the mesh shows craters
+        // only as flat baked albedo (vCrater); this gives them their real 3-D bowl/rim FORM (normal) so a
+        // crater seen from orbit looks like the one you descend into. Albedo stays with the baked vCrater
+        // tint (not re-added here) so it isn't doubled. Coarse classes only (read from orbit; finer ones are
+        // baked geometry up close), and gated to genuinely cratered worlds so other worlds pay nothing.
+        float cAmp = 0.0, cFieldOct = 0.0;
+        if (uIsCratered > 0.5 && uCraterWeightR > 0.0) {
+            float cMeshOct = tfOctFor(uCraterFreqR, meshSp, 10.0, uPlanetRadius);
+            cFieldOct = min(tfOctFor(uCraterFreqR, pixSp, 10.0, uPlanetRadius), 3.0); // coarse classes only (cost)
+            cAmp = (1.0 - smoothstep(1.0, 6.0, cMeshOct)) * uCraterWeightR;
+        }
+
+        if (mAmp > 0.001 || cAmp > 0.001) {
+            vec3 grad3 = vec3(0.0);                              // ∂(combined relief height)/∂dir, world axes
+
+            // MOUNTAIN: ridged value drives the albedo; gradient via 3 world-axis taps (ridged is cheap, and
+            // a finite difference avoids a fiddly analytic ridged derivative). Step matched to its finest
+            // octave (no aliasing); the 3-axis form is basis-free (no pole crease).
+            if (mAmp > 0.001) {
+                vec3 wp = up + tfDomainWarp(up, uWarpFreqR, uWarpStrR, uSeedR);
+                float mtn0 = tfRidged(wp, uMtnFreqR, mFieldOct, uMtnGainR, uSeedR);
+                col *= 1.0 + uReliefAlbedo * mAmp * (mtn0 * 2.0 - 1.0);      // ridges bright, valleys dark
+                float eps = clamp(0.5 / max(uMtnFreqR * exp2(max(mFieldOct - 1.0, 0.0)), 1.0), 1e-7, 0.05);
+                vec3 gx = normalize(up + vec3(eps, 0.0, 0.0));
+                vec3 gy = normalize(up + vec3(0.0, eps, 0.0));
+                vec3 gz = normalize(up + vec3(0.0, 0.0, eps));
+                float mx = tfRidged(gx + tfDomainWarp(gx, uWarpFreqR, uWarpStrR, uSeedR), uMtnFreqR, mFieldOct, uMtnGainR, uSeedR);
+                float my = tfRidged(gy + tfDomainWarp(gy, uWarpFreqR, uWarpStrR, uSeedR), uMtnFreqR, mFieldOct, uMtnGainR, uSeedR);
+                float mz = tfRidged(gz + tfDomainWarp(gz, uWarpFreqR, uWarpStrR, uSeedR), uMtnFreqR, mFieldOct, uMtnGainR, uSeedR);
+                grad3 += mAmp * vec3(mx - mtn0, my - mtn0, mz - mtn0) / eps;
+            }
+            // CRATER: value + analytic gradient in ONE cascade pass (no taps — the 3×3×3 cascade is the cost).
+            // Contributes the 3-D bowl/rim FORM (normal) only; its albedo stays with the baked vCrater tint.
+            if (cAmp > 0.001) {
+                vec4 cN = tfCraterFieldN(up, uCraterFreqR, cFieldOct, uCraterDensityR, uSeedR);
+                grad3 += cAmp * cN.xyz;
+            }
+
+            vec3 gradT = grad3 - dot(grad3, up) * up;            // tangential part (radial removed)
+            vec3 bump = (uScale / uPlanetRadius) * gradT;        // height-slope tangent vector
+            bump *= min(1.0, 0.5 / max(length(bump), 1e-6));     // cap the tilt (no hard self-shadow faces)
+            float baseLit = max(dot(N, normalize(uSunDir)), 0.0);
+            float reliefMask = smoothstep(0.0, 0.25, baseLit);   // fade out near the terminator (no hard edge)
+            N = normalize(N - uReliefStrength * reliefMask * bump);
+        }
+    }
+
     // Lighting: hemispheric ambient + diffuse + a subtle specular so the detail normals catch the sun.
     vec3 V = normalize(-vWorld);
     float diff = max(dot(N, normalize(uSunDir)), 0.0);
@@ -654,6 +781,82 @@ void main() {
     vec3 Hh = normalize(normalize(uSunDir) + V);
     float spec = uSurfaceSpecular * pow(max(dot(N, Hh), 0.0), 30.0) * diff;
     FragColor = vec4(col * (ambient + 0.95 * diff) + vec3(spec), 1.0);
+}";
+
+    // --- GPU-path ocean surface ---
+    // Reuses the patch's BASE MESH VAO (no separate water mesh): each vertex samples the height tile to
+    // read the sea-floor height, displaces to sea level + travelling swell, and carries the depth so the
+    // fragment can discard dry land (the coastline is where the floor crosses sea level) and tint shallows
+    // pale → deeps dark. Mirrors the CPU WaterVertex/Fragment shaders (same swell uniforms, same colours).
+    private const string GpuWaterVertexSource = @"#version 410 core
+layout(location = 0) in vec3 aBasePos;   // R*(dir - centreDir): planet-stable, precise
+layout(location = 1) in vec3 aDir;       // outward unit direction
+layout(location = 2) in vec2 aTexel;     // guard-offset texel of this vertex in its tile
+layout(location = 3) in float aSkirt;    // ignored for water (skirt verts collapse onto the patch edge)
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform float uMorph;
+uniform vec2 uTileOrigin;
+uniform sampler2D uHeight;
+uniform float uSeaLevel;    // metres (signed) of the ocean surface above the base radius
+uniform float uAmp;         // relief amplitude (for the depth → colour ramp)
+uniform float uWaterDrop;   // small dip below sea level so the shore doesn't z-fight the land
+uniform float uTime, uWaveAmp;
+uniform vec3 uWD[3];        // wave directions (planet-local, unit)
+uniform vec3 uWK;           // angular wavenumbers
+uniform vec3 uWW;           // angular speeds
+uniform vec3 uWA;           // per-wave amplitude weights
+uniform vec3 uPhase;        // per-patch phase base for the 3 waves
+out vec3 vNormal;
+out vec4 vColor;
+out vec3 vWorld;
+out float vDepth;           // seaLevel - floorHeight (m); < 0 = dry → fragment discards
+void main() {
+    ivec2 o = ivec2(int(uTileOrigin.x), int(uTileOrigin.y)) + ivec2(int(aTexel.x), int(aTexel.y));
+    vec2 hfc = texelFetch(uHeight, o, 0).rg;
+    float floorH = mix(hfc.x, hfc.y, uMorph);
+    vDepth = uSeaLevel - floorH;
+
+    vec3 N = aDir;
+    float h = 0.0;
+    vec3 grad = vec3(0.0);
+    for (int i = 0; i < 3; i++) {
+        float ph = uPhase[i] + uWK[i] * dot(aBasePos, uWD[i]) + uTime * uWW[i];
+        float a = uWA[i] * uWaveAmp;
+        h += a * sin(ph);
+        grad += a * cos(ph) * uWK[i] * uWD[i];
+    }
+    float lift = uSeaLevel - uWaterDrop + h;
+    vec3 posRel = aBasePos + aDir * lift;        // base sphere + radial displacement to the swell-lifted sea
+    vec3 tang = grad - dot(grad, N) * N;
+    vNormal = normalize(N - tang);
+
+    float f = clamp(vDepth / (uAmp * 0.12 + 1.0), 0.0, 1.0);
+    vec3 shallow = vec3(0.20, 0.55, 0.62), deep = vec3(0.02, 0.10, 0.26);
+    vColor = vec4(mix(shallow, deep, f), 0.5 + 0.48 * f); // shallows pale & clear → deeps dark & opaque
+    vWorld = (uModel * vec4(posRel, 1.0)).xyz;
+    gl_Position = uMVP * vec4(posRel, 1.0);
+}";
+
+    private const string GpuWaterFragmentSource = @"#version 410 core
+in vec3 vNormal;
+in vec4 vColor;
+in vec3 vWorld;
+in float vDepth;
+uniform vec3 uSunDir;
+out vec4 FragColor;
+void main() {
+    if (vDepth < 0.0) discard;                    // sea floor rises above the waterline here — bare land
+    vec3 N = normalize(vNormal);
+    vec3 L = normalize(uSunDir);
+    vec3 V = normalize(-vWorld);
+    float diff = max(dot(N, L), 0.0);
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(N, H), 0.0), 90.0);  // tight sun glint
+    float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    vec3 col = vColor.rgb * (0.12 + 0.9 * diff) + vec3(1.0) * spec * 0.7;
+    float a = clamp(vColor.a + fres * 0.2, 0.0, 1.0);
+    FragColor = vec4(col, a);
 }";
 
     // Ocean swell waves (planet-local). The CPU phase base and the shader's spatial term share these,
@@ -804,7 +1007,7 @@ void main() {
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
         ExtractFrustum(viewProj);
 
-        if (TerrainTuning.GpuTerrain) { RenderGpu(camera, viewProj, sunDir); return; }
+        if (TerrainTuning.GpuTerrain) { RenderGpu(camera, viewProj, sunDir, time); return; }
 
         _gl.Enable(EnableCap.DepthTest);
         _gl.DepthMask(true);
@@ -1015,13 +1218,14 @@ void main() {
         _tileCache ??= new TerrainTileCache(_gl, GridN + 3, 4096);
         _tileGen ??= new TerrainTileGenerator(_gl);
         _gpuShader ??= new Shader(_gl, GpuVertexSource, GpuFragmentSource);
+        _gpuWaterShader ??= new Shader(_gl, GpuWaterVertexSource, GpuWaterFragmentSource);
     }
 
     /// <summary>Render the active planet via the GPU tile path. Mirrors <see cref="Process"/>'s split/
     /// merge/cull, but each node draws a shared base-sphere mesh displaced by its GPU-generated height
     /// tile (geomorphing fine→coarse in the vertex shader). No worker pool — tiles generate on the render
     /// thread, budgeted per frame.</summary>
-    private void RenderGpu(Camera camera, in Matrix4X4<float> viewProj, Vector3D<float> sunDir)
+    private void RenderGpu(Camera camera, in Matrix4X4<float> viewProj, Vector3D<float> sunDir, float time)
     {
         EnsureGpuResources();
         _gpuGenBudget = GpuTileGensPerFrame;
@@ -1063,6 +1267,36 @@ void main() {
         _gpuShader.SetFloat("uMoistureBias", (float)gp.MoistureBias);
         _gpuShader.SetFloat("uAmplitude", (float)Math.Max(1.0, gp.Amplitude));
 
+        // Airless regolith albedo (crater floors/rims + maria) — live per-pixel on the GPU path.
+        _gpuShader.SetFloat("uIsCratered", gp.IsCratered);
+        _gpuShader.SetFloat("uCraterAlbedo", Math.Max(0f, TerrainTuning.CraterAlbedo));
+        _gpuShader.SetFloat("uMariaStrength", Math.Max(0f, TerrainTuning.MariaStrength));
+        _gpuShader.SetFloat("uMariaFreq", (float)(gp.ContinentFreq * 0.6));
+
+        // Orbital macro-relief from the real baked field (matches the mountains, fades out on descent).
+        _gpuShader.SetVector3("uSeedR", new Vector3D<float>(
+            (gp.Seed & 1023) / 1024f, ((gp.Seed >> 10) & 1023) / 1024f, ((gp.Seed >> 20) & 1023) / 1024f));
+        _gpuShader.SetFloat("uReliefStrength", Math.Max(0f, TerrainTuning.OrbitalReliefStrength));
+        _gpuShader.SetFloat("uReliefAlbedo", Math.Max(0f, TerrainTuning.OrbitalReliefAlbedo));
+        _gpuShader.SetFloat("uReliefScale", Math.Clamp(TerrainTuning.OrbitalReliefScale, 0.1f, 8f));
+        _gpuShader.SetFloat("uReliefMeshK", (float)(_lodFactor * GridN)); // camera dist → effective mesh spacing
+        _gpuShader.SetFloat("uPixelArc", camera.FovRadians / Math.Max(1, sceneVp[3])); // radians per pixel (fwidth-free footprint)
+        _gpuShader.SetFloat("uContFreqR", (float)gp.ContinentFreq);
+        _gpuShader.SetFloat("uContGainR", (float)gp.ContinentGain);
+        _gpuShader.SetFloat("uContMaxOctR", gp.MaxContinentOctaves);
+        _gpuShader.SetFloat("uMtnFreqR", (float)gp.MountainFreq);
+        _gpuShader.SetFloat("uMtnWeightR", (float)gp.MountainWeight);
+        _gpuShader.SetFloat("uMtnGainR", (float)gp.MountainGain);
+        _gpuShader.SetFloat("uMtnMaxOctR", gp.MaxMountainOctaves);
+        _gpuShader.SetFloat("uWarpFreqR", (float)gp.WarpFreq);
+        _gpuShader.SetFloat("uWarpStrR", (float)gp.WarpStrength);
+        _gpuShader.SetFloat("uRuggedFreqR", (float)gp.RuggedFreq);
+        _gpuShader.SetFloat("uRuggedLoR", (float)gp.RuggedLo);
+        _gpuShader.SetFloat("uRuggedHiR", (float)gp.RuggedHi);
+        _gpuShader.SetFloat("uCraterFreqR", (float)gp.CraterFreq);       // crater relief (gives orbital craters 3-D form)
+        _gpuShader.SetFloat("uCraterWeightR", (float)gp.CraterWeight);
+        _gpuShader.SetFloat("uCraterDensityR", (float)gp.CraterDensity);
+
         // Fragment detail layer (same knobs/scheme as the CPU shader).
         _detailNoiseFreq = DetailBaseFreq * Math.Max(0.01f, TerrainTuning.DetailNormalScale);
         _gpuShader.SetFloat("uDetailFreq", (float)_detailNoiseFreq);
@@ -1079,10 +1313,59 @@ void main() {
         _gpuShader.SetInt("uHeight", 0);
 
         LeafCount = 0;
+        _gpuWaterFrame.Clear();
         foreach (QuadNode root in _roots!) DrawSubtreeGpu(root, camera, viewProj);
+
+        // Ocean pass: a translucent sea-level shell over the opaque sea floor (depth-tested + depth-writing
+        // so the flat surface forms the limb and hides the rugged floor; alpha-blended so deeps read opaque
+        // and shallows clear). Mirrors the CPU water pass; reuses each leaf's base mesh + height tile.
+        if (_gpuWaterFrame.Count > 0) DrawGpuWater(viewProj, sunDir, time);
         _gl.Disable(EnableCap.DepthTest);
 
         if (FocusPoint is { } fp) UpdateRoverLeaf(fp); // cache the rover's tile for exact collision
+    }
+
+    /// <summary>Translucent ocean pass for the GPU path: each collected ocean leaf re-draws its base mesh
+    /// as a sea-level shell (the water shader samples the leaf's height tile for the sea floor → depth and
+    /// discards dry land). Depth-tested + depth-writing + alpha-blended, exactly like the CPU ocean pass.</summary>
+    private void DrawGpuWater(in Matrix4X4<float> viewProj, Vector3D<float> sunDir, float time)
+    {
+        _gl.Enable(EnableCap.Blend);
+        _gl.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+        _gl.DepthMask(true);
+        _gpuWaterShader!.Use();
+        _gpuWaterShader.SetVector3("uSunDir", sunDir);
+        _gpuWaterShader.SetInt("uHeight", 0); // same atlas the opaque pass left bound on texture unit 0
+        _gpuWaterShader.SetFloat("uSeaLevel", (float)_terrain!.SeaLevelMeters);
+        _gpuWaterShader.SetFloat("uAmp", (float)Math.Max(1.0, _terrain.Amplitude));
+
+        double twoPi = 2.0 * Math.PI;
+        var wk = new Vector3D<float>((float)(twoPi / WaveLen[0]), (float)(twoPi / WaveLen[1]), (float)(twoPi / WaveLen[2]));
+        _gpuWaterShader.SetFloat("uTime", time);
+        _gpuWaterShader.SetFloat("uWaveAmp", AnimateWater ? 1.0f : 0.0f);
+        for (int i = 0; i < 3; i++)
+            _gpuWaterShader.SetVector3($"uWD[{i}]", new Vector3D<float>((float)WaveDir[i].X, (float)WaveDir[i].Y, (float)WaveDir[i].Z));
+        _gpuWaterShader.SetVector3("uWK", wk);
+        _gpuWaterShader.SetVector3("uWW", new Vector3D<float>((float)(twoPi / WavePeriod[0]), (float)(twoPi / WavePeriod[1]), (float)(twoPi / WavePeriod[2])));
+        _gpuWaterShader.SetVector3("uWA", WaveAmp);
+
+        foreach ((QuadNode node, Vector3D<float> rel) in _gpuWaterFrame)
+        {
+            int layer = _tileCache!.TryGetLayer(node.TileId, _renderFrame);
+            if (layer < 0 || node.BaseVao == 0) continue; // tile evicted since the opaque draw — skip
+            Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
+            _gpuWaterShader.SetMatrix("uModel", model);
+            _gpuWaterShader.SetMatrix("uMVP", model * viewProj);
+            _gpuWaterShader.SetFloat("uMorph", node.DrawMorph);
+            _gpuWaterShader.SetFloat("uWaterDrop", (float)(node.WorldSize * 0.0004 + 0.3));
+            (int tox, int toy) = _tileCache.TileOrigin(layer);
+            _gpuWaterShader.SetVector2("uTileOrigin", new Vector2D<float>(tox, toy));
+            _gl.BindVertexArray(node.BaseVao);
+            unsafe { _gl.DrawElements(PrimitiveType.Triangles, node.BaseIndexCount, DrawElementsType.UnsignedInt, null); }
+            _gl.BindVertexArray(0);
+        }
+        _gl.DepthMask(true);
+        _gl.Disable(EnableCap.Blend);
     }
 
     /// <summary>Cache the leaf tile under the vehicle (read back from the GPU, in the render pass where
@@ -1192,6 +1475,10 @@ void main() {
         _gl.BindVertexArray(node.BaseVao);
         unsafe { _gl.DrawElements(PrimitiveType.Triangles, node.BaseIndexCount, DrawElementsType.UnsignedInt, null); }
         _gl.BindVertexArray(0);
+
+        // Ocean worlds: this drawn leaf also gets a translucent water shell (reusing its base mesh), drawn
+        // in the later water pass over the opaque sea floor.
+        if (_terrain!.HasOcean) _gpuWaterFrame.Add((node, rel));
     }
 
     /// <summary>Ensure a node has its base mesh and a resident height tile so it can be drawn this frame.
@@ -1845,6 +2132,7 @@ void main() {
         _tileCache?.Dispose();
         _tileGen?.Dispose();
         _gpuShader?.Dispose();
+        _gpuWaterShader?.Dispose();
     }
 
     private sealed class QuadNode
