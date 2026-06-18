@@ -127,6 +127,22 @@ public sealed class TerrainTileCache : IDisposable
     /// framebuffer + viewport itself).</summary>
     public void EndRender() => _gl.Disable(EnableCap.ScissorTest);
 
+    /// <summary>Read a slot's tile back to the CPU as RGBA per texel (R=fine, G=coarse height) — the exact
+    /// heights drawn, for vehicle collision. <paramref name="dest"/> must hold TileSize² × 4 floats. RGBA/
+    /// FLOAT is the read combo guaranteed for a float target (RG can be rejected on macOS GL 4.1). Binds
+    /// (and leaves bound) the default framebuffer; call when no scene framebuffer is mid-use (the physics
+    /// step). A read-back stalls the GPU, so the caller caches per-tile and only re-reads on a leaf change.</summary>
+    public void ReadTile(int slot, float[] dest)
+    {
+        Span<int> prevFbo = stackalloc int[1];
+        _gl.GetInteger(GetPName.DrawFramebufferBinding, prevFbo);
+        (int x, int y) = TileOrigin(slot);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
+        _gl.ReadBuffer(ReadBufferMode.ColorAttachment0);
+        _gl.ReadPixels<float>(x, y, (uint)_tileSize, (uint)_tileSize, PixelFormat.Rgba, PixelType.Float, dest);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, (uint)prevFbo[0]);
+    }
+
     private void EvictOldest(long frame)
     {
         long oldestKey = 0, oldestFrame = long.MaxValue;

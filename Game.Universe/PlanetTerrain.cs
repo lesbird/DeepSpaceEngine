@@ -475,21 +475,22 @@ public sealed class PlanetTerrain
     {
         if (!HasSurface) return 0.0;
         GpuTerrainParams p = GpuParams();
-        Vector3D<double> seed = GpuSeedOffset(p.Seed);
-        double oc = GpuOctClamp(p.ContinentFreq, sampleSpacing, p.MaxContinentOctaves);
-        double om = GpuOctClamp(p.MountainFreq, sampleSpacing, p.MaxMountainOctaves);
-        double od = GpuOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
+        var dir = new Vector3D<float>((float)unitDir.X, (float)unitDir.Y, (float)unitDir.Z);
+        Vector3D<float> seed = GpuSeedOffset(p.Seed);
+        float oc = (float)GpuOctClamp(p.ContinentFreq, sampleSpacing, p.MaxContinentOctaves);
+        float om = (float)GpuOctClamp(p.MountainFreq, sampleSpacing, p.MaxMountainOctaves);
+        float od = (float)GpuOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
 
-        double cont = GpuFbm(unitDir, p.ContinentFreq, oc, p.ContinentGain, seed);
-        double rugged = Smoothstep(p.RuggedLo, p.RuggedHi,
-            0.5 + 0.5 * GpuFbm(unitDir + new Vector3D<double>(53.1, 12.7, 91.3), p.RuggedFreq, 4.0, 0.5, seed));
-        double mask = Smoothstep(-0.2, 0.4, cont);
-        Vector3D<double> warped = unitDir + GpuDomainWarp(unitDir, p, seed);
-        double mtn = GpuRidged(warped, p.MountainFreq, om, p.MountainGain, seed);
-        double det = GpuFbm(unitDir, p.DetailFreq, od, p.DetailGain, seed);
-        double detailGate = p.DetailFloor + (1.0 - p.DetailFloor) * rugged;
-        double shape = p.ContinentWeight * cont + p.MountainWeight * mtn * mask * rugged
-                     + p.DetailWeight * det * detailGate;
+        float cont = GpuFbm(dir, (float)p.ContinentFreq, oc, (float)p.ContinentGain, seed);
+        float rugged = SmoothstepF((float)p.RuggedLo, (float)p.RuggedHi,
+            0.5f + 0.5f * GpuFbm(dir + new Vector3D<float>(53.1f, 12.7f, 91.3f), (float)p.RuggedFreq, 4f, 0.5f, seed));
+        float mask = SmoothstepF(-0.2f, 0.4f, cont);
+        Vector3D<float> warped = dir + GpuDomainWarp(dir, p, seed);
+        float mtn = GpuRidged(warped, (float)p.MountainFreq, om, (float)p.MountainGain, seed);
+        float det = GpuFbm(dir, (float)p.DetailFreq, od, (float)p.DetailGain, seed);
+        float detailGate = (float)p.DetailFloor + (1f - (float)p.DetailFloor) * rugged;
+        float shape = (float)p.ContinentWeight * cont + (float)p.MountainWeight * mtn * mask * rugged
+                    + (float)p.DetailWeight * det * detailGate;
         return p.Scale * shape;
     }
 
@@ -500,68 +501,69 @@ public sealed class PlanetTerrain
         return Math.Max(0.0, Math.Min(lod, safe));
     }
 
-    private static Vector3D<double> GpuSeedOffset(ulong seed) => new(
-        (seed & 1023) / 1024.0, ((seed >> 10) & 1023) / 1024.0, ((seed >> 20) & 1023) / 1024.0);
+    // Everything below mirrors the GLSL generator in float (not double): the noise hash floors at the
+    // float precision edge, so only matching float reproduces the GPU surface — a double mirror diverged
+    // by up to kilometres on a coarse leaf's top octave.
+    private static float SmoothstepF(float lo, float hi, float x) { float t = Math.Clamp((x - lo) / (hi - lo), 0f, 1f); return t * t * (3f - 2f * t); }
+    private static Vector3D<float> GpuSeedOffset(ulong seed) => new(
+        (float)(seed & 1023) / 1024f, (float)((seed >> 10) & 1023) / 1024f, (float)((seed >> 20) & 1023) / 1024f);
+    private static float GpuFractF(float x) => x - MathF.Floor(x);
+    private static float ModF(float a, float b) => a - b * MathF.Floor(a / b);
+    private static float LerpF(float a, float b, float t) => a + (b - a) * t;
 
-    private static double GpuFract(double x) => x - Math.Floor(x);
-
-    private static double GpuHash13(Vector3D<double> p, Vector3D<double> seed)
+    private static float GpuHash13(Vector3D<float> p, Vector3D<float> seed)
     {
-        p = new Vector3D<double>(Mod(p.X, 8192.0), Mod(p.Y, 8192.0), Mod(p.Z, 8192.0)) + seed;
-        p = new Vector3D<double>(GpuFract(p.X * 0.1031), GpuFract(p.Y * 0.1031), GpuFract(p.Z * 0.1031));
-        double d = p.X * (p.Y + 33.33) + p.Y * (p.Z + 33.33) + p.Z * (p.X + 33.33); // dot(p, p.yzx + 33.33)
-        p += new Vector3D<double>(d, d, d);
-        return GpuFract((p.X + p.Y) * p.Z);
+        p = new Vector3D<float>(ModF(p.X, 8192f), ModF(p.Y, 8192f), ModF(p.Z, 8192f)) + seed;
+        p = new Vector3D<float>(GpuFractF(p.X * 0.1031f), GpuFractF(p.Y * 0.1031f), GpuFractF(p.Z * 0.1031f));
+        float d = p.X * (p.Y + 33.33f) + p.Y * (p.Z + 33.33f) + p.Z * (p.X + 33.33f); // dot(p, p.yzx + 33.33)
+        p += new Vector3D<float>(d, d, d);
+        return GpuFractF((p.X + p.Y) * p.Z);
     }
 
-    private static double Mod(double a, double b) => a - b * Math.Floor(a / b);
-
-    private static double GpuVNoise(Vector3D<double> q, Vector3D<double> seed)
+    private static float GpuVNoise(Vector3D<float> q, Vector3D<float> seed)
     {
-        Vector3D<double> c = new(Math.Floor(q.X), Math.Floor(q.Y), Math.Floor(q.Z));
-        Vector3D<double> f = q - c;
-        f = new Vector3D<double>(f.X * f.X * (3 - 2 * f.X), f.Y * f.Y * (3 - 2 * f.Y), f.Z * f.Z * (3 - 2 * f.Z));
-        double n000 = GpuHash13(c, seed), n100 = GpuHash13(c + new Vector3D<double>(1, 0, 0), seed);
-        double n010 = GpuHash13(c + new Vector3D<double>(0, 1, 0), seed), n110 = GpuHash13(c + new Vector3D<double>(1, 1, 0), seed);
-        double n001 = GpuHash13(c + new Vector3D<double>(0, 0, 1), seed), n101 = GpuHash13(c + new Vector3D<double>(1, 0, 1), seed);
-        double n011 = GpuHash13(c + new Vector3D<double>(0, 1, 1), seed), n111 = GpuHash13(c + new Vector3D<double>(1, 1, 1), seed);
-        double x00 = Lerp1(n000, n100, f.X), x10 = Lerp1(n010, n110, f.X);
-        double x01 = Lerp1(n001, n101, f.X), x11 = Lerp1(n011, n111, f.X);
-        return Lerp1(Lerp1(x00, x10, f.Y), Lerp1(x01, x11, f.Y), f.Z);
+        var c = new Vector3D<float>(MathF.Floor(q.X), MathF.Floor(q.Y), MathF.Floor(q.Z));
+        var f = q - c;
+        f = new Vector3D<float>(f.X * f.X * (3f - 2f * f.X), f.Y * f.Y * (3f - 2f * f.Y), f.Z * f.Z * (3f - 2f * f.Z));
+        float n000 = GpuHash13(c, seed), n100 = GpuHash13(c + new Vector3D<float>(1, 0, 0), seed);
+        float n010 = GpuHash13(c + new Vector3D<float>(0, 1, 0), seed), n110 = GpuHash13(c + new Vector3D<float>(1, 1, 0), seed);
+        float n001 = GpuHash13(c + new Vector3D<float>(0, 0, 1), seed), n101 = GpuHash13(c + new Vector3D<float>(1, 0, 1), seed);
+        float n011 = GpuHash13(c + new Vector3D<float>(0, 1, 1), seed), n111 = GpuHash13(c + new Vector3D<float>(1, 1, 1), seed);
+        float x00 = LerpF(n000, n100, f.X), x10 = LerpF(n010, n110, f.X);
+        float x01 = LerpF(n001, n101, f.X), x11 = LerpF(n011, n111, f.X);
+        return LerpF(LerpF(x00, x10, f.Y), LerpF(x01, x11, f.Y), f.Z);
     }
 
-    private static double Lerp1(double a, double b, double t) => a + (b - a) * t;
-
-    private static double GpuFbm(Vector3D<double> dir, double freq, double oct, double gain, Vector3D<double> seed)
+    private static float GpuFbm(Vector3D<float> dir, float freq, float oct, float gain, Vector3D<float> seed)
     {
-        if (oct <= 0.0) return 0.0;
-        int full = (int)Math.Floor(oct);
-        double frac = oct - full, sum = 0, amp = 1, f = freq, norm = 0;
-        for (int i = 0; i < 32 && i < full; i++) { sum += amp * (GpuVNoise(dir * f, seed) * 2.0 - 1.0); norm += amp; amp *= gain; f *= 2.0; }
-        if (frac > 0.0) { sum += amp * frac * (GpuVNoise(dir * f, seed) * 2.0 - 1.0); norm += amp * frac; }
-        return norm > 0 ? sum / norm : 0;
+        if (oct <= 0f) return 0f;
+        int full = (int)MathF.Floor(oct);
+        float frac = oct - full, sum = 0, amp = 1, f = freq, norm = 0;
+        for (int i = 0; i < 32 && i < full; i++) { sum += amp * (GpuVNoise(dir * f, seed) * 2f - 1f); norm += amp; amp *= gain; f *= 2f; }
+        if (frac > 0f) { sum += amp * frac * (GpuVNoise(dir * f, seed) * 2f - 1f); norm += amp * frac; }
+        return norm > 0f ? sum / norm : 0f;
     }
 
-    private static double GpuRidged(Vector3D<double> dir, double freq, double oct, double gain, Vector3D<double> seed)
+    private static float GpuRidged(Vector3D<float> dir, float freq, float oct, float gain, Vector3D<float> seed)
     {
-        if (oct <= 0.0) return 0.0;
-        int full = (int)Math.Floor(oct);
-        double frac = oct - full, sum = 0, amp = 0.5, f = freq, prev = 1.0, norm = 0;
+        if (oct <= 0f) return 0f;
+        int full = (int)MathF.Floor(oct);
+        float frac = oct - full, sum = 0, amp = 0.5f, f = freq, prev = 1f, norm = 0;
         for (int i = 0; i < 32 && i < full; i++)
         {
-            double n = 1.0 - Math.Abs(GpuVNoise(dir * f, seed) * 2.0 - 1.0); n *= n; n *= prev;
-            sum += n * amp; norm += amp; prev = n; amp *= gain; f *= 2.0;
+            float n = 1f - MathF.Abs(GpuVNoise(dir * f, seed) * 2f - 1f); n *= n; n *= prev;
+            sum += n * amp; norm += amp; prev = n; amp *= gain; f *= 2f;
         }
-        if (frac > 0.0) { double n = 1.0 - Math.Abs(GpuVNoise(dir * f, seed) * 2.0 - 1.0); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
-        return norm > 0 ? Math.Clamp(sum / norm, 0.0, 1.0) : 0;
+        if (frac > 0f) { float n = 1f - MathF.Abs(GpuVNoise(dir * f, seed) * 2f - 1f); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
+        return norm > 0f ? Math.Clamp(sum / norm, 0f, 1f) : 0f;
     }
 
-    private static Vector3D<double> GpuDomainWarp(Vector3D<double> dir, GpuTerrainParams p, Vector3D<double> seed)
+    private static Vector3D<float> GpuDomainWarp(Vector3D<float> dir, GpuTerrainParams p, Vector3D<float> seed)
     {
-        double wx = GpuFbm(dir, p.WarpFreq, 3.0, 0.5, seed);
-        double wy = GpuFbm(dir + new Vector3D<double>(31.4, 11.7, 5.2), p.WarpFreq, 3.0, 0.5, seed);
-        double wz = GpuFbm(dir + new Vector3D<double>(-7.1, 23.9, 17.3), p.WarpFreq, 3.0, 0.5, seed);
-        return new Vector3D<double>(wx, wy, wz) * p.WarpStrength;
+        float wx = GpuFbm(dir, (float)p.WarpFreq, 3f, 0.5f, seed);
+        float wy = GpuFbm(dir + new Vector3D<float>(31.4f, 11.7f, 5.2f), (float)p.WarpFreq, 3f, 0.5f, seed);
+        float wz = GpuFbm(dir + new Vector3D<float>(-7.1f, 23.9f, 17.3f), (float)p.WarpFreq, 3f, 0.5f, seed);
+        return new Vector3D<float>(wx, wy, wz) * (float)p.WarpStrength;
     }
 
     // --- terrain style ---

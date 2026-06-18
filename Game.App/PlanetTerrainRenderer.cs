@@ -430,6 +430,15 @@ void main() {
     private long _nextTileId = 1;
     private int _gpuGenBudget;
 
+    // The rover's current leaf tile, read back once per leaf during render: all four wheels sample THIS
+    // one buffer (clamped to its u,v rect), so the footprint has a single consistent, exact source —
+    // mixing per-wheel sources or an analytic fallback either floated the body or ratcheted it upward.
+    private float[]? _roverLeafBuf;
+    private long _roverLeafTileId = -1;
+    private int _roverLeafFace;
+    private double _rlU0, _rlV0, _rlU1, _rlV1;
+    private float _roverLeafMorph;
+
     private const string GpuVertexSource = @"#version 410 core
 layout(location = 0) in vec3 aBasePos;   // R*(dir - centerDir): patch-centre-relative, small & precise
 layout(location = 1) in vec3 aDir;       // outward unit direction at this vertex
@@ -1072,6 +1081,30 @@ void main() {
         LeafCount = 0;
         foreach (QuadNode root in _roots!) DrawSubtreeGpu(root, camera, viewProj);
         _gl.Disable(EnableCap.DepthTest);
+
+        if (FocusPoint is { } fp) UpdateRoverLeaf(fp); // cache the rover's tile for exact collision
+    }
+
+    /// <summary>Cache the leaf tile under the vehicle (read back from the GPU, in the render pass where
+    /// the context is current and the tile is fresh) so <see cref="TrySurfaceHeight"/> can sample the exact
+    /// drawn surface. Re-reads only on a leaf change; the morph is refreshed every frame.</summary>
+    private void UpdateRoverLeaf(UniversePosition focus)
+    {
+        DirToFaceUV(Vector3D.Normalize(focus.DeltaMeters(_body!.CurrentPosition)), out int face, out double u, out double v);
+        if (FindDrawnLeaf(face, u, v) is not { } leaf) return;
+        int slot = _tileCache!.TryGetLayer(leaf.TileId, _renderFrame);
+        if (slot < 0) return;
+
+        _roverLeafFace = leaf.Face;
+        _rlU0 = leaf.U0; _rlV0 = leaf.V0; _rlU1 = leaf.U1; _rlV1 = leaf.V1;
+        _roverLeafMorph = leaf.DrawMorph;
+        if (leaf.TileId != _roverLeafTileId)
+        {
+            int t = _tileCache.TileSize;
+            if (_roverLeafBuf == null || _roverLeafBuf.Length != t * t * 4) _roverLeafBuf = new float[t * t * 4];
+            _tileCache.ReadTile(slot, _roverLeafBuf);
+            _roverLeafTileId = leaf.TileId;
+        }
     }
 
     /// <summary>Standard split/merge/cull state for a node (shared by the ensure and draw passes so they
@@ -1383,14 +1416,11 @@ void main() {
     /// make the body oscillate (drive the focus → refine/merge → height jumps → bounce). Returns false
     /// when nothing is drawn yet (no baked collision data), so the caller can fall back to the raw field.
     /// </summary>
-    public bool TrySurfaceHeight(Vector3D<double> localDir, out double height)
+    /// <summary>Walk the (u,v) path on a face to the deepest node drawn as a leaf this frame (ancestors are
+    /// internal/recursed and unstamped; deeper nodes are speculative and weren't drawn). Null if none.</summary>
+    private QuadNode? FindDrawnLeaf(int face, double u, double v)
     {
-        height = 0.0;
-        if (_terrain == null || _roots == null) return false;
-
-        DirToFaceUV(localDir, out int face, out double u, out double v);
-        // Walk the u,v path and keep the deepest node drawn as a leaf this frame (its ancestors are
-        // internal/recursed and unstamped; any deeper nodes are speculative and weren't drawn).
+        if (_roots == null) return null;
         QuadNode? leaf = null;
         for (QuadNode node = _roots[face]; ; )
         {
@@ -1399,7 +1429,47 @@ void main() {
             double um = (node.U0 + node.U1) * 0.5, vm = (node.V0 + node.V1) * 0.5;
             node = kids[(v >= vm ? 2 : 0) + (u >= um ? 1 : 0)];
         }
-        if (leaf?.CollHF is not { } hf || leaf.CollHC is not { } hc) return false; // nothing drawn yet
+        return leaf;
+    }
+
+    public bool TrySurfaceHeight(Vector3D<double> localDir, out double height)
+    {
+        height = 0.0;
+        if (_terrain == null || _roots == null) return false;
+
+        DirToFaceUV(localDir, out int face, out double u, out double v);
+
+        // GPU path: sample the exact tile read back for the vehicle's leaf (UpdateRoverLeaf). All wheels
+        // use this one buffer, clamped to its u,v rect, so the footprint has a single consistent source —
+        // the readback is the true drawn surface (no chord/float-divergence gap). A wheel on a different
+        // cube face (only at cube edges) falls back to the float mirror.
+        if (TerrainTuning.GpuTerrain)
+        {
+            if (_roverLeafBuf == null || face != _roverLeafFace)
+            {
+                double sp = (FindDrawnLeaf(face, u, v) ?? _roots[face]).WorldSize / GridN;
+                double hf2 = _terrain.GpuHeightAt(localDir, sp);
+                double hc2 = _terrain.GpuHeightAt(localDir, sp * 2.0);
+                height = hf2 + (hc2 - hf2) * _roverLeafMorph;
+                return true;
+            }
+            const int ng = GridN;
+            double gu = Math.Clamp((u - _rlU0) / (_rlU1 - _rlU0), 0.0, 1.0) * ng;
+            double gv = Math.Clamp((v - _rlV0) / (_rlV1 - _rlV0), 0.0, 1.0) * ng;
+            int gi = Math.Clamp((int)gu, 0, ng - 1), gj = Math.Clamp((int)gv, 0, ng - 1);
+            double gfu = gu - gi, gfv = gv - gj;
+            float gm = _roverLeafMorph;
+            int tt = _tileCache!.TileSize;
+            double Hg(int ii, int jj) { int k = ((ii + 1) + (jj + 1) * tt) * 4; return _roverLeafBuf[k] + (_roverLeafBuf[k + 1] - _roverLeafBuf[k]) * gm; }
+            double b00 = Hg(gi, gj), b10 = Hg(gi + 1, gj), b11 = Hg(gi + 1, gj + 1), b01 = Hg(gi, gj + 1);
+            height = gfu >= gfv
+                ? b00 * (1.0 - gfu) + b10 * (gfu - gfv) + b11 * gfv
+                : b00 * (1.0 - gfv) + b01 * (gfv - gfu) + b11 * gfu;
+            return true;
+        }
+
+        QuadNode? leaf = FindDrawnLeaf(face, u, v);
+        if (leaf?.CollHF is not { } hf || leaf.CollHC is not { } hc) return false; // CPU tile not baked yet
 
         const int n = GridN;
         double lu = Math.Clamp((u - leaf.U0) / (leaf.U1 - leaf.U0), 0.0, 1.0) * n;
