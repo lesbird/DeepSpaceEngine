@@ -44,6 +44,10 @@ public static class TerrainTuning
     /// 0 = off. Baked into the surface colour, so a change needs a terrain rebuild.</summary>
     public static float MariaStrength = 0.6f;
 
+    /// <summary>Emissive brightness of glowing lava (fissures + volcano vents) on lava worlds; 0 = cold
+    /// crust. Pushed above 1 so the bloom pass haloes it. Live (per-pixel on the GPU path; no rebuild).</summary>
+    public static float LavaGlow = 2.5f;
+
     /// <summary>Scales the fine, LOD-gated micro-relief height layer that only appears up close;
     /// 0 removes it. Changing it requires a terrain rebuild (it's geometry).</summary>
     public static float MicroDetailScale = 1.0f;

@@ -151,6 +151,30 @@ vec4 tfCraterFieldN(vec3 dir, float baseFreq, float octCount, float density, vec
     }
     return vec4(sumG / wnorm, sumV / wnorm);
 }
+// Volcano cones (lava worlds) — identical to the generator's volcanoField. .x = height [0,1], .y = vent mask
+// (1 at the caldera floor → 0 at the rim) the render shader turns into glowing summit lava.
+vec2 tfVolcano(vec3 dir, float freq, float density, vec3 seed) {
+    vec3 p = dir * freq;
+    vec3 ip = floor(p);
+    float h = 0.0, vent = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        vec3 c = ip + vec3(float(dx), float(dy), float(dz));
+        float ex = tfHash(c + vec3(7.0), seed);
+        if (ex > density) continue;
+        vec3 jit = vec3(tfHash(c + vec3(3.1), seed), tfHash(c + vec3(8.7), seed), tfHash(c + vec3(1.9), seed));
+        float radius = 0.45 + 0.25 * fract(ex * 5.0 + 0.3);
+        float t = length(p - (c + jit)) / radius;
+        if (t >= 1.0) continue;
+        float rimT = 0.30;
+        float flank = smoothstep(1.0, rimT, t);
+        float cone = (t < rimT) ? mix(0.55, 1.0, smoothstep(0.0, rimT, t)) : flank;
+        float ch = cone * (0.7 + 0.6 * fract(ex * 11.0));
+        if (ch > h) { h = ch; vent = (t < rimT) ? (1.0 - smoothstep(0.0, rimT, t)) : 0.0; }
+    }
+    return vec2(h, vent);
+}
 ";
 
     private const string VertexSource = @"#version 410 core
@@ -179,6 +203,7 @@ uniform float uRuggedFreq, uRuggedLo, uRuggedHi;   // regional ruggedness mask: 
 uniform float uDetailFloor;                        // min detail roughness in the flattest regions
 uniform float uCraterWeight, uCraterDensity, uCraterFreq; // impact craters (0 weight = none)
 uniform float uCraterOctFine, uCraterOctCoarse;    // crater size classes resolved at each band-limit
+uniform float uVolcanoWeight, uVolcanoFreq, uVolcanoDensity; // raised volcano cones (lava worlds; 0 = none)
 layout(location = 0) out vec4 oHeight;
 
 const int MaxOct = 32;
@@ -343,6 +368,32 @@ float craterField(vec3 dir, float baseFreq, float octCount, float density) {
     return sum / wnorm;
 }
 
+// Sparse raised volcano cones with a summit caldera (lava worlds): one per occupied cell, max-combined so
+// the tallest cone wins. .x = height in [0,1] (× uVolcanoWeight·uScale outside); .y = a vent mask (1 at the
+// caldera floor → 0 at the rim) the render shader turns into glowing lava. Low frequency → big volcanoes.
+vec2 volcanoField(vec3 dir, float freq, float density) {
+    vec3 p = dir * freq;
+    vec3 ip = floor(p);
+    float h = 0.0, vent = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        vec3 c = ip + vec3(float(dx), float(dy), float(dz));
+        float ex = hash(c + vec3(7.0));
+        if (ex > density) continue;                       // only some cells bear a volcano
+        vec3 jit = vec3(hash(c + vec3(3.1)), hash(c + vec3(8.7)), hash(c + vec3(1.9)));
+        float radius = 0.45 + 0.25 * fract(ex * 5.0 + 0.3);
+        float t = length(p - (c + jit)) / radius;         // 0 at the summit → 1 at the base
+        if (t >= 1.0) continue;
+        float rimT = 0.30;
+        float flank = smoothstep(1.0, rimT, t);           // 0 base → 1 rim
+        float cone = (t < rimT) ? mix(0.55, 1.0, smoothstep(0.0, rimT, t)) : flank; // caldera dip inside the rim
+        float ch = cone * (0.7 + 0.6 * fract(ex * 11.0)); // per-volcano height variation
+        if (ch > h) { h = ch; vent = (t < rimT) ? (1.0 - smoothstep(0.0, rimT, t)) : 0.0; }
+    }
+    return vec2(h, vent);
+}
+
 float shape(vec3 dir, vec3 oct) {
     float cont = fbm(dir, uFreq.x, oct.x, uGain.x);     // broad continents / basins
     float rugged = ruggedness(dir);                     // where rugged terrain belongs
@@ -373,8 +424,10 @@ void main() {
         craterFine   = craterField(dir, uCraterFreq, uCraterOctFine,   uCraterDensity);
         craterCoarse = craterField(dir, uCraterFreq, uCraterOctCoarse, uCraterDensity);
     }
-    float hFine   = uScale * (shape(dir, uOctFine)   + uCraterWeight * craterFine);
-    float hCoarse = uScale * (shape(dir, uOctCoarse) + uCraterWeight * craterCoarse);
+    // Volcano cones: large, LOD-independent → added equally to both band-limits (no pop). Lava worlds only.
+    float volcano = uVolcanoWeight > 0.0 ? volcanoField(dir, uVolcanoFreq, uVolcanoDensity).x : 0.0;
+    float hFine   = uScale * (shape(dir, uOctFine)   + uCraterWeight * craterFine   + uVolcanoWeight * volcano);
+    float hCoarse = uScale * (shape(dir, uOctCoarse) + uCraterWeight * craterCoarse + uVolcanoWeight * volcano);
     oHeight = vec4(hFine, hCoarse, craterFine, craterCoarse);
 }";
 
@@ -429,6 +482,9 @@ void main() {
         _shader.SetFloat("uCraterFreq", (float)p.CraterFreq);
         _shader.SetFloat("uCraterOctFine", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingFine) : 0.0));
         _shader.SetFloat("uCraterOctCoarse", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingCoarse) : 0.0));
+        _shader.SetFloat("uVolcanoWeight", (float)p.VolcanoWeight);
+        _shader.SetFloat("uVolcanoFreq", (float)p.VolcanoFreq);
+        _shader.SetFloat("uVolcanoDensity", (float)p.VolcanoDensity);
 
         // Render the noise into the tile, then restore exactly the framebuffer + viewport that were bound
         // (the scene FBO mid-render): generation can run inside the terrain pass, so it must leave no trace.

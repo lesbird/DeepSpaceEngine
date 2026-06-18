@@ -49,10 +49,14 @@ public sealed class PlanetTerrain
     private readonly double _craterWeight;      // 0 = no craters; else crater layer weight in the blend
     private readonly double _craterDensity;     // fraction of cells [0,1] that actually bear a crater
     private readonly double _craterFreqA, _craterFreqB; // large basins / smaller craters
+    private readonly double _volcanoWeight;     // 0 = no volcanoes; else cone height weight (lava worlds)
+    private readonly double _volcanoFreq;       // cones over the unit sphere (low → big volcanoes)
+    private readonly double _volcanoDensity;    // fraction of cells [0,1] bearing a volcano (sparse)
 
     private readonly bool _hasOcean;
     private readonly double _seaLevelFrac;      // sea level as a fraction of Amplitude
     private readonly Vector3D<float> _baseColor;
+    private readonly Vector3D<float> _substrateTint; // abiotic ground colour from the scanned surface chemistry
 
     // Climate inputs for the Whittaker biome colouring (temperature × moisture).
     private readonly float _surfaceTempK;       // representative planet temperature
@@ -108,7 +112,7 @@ public sealed class PlanetTerrain
         (ContinentWeight + _mountainWeight * PlanetTuning.EffectiveMountain(Type) + DetailWeight
          + MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale)
          + _craterWeight * PlanetTuning.EffectiveCraterScale(Type)
-         + _strataWeight);
+         + _volcanoWeight + _strataWeight);
 
     public PlanetTerrain(CelestialBody body)
     {
@@ -155,10 +159,20 @@ public sealed class PlanetTerrain
         _craterFreqA = rng.Range(28.0, 55.0);              // large basins, visible from orbit
         _craterFreqB = _craterFreqA * rng.Range(3.0, 4.5); // smaller craters, fade in up close
 
+        // Volcanoes: sparse big raised cones with a summit caldera + glowing vent — lava worlds only.
+        if (body.Type == PlanetType.Lava)
+        {
+            _volcanoWeight = rng.Range(0.45, 0.85);        // cone height as a fraction of relief amplitude
+            _volcanoFreq = rng.Range(10.0, 22.0);          // cones over the sphere (low → big)
+            _volcanoDensity = rng.Range(0.10, 0.20);       // fraction of cells bearing one (sparse)
+        }
+        else { _volcanoWeight = 0.0; _volcanoFreq = 12.0; _volcanoDensity = 0.0; }
+
         _hasOcean = body.Type == PlanetType.Ocean;
         _seaLevelFrac = _hasOcean ? rng.Range(-0.15, 0.05) : double.NegativeInfinity;
 
         _surfaceTempK = body.SurfaceTempK;
+        _substrateTint = MineralTint(body.SurfaceComposition);
         _hasLife = body.HasLiquidWater && body.HasAtmosphere; // vegetation needs both
         _moistureFreq = _continentFreq * rng.Range(0.7, 1.3);
         _moistureBias = body.Type switch
@@ -426,9 +440,11 @@ public sealed class PlanetTerrain
         // climbs from there. Weight 0 → the world has no craters (the GPU path skips the whole field).
         public double CraterWeight, CraterDensity, CraterFreq;
         public float IsCratered;             // 1 = crater albedo + maria apply (genuinely cratered world)
+        public double VolcanoWeight, VolcanoFreq, VolcanoDensity; // raised volcano cones (lava worlds)
+        public float IsLava;                 // 1 = lava world (emissive lava fields + glowing vents)
 
         // Biome / colour (for the per-pixel albedo in the render shader, mirroring ColorAt/LandBand).
-        public Vector3D<float> BaseColor, Rock, Snow, Cliff, Lowland;
+        public Vector3D<float> BaseColor, Rock, Snow, Cliff, Lowland, SubstrateTint;
         public float SnowLine, CliffThreshold, CliffStrength, SurfaceTempK;
         public float HasLife;               // 1 = supports vegetation (liquid water + atmosphere)
         public double MoistureFreq, MoistureBias, Amplitude;
@@ -454,7 +470,10 @@ public sealed class PlanetTerrain
             CraterDensity = Math.Clamp(_craterDensity * PlanetTuning.EffectiveCraterDensity(Type), 0.0, 1.0),
             CraterFreq = _craterFreqA * 0.5 * fs,
             IsCratered = IsCratered ? 1f : 0f,
-            BaseColor = _baseColor, Rock = PlanetTuning.EffectiveRock(Type), Snow = PlanetTuning.EffectiveSnow(Type),
+            VolcanoWeight = _volcanoWeight, VolcanoFreq = _volcanoFreq * fs, VolcanoDensity = _volcanoDensity,
+            IsLava = Type == PlanetType.Lava ? 1f : 0f,
+            BaseColor = _baseColor, SubstrateTint = _substrateTint,
+            Rock = PlanetTuning.EffectiveRock(Type), Snow = PlanetTuning.EffectiveSnow(Type),
             Cliff = PlanetTuning.EffectiveCliff(Type), Lowland = PlanetTuning.EffectiveLowland(Type),
             SnowLine = PlanetTuning.EffectiveSnowLine(Type),
             CliffThreshold = PlanetTuning.EffectiveCliffThreshold(Type),
@@ -524,7 +543,40 @@ public sealed class PlanetTerrain
                 (float)CraterOctavesForSpacing(sampleSpacing), (float)p.CraterDensity, seed);
             shape += (float)p.CraterWeight * crater;
         }
+        if (p.VolcanoWeight > 0.0)
+            shape += (float)p.VolcanoWeight * GpuVolcano(dir, (float)p.VolcanoFreq, (float)p.VolcanoDensity, seed);
         return p.Scale * shape;
+    }
+
+    /// <summary>Float mirror of the gen shader's <c>volcanoField</c> height (.x): sparse raised cones with a
+    /// summit caldera, max-combined. Lets the rover/near-plane sit on the baked volcanoes.</summary>
+    private static float GpuVolcano(Vector3D<float> dir, float freq, float density, Vector3D<float> seed)
+    {
+        Vector3D<float> p = dir * freq;
+        var ip = new Vector3D<float>(MathF.Floor(p.X), MathF.Floor(p.Y), MathF.Floor(p.Z));
+        float h = 0f;
+        for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            var c = ip + new Vector3D<float>(dx, dy, dz);
+            float ex = GpuHash13(c + new Vector3D<float>(7f, 7f, 7f), seed);
+            if (ex > density) continue;
+            var jit = new Vector3D<float>(
+                GpuHash13(c + new Vector3D<float>(3.1f, 3.1f, 3.1f), seed),
+                GpuHash13(c + new Vector3D<float>(8.7f, 8.7f, 8.7f), seed),
+                GpuHash13(c + new Vector3D<float>(1.9f, 1.9f, 1.9f), seed));
+            float radius = 0.45f + 0.25f * GpuFractF(ex * 5f + 0.3f);
+            var d = p - (c + jit);
+            float t = MathF.Sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z) / radius;
+            if (t >= 1f) continue;
+            const float rimT = 0.30f;
+            float flank = SmoothstepF(1f, rimT, t);
+            float cone = t < rimT ? LerpF(0.55f, 1f, SmoothstepF(0f, rimT, t)) : flank;
+            float ch = cone * (0.7f + 0.6f * GpuFractF(ex * 11f));
+            if (ch > h) h = ch;
+        }
+        return h;
     }
 
     /// <summary>Float mirror of the GPU generator's GLSL crater cascade (see <c>TerrainTileGenerator</c>):
@@ -982,10 +1034,26 @@ public sealed class PlanetTerrain
         }
 
         Vector3D<float> land = LandBand(dir, height, amplitude, slope);
+        if (Type == PlanetType.Lava) return LavaAlbedo(land, dir, height); // glowing fissures over dark crust
         if (!IsCratered) return land;
         // Airless cratered worlds get crater-floor/rim albedo and maria provinces over the bare land.
         double cr = craterKnown ? craterValue : CraterField(dir, PlanetTuning.EffectiveFrequency(Type), sampleSpacing);
         return RegolithAlbedo(land, dir, cr);
+    }
+
+    /// <summary>Bright molten-lava albedo over the cooled crust on lava worlds: glowing fissures pooled in
+    /// the low/cracked ground, pushed bright (so the distant sphere blooms). Mirrors the GPU emissive field;
+    /// vents are added per-pixel in the GPU shader (this drives the baked map + CPU fallback far view).</summary>
+    private Vector3D<float> LavaAlbedo(Vector3D<float> crust, Vector3D<double> dir, double height)
+    {
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+        double lowness = 1.0 - Smoothstep(-0.15 * Amplitude, 0.15 * Amplitude, height);
+        double veinN = _noise.Fbm(dir, 4, _mountainFreq * fs * 6.0, 2.0, 0.5);
+        double cracks = Smoothstep(0.82, 1.0, 1.0 - Math.Abs(veinN));
+        float heat = (float)Math.Clamp(lowness * cracks, 0.0, 1.0);
+        var lavaCol = Lerp(new Vector3D<float>(0.6f, 0.06f, 0f), new Vector3D<float>(1f, 0.5f, 0.1f), Smoothstepf(0.15f, 0.65f, heat));
+        lavaCol = Lerp(lavaCol, new Vector3D<float>(1f, 0.92f, 0.6f), Smoothstepf(0.65f, 1f, heat));
+        return Lerp(crust, lavaCol, heat);
     }
 
     /// <summary>
@@ -1026,7 +1094,7 @@ public sealed class PlanetTerrain
     private Vector3D<float> LandBand(Vector3D<double> dir, double height, double amplitude, double slope)
     {
         double temp = Temperature01(dir, height, amplitude);
-        double moist = Moisture01(dir);
+        double moist = Moisture01(dir, height, amplitude);
         Vector3D<float> ground = BiomeGround(temp, moist);
 
         Vector3D<float> rock = PlanetTuning.EffectiveRock(Type);
@@ -1067,17 +1135,56 @@ public sealed class PlanetTerrain
         return Math.Clamp(tBase - 0.55 * Math.Pow(lat, 1.3) - 0.55 * elevAbove, 0.0, 1.0);
     }
 
-    /// <summary>Point moisture in [0,1] from a low-frequency field, biased wet/dry per world class.</summary>
-    private double Moisture01(Vector3D<double> dir)
+    /// <summary>Geographic moisture in [0,1]: latitude rain belts (wet tropics, dry subtropics, moist
+    /// temperate, dry poles) × orographic drying (higher ground is drier) × regional variation, biased
+    /// wet/dry per world class. Reads as geography rather than as a uniform random field.</summary>
+    private double Moisture01(Vector3D<double> dir, double height, double amplitude)
     {
-        var p = dir + new Vector3D<double>(17.3, 5.9, 42.1); // decorrelate from continents/ruggedness
-        double m = 0.5 + 0.5 * _noise.Fbm(p, 4, _moistureFreq, 2.0, 0.5);
-        return Math.Clamp(m + _moistureBias, 0.0, 1.0);
+        double lat = Math.Abs(dir.Y); // sin(latitude): 0 equator, 1 pole
+        double tropics = 1.0 - Smoothstep(0.0, 0.45, lat);                       // wet equatorial belt
+        double temperateBelt = Smoothstep(0.5, 0.7, lat) * (1.0 - Smoothstep(0.8, 0.97, lat)); // moist mid-latitudes
+        double band = Math.Clamp(Math.Max(tropics, 0.75 * temperateBelt), 0.0, 1.0);
+        double elevDry = Math.Clamp(Math.Max(0.0, height) / Math.Max(1.0, amplitude), 0.0, 1.0);
+        var p = dir + new Vector3D<double>(17.3, 5.9, 42.1);                     // regional variation
+        double regional = 0.5 + 0.5 * _noise.Fbm(p, 4, _moistureFreq, 2.0, 0.5);
+        double m = band * (1.0 - 0.55 * elevDry) * (0.6 + 0.8 * regional) + _moistureBias;
+        return Math.Clamp(m, 0.0, 1.0);
+    }
+
+    /// <summary>A representative abiotic ground colour from the scanned surface composition, so an
+    /// iron-oxide desert reads rust, a sulphur/obsidian lava crust yellow-black, an icy world pale blue —
+    /// instead of every lifeless world reading temperate-grey. Weighted average of per-mineral colours by
+    /// fraction; this is the SAME data the scanner shows.</summary>
+    private static Vector3D<float> MineralTint(Constituent[] comp)
+    {
+        if (comp == null || comp.Length == 0) return new Vector3D<float>(0.5f, 0.48f, 0.45f);
+        Vector3D<float> sum = default; float wsum = 0f;
+        foreach (Constituent c in comp) { sum += MineralColor(c.Name) * c.Fraction; wsum += c.Fraction; }
+        return wsum > 0f ? sum / wsum : new Vector3D<float>(0.5f, 0.48f, 0.45f);
+    }
+
+    private static Vector3D<float> MineralColor(string name)
+    {
+        string n = name.ToLowerInvariant();
+        if (n.Contains("iron oxide") || n.Contains("hematite") || n.Contains("rust")) return new(0.62f, 0.30f, 0.20f);
+        if (n.Contains("iron"))     return new(0.45f, 0.40f, 0.38f);   // metallic grey
+        if (n.Contains("sulphur") || n.Contains("sulfur")) return new(0.85f, 0.74f, 0.22f); // yellow
+        if (n.Contains("obsidian")) return new(0.10f, 0.10f, 0.13f);   // black glass
+        if (n.Contains("basalt"))   return new(0.26f, 0.25f, 0.27f);   // dark volcanic grey
+        if (n.Contains("granite"))  return new(0.60f, 0.55f, 0.52f);   // pinkish grey
+        if (n.Contains("gypsum"))   return new(0.90f, 0.89f, 0.84f);   // white
+        if (n.Contains("clay"))     return new(0.60f, 0.46f, 0.32f);   // brown
+        if (n.Contains("silica") || n.Contains("sand")) return new(0.80f, 0.72f, 0.50f); // tan
+        if (n.Contains("ammonia"))  return new(0.86f, 0.84f, 0.66f);   // pale yellow ice
+        if (n.Contains("carbon") || n.Contains("co2") || n.Contains("dioxide")) return new(0.90f, 0.90f, 0.92f);
+        if (n.Contains("water") || n.Contains("ice")) return new(0.82f, 0.88f, 0.94f); // pale blue ice
+        if (n.Contains("regolith") || n.Contains("rock") || n.Contains("silicate")) return new(0.50f, 0.48f, 0.45f);
+        return new(0.55f, 0.52f, 0.49f); // neutral
     }
 
     /// <summary>Whittaker-style ground colour from temperature × moisture. The abiotic substrate
-    /// (frozen → temperate rock/tint → hot sand) always applies; vegetation overlays it only where
-    /// the world can support it (liquid water + atmosphere), and only in the warm, moist middle.</summary>
+    /// (frozen → temperate → hot sand, shifted toward the world's mineral colour) always applies;
+    /// vegetation overlays it on life-bearing worlds via a full arid↔wet × cold↔hot biome matrix.</summary>
     private Vector3D<float> BiomeGround(double temp, double moist)
     {
         Vector3D<float> tint = PlanetTuning.EffectiveLowland(Type);
@@ -1087,20 +1194,25 @@ public sealed class PlanetTerrain
         Vector3D<float> substrate = temp < 0.5
             ? Lerp(frozen, temperate, (float)(temp / 0.5))
             : Lerp(temperate, hot, (float)((temp - 0.5) / 0.5));
+        substrate = Lerp(substrate, _substrateTint, 0.45f);    // composition-driven hue
 
         if (!_hasLife) return substrate;
 
-        var tundra = new Vector3D<float>(0.45f, 0.46f, 0.34f);
-        var grass = new Vector3D<float>(0.48f, 0.56f, 0.28f);
-        var forest = new Vector3D<float>(0.20f, 0.42f, 0.18f);
-        var jungle = new Vector3D<float>(0.12f, 0.40f, 0.15f);
-        Vector3D<float> veg;
-        if (temp < 0.35) veg = Lerp(tundra, forest, (float)Smoothstep(0.15, 0.35, temp));
-        else if (temp < 0.7) veg = Lerp(grass, forest, (float)moist);
-        else veg = Lerp(substrate, jungle, (float)moist); // hot+dry stays desert, hot+wet turns jungle
+        // Whittaker vegetation matrix: an arid axis (lichen tundra → steppe → desert) blended by moisture
+        // to a wet axis (boreal taiga → temperate forest → tropical jungle), each interpolated over
+        // temperature — so cold-wet reads taiga, temperate-wet forest, hot-wet jungle, warm-dry savanna/steppe.
+        var aridCold = new Vector3D<float>(0.52f, 0.52f, 0.42f);  // lichen tundra
+        var aridWarm = new Vector3D<float>(0.66f, 0.62f, 0.34f);  // steppe / dry grass / savanna
+        var aridHot = hot;                                        // desert sand
+        var wetCold = new Vector3D<float>(0.16f, 0.34f, 0.20f);   // boreal taiga
+        var wetWarm = new Vector3D<float>(0.22f, 0.46f, 0.18f);   // temperate forest
+        var wetHot = new Vector3D<float>(0.10f, 0.40f, 0.14f);    // tropical jungle
+        Vector3D<float> arid = temp < 0.5 ? Lerp(aridCold, aridWarm, (float)(temp / 0.5)) : Lerp(aridWarm, aridHot, (float)((temp - 0.5) / 0.5));
+        Vector3D<float> wet = temp < 0.5 ? Lerp(wetCold, wetWarm, (float)(temp / 0.5)) : Lerp(wetWarm, wetHot, (float)((temp - 0.5) / 0.5));
+        Vector3D<float> veg = Lerp(arid, wet, (float)Smoothstep(0.2, 0.8, moist));
 
         // Lushness needs warmth and moisture; frozen wastes and parched deserts stay bare substrate.
-        double lush = Smoothstep(0.12, 0.35, temp) * Smoothstep(0.25, 0.6, moist);
+        double lush = Smoothstep(0.12, 0.35, temp) * Smoothstep(0.2, 0.55, moist);
         return Lerp(substrate, veg, (float)lush);
     }
 

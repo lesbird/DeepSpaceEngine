@@ -543,8 +543,11 @@ uniform float uMtnFreqR, uMtnWeightR, uMtnGainR; uniform float uMtnMaxOctR;
 uniform float uWarpFreqR, uWarpStrR;
 uniform float uRuggedFreqR, uRuggedLoR, uRuggedHiR;
 uniform float uCraterFreqR, uCraterWeightR, uCraterDensityR; // crater relief (airless worlds; uIsCratered gates)
+// Emissive lava (lava worlds): glowing fissures in the low/cracked ground + glowing volcano vents.
+uniform float uIsLava, uLavaGlow, uLavaFreq;
+uniform float uVolcanoFreqR, uVolcanoDensityR;
 // Biome / colour (per-pixel port of ColorAt / LandBand).
-uniform vec3 uBaseColor, uRock, uSnow, uCliff, uLowland;
+uniform vec3 uBaseColor, uRock, uSnow, uCliff, uLowland, uSubstrateTint;
 uniform float uSnowLine, uCliffThreshold, uCliffStrength, uSurfaceTempK, uHasLife;
 uniform float uMoistureFreq, uMoistureBias, uAmplitude;
 // Fragment detail layer (shared design with the CPU terrain shader).
@@ -617,18 +620,28 @@ vec3 biomeColor(vec3 dir, float elevM, float slope) {
     float lat = abs(dir.y);
     float elevAbove = max(0.0, elevM / uAmplitude);
     float temp = clamp(tBase - 0.55 * pow(lat, 1.3) - 0.55 * elevAbove, 0.0, 1.0);
-    float moist = clamp(0.5 + 0.5 * fbm3(dir + vec3(17.3, 5.9, 42.1), uMoistureFreq) + uMoistureBias, 0.0, 1.0);
+    // Geographic moisture: latitude rain belts × orographic drying × regional variation (mirrors Moisture01).
+    float tropics = 1.0 - smoothstep(0.0, 0.45, lat);
+    float temperateBelt = smoothstep(0.5, 0.7, lat) * (1.0 - smoothstep(0.8, 0.97, lat));
+    float rainBand = clamp(max(tropics, 0.75 * temperateBelt), 0.0, 1.0);
+    float regional = 0.5 + 0.5 * fbm3(dir + vec3(17.3, 5.9, 42.1), uMoistureFreq);
+    float moist = clamp(rainBand * (1.0 - 0.55 * elevAbove) * (0.6 + 0.8 * regional) + uMoistureBias, 0.0, 1.0);
 
     vec3 temperate = uBaseColor * uLowland;
+    vec3 hot = vec3(0.80, 0.62, 0.40);
     vec3 substrate = temp < 0.5 ? mix(vec3(0.78,0.82,0.86), temperate, temp / 0.5)
-                                : mix(temperate, vec3(0.80,0.62,0.40), (temp - 0.5) / 0.5);
+                                : mix(temperate, hot, (temp - 0.5) / 0.5);
+    substrate = mix(substrate, uSubstrateTint, 0.45);            // composition-driven hue
     vec3 ground = substrate;
     if (uHasLife > 0.5) {
-        vec3 veg;
-        if (temp < 0.35)      veg = mix(vec3(0.45,0.46,0.34), vec3(0.20,0.42,0.18), smoothstep(0.15, 0.35, temp));
-        else if (temp < 0.7)  veg = mix(vec3(0.48,0.56,0.28), vec3(0.20,0.42,0.18), moist);
-        else                  veg = mix(substrate, vec3(0.12,0.40,0.15), moist);
-        float lush = smoothstep(0.12, 0.35, temp) * smoothstep(0.25, 0.6, moist);
+        // Whittaker matrix: arid axis (tundra→steppe→desert) blended by moisture to the wet axis
+        // (taiga→temperate forest→jungle), each over temperature.
+        vec3 aridCold = vec3(0.52,0.52,0.42), aridWarm = vec3(0.66,0.62,0.34), aridHot = hot;
+        vec3 wetCold = vec3(0.16,0.34,0.20), wetWarm = vec3(0.22,0.46,0.18), wetHot = vec3(0.10,0.40,0.14);
+        vec3 arid = temp < 0.5 ? mix(aridCold, aridWarm, temp / 0.5) : mix(aridWarm, aridHot, (temp - 0.5) / 0.5);
+        vec3 wet  = temp < 0.5 ? mix(wetCold, wetWarm, temp / 0.5)   : mix(wetWarm, wetHot, (temp - 0.5) / 0.5);
+        vec3 veg = mix(arid, wet, smoothstep(0.2, 0.8, moist));
+        float lush = smoothstep(0.12, 0.35, temp) * smoothstep(0.2, 0.55, moist);
         ground = mix(substrate, veg, lush);
     }
 
@@ -780,7 +793,23 @@ void main() {
     float ambient = uAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up));
     vec3 Hh = normalize(normalize(uSunDir) + V);
     float spec = uSurfaceSpecular * pow(max(dot(N, Hh), 0.0), 30.0) * diff;
-    FragColor = vec4(col * (ambient + 0.95 * diff) + vec3(spec), 1.0);
+
+    // Lava worlds: emissive molten rock — glowing fissures pooled in the low/cracked ground plus glowing
+    // caldera vents at the volcano summits. Added AFTER lighting (so it glows on the night side) and pushed
+    // bright so the bloom pass haloes it; the cooled basalt crust (biome colour) stays dark between.
+    vec3 emissive = vec3(0.0);
+    if (uIsLava > 0.5 && uLavaGlow > 0.0) {
+        float lowness = 1.0 - smoothstep(-0.15 * uScale, 0.15 * uScale, vElev); // lava pools in low ground
+        float veinN = fbm3(up, uLavaFreq);                                      // [-1,1]
+        float cracks = smoothstep(0.82, 1.0, 1.0 - abs(veinN));                 // thin glowing fissures
+        float vent = tfVolcano(up, uVolcanoFreqR, uVolcanoDensityR, uSeedR).y;  // glowing caldera lava
+        float heat = clamp(max(lowness * cracks, vent), 0.0, 1.0);
+        vec3 lavaCol = mix(vec3(0.6, 0.06, 0.0), vec3(1.0, 0.5, 0.1), smoothstep(0.15, 0.65, heat));
+        lavaCol = mix(lavaCol, vec3(1.0, 0.92, 0.6), smoothstep(0.65, 1.0, heat));
+        emissive = uLavaGlow * heat * lavaCol;
+    }
+
+    FragColor = vec4(col * (ambient + 0.95 * diff) + vec3(spec) + emissive, 1.0);
 }";
 
     // --- GPU-path ocean surface ---
@@ -1254,6 +1283,7 @@ void main() {
 
         // Biome / colour (per-pixel albedo, mirroring ColorAt/LandBand).
         _gpuShader.SetVector3("uBaseColor", gp.BaseColor);
+        _gpuShader.SetVector3("uSubstrateTint", gp.SubstrateTint);
         _gpuShader.SetVector3("uRock", gp.Rock);
         _gpuShader.SetVector3("uSnow", gp.Snow);
         _gpuShader.SetVector3("uCliff", gp.Cliff);
@@ -1296,6 +1326,13 @@ void main() {
         _gpuShader.SetFloat("uCraterFreqR", (float)gp.CraterFreq);       // crater relief (gives orbital craters 3-D form)
         _gpuShader.SetFloat("uCraterWeightR", (float)gp.CraterWeight);
         _gpuShader.SetFloat("uCraterDensityR", (float)gp.CraterDensity);
+
+        // Emissive lava (lava worlds) — live glow strength.
+        _gpuShader.SetFloat("uIsLava", gp.IsLava);
+        _gpuShader.SetFloat("uLavaGlow", Math.Max(0f, TerrainTuning.LavaGlow));
+        _gpuShader.SetFloat("uLavaFreq", (float)(gp.MountainFreq * 6.0)); // crack/fissure frequency
+        _gpuShader.SetFloat("uVolcanoFreqR", (float)gp.VolcanoFreq);
+        _gpuShader.SetFloat("uVolcanoDensityR", (float)gp.VolcanoDensity);
 
         // Fragment detail layer (same knobs/scheme as the CPU shader).
         _detailNoiseFreq = DetailBaseFreq * Math.Max(0.01f, TerrainTuning.DetailNormalScale);
