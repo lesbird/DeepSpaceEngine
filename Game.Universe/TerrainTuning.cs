@@ -48,6 +48,10 @@ public static class TerrainTuning
     /// crust. Pushed above 1 so the bloom pass haloes it. Live (per-pixel on the GPU path; no rebuild).</summary>
     public static float LavaGlow = 2.5f;
 
+    /// <summary>Brightness of night-side city lights on inhabited (life-bearing) worlds; 0 = uninhabited
+    /// dark. Clustered on temperate coastal lowlands, visible from orbit, blooming. Live (no rebuild).</summary>
+    public static float CityGlow = 1.5f;
+
     /// <summary>Scales the fine, LOD-gated micro-relief height layer that only appears up close;
     /// 0 removes it. Changing it requires a terrain rebuild (it's geometry).</summary>
     public static float MicroDetailScale = 1.0f;

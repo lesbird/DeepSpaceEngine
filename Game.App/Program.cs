@@ -70,6 +70,7 @@ internal static class Program
     private static bool _prevF;
     private static bool _prevH;
     private static bool _hudVisible = true; // 'H' toggles all on-screen UI (reticles + panels)
+    private static float _eclipse;          // this frame's solar-eclipse coverage on the focused body [0,1]
     private static bool _prevB, _prevJ;
     private static string _jumpStatus = "";
     private static bool _scannerOpen;
@@ -403,12 +404,16 @@ internal static class Program
             }
         }
 
+        _eclipse = 0f; // only the body we're at can be eclipsed (set below); 0 keeps distant skies un-dimmed
         if (_terrainTarget != null)
         {
             SolarSystem sys = _systemManager.Active!;
             Vector3D<float> sunRel = sys.Sun.Position.ToCameraRelative(_camera.Position);
             Vector3D<float> planetRel = _terrainTarget.CurrentPosition.ToCameraRelative(_camera.Position);
             Vector3D<float> sunDir = Vector3D.Normalize(sunRel - planetRel);
+            sunDir = _terrainTarget.ApparentSunDir(sunDir, _systemManager.SimTime); // axial-rotation day/night
+            _eclipse = EclipseFactor(_terrainTarget, sys);  // a moon/planet occluding the sun → twilight
+            _terrainRenderer.Eclipse = _eclipse;
 
             // Reset depth before the terrain pass: the sun/planets/moons SystemRenderer just drew keep
             // their colour but drop back to the cleared far-depth. They were rendered with the system
@@ -443,7 +448,7 @@ internal static class Program
             _cloudRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
                 (float)_renderClock, _terrainTarget, _terrainRenderer.ActiveAmplitude, _postFbo);
             _atmosphereRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
-                _terrainTarget, _terrainRenderer.ActiveAmplitude);
+                _terrainTarget, _terrainRenderer.ActiveAmplitude, _systemManager.SimTime, _eclipse);
         }
 
         // Post-process bloom: bright-pass + blur off _postFbo (scene + atmosphere), then composite
@@ -755,13 +760,14 @@ internal static class Program
             terrainDirty |= ImGui.SliderFloat("Crater density", ref craterDensity, 0f, 3f);
             terrainDirty |= ImGui.SliderFloat("Crater albedo", ref TerrainTuning.CraterAlbedo, 0f, 2f);
             terrainDirty |= ImGui.SliderFloat("Maria", ref TerrainTuning.MariaStrength, 0f, 1.5f);
-            ImGui.SliderFloat("Lava glow", ref TerrainTuning.LavaGlow, 0f, 6f); // live (no rebuild)
-            ImGui.TextDisabled("(craters/maria: airless worlds; lava glow: lava worlds)");
+            ImGui.SliderFloat("Lava glow", ref TerrainTuning.LavaGlow, 0f, 6f);   // live (no rebuild)
+            ImGui.SliderFloat("City lights", ref TerrainTuning.CityGlow, 0f, 5f); // live (no rebuild)
+            ImGui.TextDisabled("(craters/maria: airless; lava: lava worlds; city lights: life worlds)");
             if (ImGui.Button("Reset terrain"))
             {
                 relief = 1f; mountain = 1f; freq = 1f; craterDepth = 1f; craterDensity = 1f;
                 TerrainTuning.CraterAlbedo = 1f; TerrainTuning.MariaStrength = 0.6f;
-                TerrainTuning.LavaGlow = 2.5f;
+                TerrainTuning.LavaGlow = 2.5f; TerrainTuning.CityGlow = 1.5f;
                 terrainDirty = true;
             }
         }
@@ -957,6 +963,39 @@ internal static class Program
         }
         dist = bestD;
         return best;
+    }
+
+    /// <summary>Solar-eclipse coverage [0,1] on <paramref name="focus"/>: the largest fraction of the sun's
+    /// angular disk any other body (a moon, the parent planet, a sibling) blocks as seen from this world —
+    /// 1 = totality. Dims the surface to twilight during an eclipse.</summary>
+    private static float EclipseFactor(CelestialBody focus, SolarSystem sys)
+    {
+        UniversePosition P = focus.CurrentPosition;
+        double dSun = P.DistanceTo(sys.Sun.Position);
+        if (dSun <= 1.0) return 0f;
+        Vector3D<double> toSun = Vector3D.Normalize(sys.Sun.Position.DeltaMeters(P)); // S - P
+        double sunAng = Math.Asin(Math.Clamp(sys.Sun.RadiusMeters / dSun, 0.0, 1.0));
+
+        float Cover(CelestialBody b)
+        {
+            if (ReferenceEquals(b, focus)) return 0f;
+            double dB = P.DistanceTo(b.CurrentPosition);
+            if (dB <= 1.0 || dB >= dSun) return 0f;             // must sit between this world and the sun
+            Vector3D<double> toB = Vector3D.Normalize(b.CurrentPosition.DeltaMeters(P));
+            double align = Vector3D.Dot(toB, toSun);
+            if (align <= 0.0) return 0f;                        // toward the sun, not behind us
+            double bAng = Math.Asin(Math.Clamp(b.RadiusMeters / dB, 0.0, 1.0));
+            double sep = Math.Acos(Math.Clamp(align, -1.0, 1.0));
+            return (float)Math.Clamp((sunAng + bAng - sep) / (2.0 * sunAng), 0.0, 1.0);
+        }
+
+        float ecl = 0f;
+        foreach (Planet pl in sys.Planets)
+        {
+            ecl = Math.Max(ecl, Cover(pl));
+            foreach (Moon mn in pl.Moons) ecl = Math.Max(ecl, Cover(mn));
+        }
+        return ecl;
     }
 
     /// <summary>ImGui colour swatch bound to a Silk <see cref="Vector3D{T}"/>. Returns true on edit.</summary>

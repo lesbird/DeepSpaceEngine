@@ -59,6 +59,29 @@ public abstract class CelestialBody
     public Constituent[] AtmosphereComposition = Array.Empty<Constituent>(); // empty when airless
     public Constituent[] SurfaceComposition = Array.Empty<Constituent>();    // empty for gas/ice giants
 
+    // Axial rotation (drives the day/night cycle). Seeded per body. The geometry/camera stay in the body's
+    // co-rotating frame, so rotation is expressed by sweeping the apparent SUN DIRECTION (see ApparentSunDir)
+    // rather than spinning the mesh — the terminator moves over the surface as sim time advances.
+    public double RotationPeriodSeconds;          // 0 = no spin (always-day/night by orbit only)
+    public Vector3D<double> SpinAxis = new(0, 1, 0); // unit, body/world frame (tilt = axial obliquity)
+
+    /// <summary>The sun direction as seen from this body's co-rotating surface at <paramref name="simTime"/>:
+    /// the true planet→sun direction rotated backward by the spin angle about <see cref="SpinAxis"/>, so a
+    /// fixed surface point sees the sun rise, cross the sky and set. Returns the input unchanged when the body
+    /// has no spin. Used by the terrain, rover and atmosphere so the ground and sky share one day/night.</summary>
+    public Vector3D<float> ApparentSunDir(Vector3D<float> trueSunDir, double simTime)
+    {
+        if (RotationPeriodSeconds <= 0.0) return trueSunDir;
+        double theta = -2.0 * Math.PI * simTime / RotationPeriodSeconds; // surface observer sees the sun move backward
+        double c = Math.Cos(theta), s = Math.Sin(theta);
+        var v = new Vector3D<double>(trueSunDir.X, trueSunDir.Y, trueSunDir.Z);
+        var k = Vector3D.Normalize(SpinAxis);
+        // Rodrigues rotation of v about k by theta.
+        Vector3D<double> r = v * c + Vector3D.Cross(k, v) * s + k * (Vector3D.Dot(k, v) * (1.0 - c));
+        r = Vector3D.Normalize(r);
+        return new Vector3D<float>((float)r.X, (float)r.Y, (float)r.Z);
+    }
+
     /// <summary>World position for the current simulation time (updated by SolarSystem).</summary>
     public UniversePosition CurrentPosition;
 

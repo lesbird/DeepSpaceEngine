@@ -43,6 +43,8 @@ uniform float uReliefFreq;      // macro-relief base frequency (cells over the u
 uniform float uCraterStrength;  // 0 = not a cratered (airless) world
 uniform float uCraterFreq;      // largest-crater base frequency
 uniform float uMariaStrength;   // dark basaltic-plain provinces (airless)
+uniform float uGasGiant;        // 1 = banded gas/ice giant (zonal cloud bands + storms)
+uniform float uBandFreq;        // number of zonal bands (latitude stripes)
 uniform float uPlanetRadiusM;
 uniform vec3  uSeedOffset;      // per-planet noise offset (variety)
 // Baked surface map for the focused body: exact-match albedo + planet-local normal. When present it
@@ -104,6 +106,18 @@ void main() {
         vec2 uv = dirToUv(N);
         col = texture(uAlbedoMap, uv).rgb;
         N = normalize(texture(uNormalMap, uv).rgb * 2.0 - 1.0);
+    } else if (uEmissive < 0.5 && uGasGiant > 0.5) {
+        // Banded gas/ice giant: zonal cloud bands (latitude stripes) warped by turbulence so they swirl
+        // rather than ring perfectly, with bright zones / dark belts, fine wind streaks, and a storm oval.
+        vec3 dir = N + uSeedOffset;
+        float warp = fbm(dir * 2.5) * 0.15 + fbm(dir * 7.0) * 0.05;        // turbulent distortion
+        float band = 0.5 + 0.5 * sin((N.y + warp) * uBandFreq);            // alternating zones
+        vec3 zone = uColor * 1.3;                                          // bright zones
+        vec3 belt = uColor * 0.55;                                         // dark belts
+        col = mix(belt, zone, smoothstep(0.3, 0.7, band));
+        col *= 1.0 + 0.07 * (fbm(dir * vec3(22.0, 7.0, 22.0)) * 2.0 - 1.0); // longitudinal wind streaks
+        float storm = smoothstep(0.78, 0.95, fbm(dir * 4.0 + vec3(5.3, 1.1, 2.7)));
+        col = mix(col, uColor * vec3(1.25, 0.8, 0.65), storm * 0.6);       // a Great-Red-Spot-ish storm
     } else if (uEmissive < 0.5 && (uReliefAmp > 0.0 || uCraterStrength > 0.0)) {
         vec3 dir = N + uSeedOffset;                                   // per-planet variety
         float fp = max(max(fwidth(N.x), fwidth(N.y)), fwidth(N.z));   // pixel footprint
@@ -345,6 +359,8 @@ void main() { FragColor = uColor; }";
         _planetShader.SetFloat("uCraterStrength", sp.CraterStrength);
         _planetShader.SetFloat("uCraterFreq", sp.CraterFreq);
         _planetShader.SetFloat("uMariaStrength", sp.MariaStrength);
+        _planetShader.SetFloat("uGasGiant", sp.GasGiant);
+        _planetShader.SetFloat("uBandFreq", sp.BandFreq);
         _planetShader.SetFloat("uPlanetRadiusM", (float)radius);
         _planetShader.SetVector3("uSeedOffset", sp.SeedOffset);
         _planetShader.SetFloat("uHasMap", useMap ? 1f : 0f);
@@ -356,24 +372,25 @@ void main() { FragColor = uColor; }";
     /// others get gentle relief. The seed offset varies the noise so worlds differ.</summary>
     private readonly record struct SurfaceParams(
         float ReliefAmp, float ReliefFreq, float CraterStrength, float CraterFreq, float MariaStrength,
-        Vector3D<float> SeedOffset)
+        Vector3D<float> SeedOffset, float GasGiant, float BandFreq)
     {
-        public static readonly SurfaceParams None = new(0f, 0f, 0f, 0f, 0f, default);
+        public static readonly SurfaceParams None = new(0f, 0f, 0f, 0f, 0f, default, 0f, 0f);
     }
 
     private static SurfaceParams ParamsFor(CelestialBody b)
     {
-        if (!b.HasSurface) return SurfaceParams.None; // gas/ice giants keep their flat banding colour
-        bool airless = !b.HasAtmosphere;
         var rng = new DeterministicRng(Hashing.Combine(b.Seed, 0xB0DEu));
         var off = new Vector3D<float>((float)rng.Range(0, 128), (float)rng.Range(0, 128), (float)rng.Range(0, 128));
+        if (!b.HasSurface) // gas/ice giants → zonal cloud bands + storms
+            return new SurfaceParams(0f, 0f, 0f, 0f, 0f, off, GasGiant: 1f, BandFreq: (float)rng.Range(10.0, 22.0));
+        bool airless = !b.HasAtmosphere;
         return new SurfaceParams(
             ReliefAmp: (float)(b.RadiusMeters * (airless ? 0.020 : 0.012)),
             ReliefFreq: 6f,
             CraterStrength: airless ? 1f : 0f,
             CraterFreq: 18f,
             MariaStrength: airless ? 0.6f : 0f,
-            SeedOffset: off);
+            SeedOffset: off, GasGiant: 0f, BandFreq: 0f);
     }
 
     /// <summary>Near/far planes from the most recent <see cref="FitProjection"/> (for depth reconstruction).</summary>

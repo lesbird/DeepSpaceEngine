@@ -201,6 +201,8 @@ void main() {
     // radius so low terrain gets hazed; distant bodies stay smooth spheres at their base radius.
     private CelestialBody? _groundBody;
     private double _groundAmplitude;
+    private double _simTime; // for the per-body axial-rotation day/night (ApparentSunDir)
+    private float _eclipse;  // focused-body solar-eclipse coverage [0,1] — dims the sky to twilight
 
     public AtmosphereRenderer(GL gl)
     {
@@ -216,7 +218,8 @@ void main() {
     /// <paramref name="far"/> are the projection planes that wrote it (the dominant geometry's).
     /// </summary>
     public void Render(Camera camera, SolarSystem system, uint depthTexture, float near, float far,
-        CelestialBody? groundBody = null, double groundAmplitudeMeters = 0.0)
+        CelestialBody? groundBody = null, double groundAmplitudeMeters = 0.0, double simTime = 0.0,
+        float eclipse = 0f)
     {
         if (!Enabled || system.Planets.Length == 0) return;
         _depthTexture = depthTexture;
@@ -224,6 +227,8 @@ void main() {
         _depthFar = far;
         _groundBody = groundBody;
         _groundAmplitude = groundAmplitudeMeters;
+        _simTime = simTime;
+        _eclipse = eclipse;
         UniversePosition cam = camera.Position;
         Vector3D<float> sunRel = system.Sun.Position.ToCameraRelative(cam);
 
@@ -261,7 +266,7 @@ void main() {
         _shader.SetVector3("uUp", camera.Up);
         _shader.SetFloat("uTanHalfFov", MathF.Tan(camera.FovRadians * 0.5f));
         _shader.SetFloat("uAspect", camera.AspectRatio);
-        _shader.SetFloat("uSunI", SunIntensity);
+        _shader.SetFloat("uSunI", SunIntensity * (1f - 0.9f * Math.Clamp(_eclipse, 0f, 1f))); // eclipse → twilight sky
         _shader.SetFloat("uExposure", Exposure);
         _shader.SetFloat("uMieG", Math.Clamp(MieG, -0.95f, 0.95f));
         _shader.SetFloat("uDebug", DebugTransmittance ? 1f : 0f);
@@ -289,6 +294,9 @@ void main() {
 
         Vector3D<float> planetRel = p.CurrentPosition.ToCameraRelative(cam);
         Vector3D<float> sunDir = Vector3D.Normalize(sunRel - planetRel);
+        // Rotate the sun only for the body we're standing on, so its sky matches the spun terrain. Distant
+        // planets keep the true sun, matching their (un-rotated) SystemRenderer spheres — no terminator split.
+        if (ReferenceEquals(p, _groundBody)) sunDir = p.ApparentSunDir(sunDir, _simTime);
         Vector3D<float> planetScaled = planetRel * (float)(1.0 / rp); // ~1.0 in magnitude
 
         // Size-independent optical depth: beta = tau / scaleHeight. Rayleigh keeps the λ⁻⁴ blue ratio,

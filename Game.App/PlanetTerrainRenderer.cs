@@ -546,6 +546,8 @@ uniform float uCraterFreqR, uCraterWeightR, uCraterDensityR; // crater relief (a
 // Emissive lava (lava worlds): glowing fissures in the low/cracked ground + glowing volcano vents.
 uniform float uIsLava, uLavaGlow, uLavaFreq;
 uniform float uVolcanoFreqR, uVolcanoDensityR;
+uniform float uCityGlow, uCityFreq; // night-side city lights on inhabited worlds (uHasLife gates)
+uniform float uEclipse;             // solar-eclipse coverage [0,1] — dims the sunlit surface to twilight
 // Biome / colour (per-pixel port of ColorAt / LandBand).
 uniform vec3 uBaseColor, uRock, uSnow, uCliff, uLowland, uSubstrateTint;
 uniform float uSnowLine, uCliffThreshold, uCliffStrength, uSurfaceTempK, uHasLife;
@@ -789,8 +791,9 @@ void main() {
 
     // Lighting: hemispheric ambient + diffuse + a subtle specular so the detail normals catch the sun.
     vec3 V = normalize(-vWorld);
-    float diff = max(dot(N, normalize(uSunDir)), 0.0);
-    float ambient = uAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up));
+    float sunlit = 1.0 - 0.95 * uEclipse;                  // solar eclipse → the sun all but vanishes
+    float diff = max(dot(N, normalize(uSunDir)), 0.0) * sunlit;
+    float ambient = uAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up)) * mix(1.0, 0.2, uEclipse);
     vec3 Hh = normalize(normalize(uSunDir) + V);
     float spec = uSurfaceSpecular * pow(max(dot(N, Hh), 0.0), 30.0) * diff;
 
@@ -807,6 +810,27 @@ void main() {
         vec3 lavaCol = mix(vec3(0.6, 0.06, 0.0), vec3(1.0, 0.5, 0.1), smoothstep(0.15, 0.65, heat));
         lavaCol = mix(lavaCol, vec3(1.0, 0.92, 0.6), smoothstep(0.65, 1.0, heat));
         emissive = uLavaGlow * heat * lavaCol;
+    }
+
+    // City lights: warm clustered glow on the NIGHT side of inhabited worlds (a sign of civilisation from
+    // orbit). Habitable land only — temperate latitudes, low coastal ground (not deep ocean or high peaks) —
+    // brightest where it is dark. Clusters = low-freq regions × finer sparkle; pushed bright so it blooms.
+    if (uHasLife > 0.5 && uCityGlow > 0.0) {
+        float sunFace = dot(up, normalize(uSunDir));
+        float night = 1.0 - smoothstep(-0.12, 0.10, sunFace);          // 1 on the dark side
+        // City lights are an ORBITAL effect: from far the clusters read as points, but up close one cluster
+        // magnifies into a smooth glowing blob (we don't model individual windows). So fade them out as you
+        // descend toward the surface — full from orbit, gone by low altitude.
+        float cityFade = smoothstep(uPlanetRadius * 0.012, uPlanetRadius * 0.08, length(vWorld));
+        if (night * cityFade > 0.01) {
+            float elevN = vElev / max(1.0, uAmplitude);
+            float lowOk = smoothstep(-0.02, 0.05, elevN) * (1.0 - smoothstep(0.15, 0.40, elevN)); // coastal lowland
+            float tempOk = 1.0 - smoothstep(0.6, 0.95, abs(up.y));      // not polar
+            float region = smoothstep(0.5, 0.85, 0.5 + 0.5 * fbm3(up, uCityFreq * 0.25));   // populated regions
+            float sparkle = smoothstep(0.55, 0.95, 0.5 + 0.5 * fbm3(up + vec3(11.0, 4.0, 7.0), uCityFreq * 1.6)); // lights
+            float city = night * cityFade * lowOk * tempOk * region * sparkle;
+            emissive += uCityGlow * city * vec3(1.0, 0.84, 0.5);       // warm sodium glow
+        }
     }
 
     FragColor = vec4(col * (ambient + 0.95 * diff) + vec3(spec) + emissive, 1.0);
@@ -936,6 +960,11 @@ void main() {
     /// even when the chase camera is a little farther back. Null disables it.
     /// </summary>
     public UniversePosition? FocusPoint;
+
+    /// <summary>Solar-eclipse coverage in [0,1] (another body occluding the sun as seen from this world):
+    /// 0 = full sun, 1 = totality. Dims the lit terrain so the surface goes to twilight during an eclipse.
+    /// Set by the host each frame before <see cref="Render"/>.</summary>
+    public float Eclipse;
 
     public PlanetTerrainRenderer(GL gl)
     {
@@ -1333,6 +1362,9 @@ void main() {
         _gpuShader.SetFloat("uLavaFreq", (float)(gp.MountainFreq * 6.0)); // crack/fissure frequency
         _gpuShader.SetFloat("uVolcanoFreqR", (float)gp.VolcanoFreq);
         _gpuShader.SetFloat("uVolcanoDensityR", (float)gp.VolcanoDensity);
+        _gpuShader.SetFloat("uCityGlow", Math.Max(0f, TerrainTuning.CityGlow));
+        _gpuShader.SetFloat("uCityFreq", (float)(gp.ContinentFreq * 14.0)); // city-cluster frequency
+        _gpuShader.SetFloat("uEclipse", Math.Clamp(Eclipse, 0f, 1f));
 
         // Fragment detail layer (same knobs/scheme as the CPU shader).
         _detailNoiseFreq = DetailBaseFreq * Math.Max(0.01f, TerrainTuning.DetailNormalScale);
