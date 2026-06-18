@@ -100,6 +100,16 @@ produces a small, precise float vector relative to the camera (floating origin).
 
 ## Build & run
 
+**Prerequisites — the [.NET 7 SDK](https://dotnet.microsoft.com/download/dotnet/7.0).** If you downloaded
+this repo as a ZIP and `dotnet build` / `dotnet run` does nothing — or you see `dotnet: command not found` —
+you just need the SDK. Download it free from Microsoft's official page and pick the **SDK** installer for your
+platform:
+
+- **[.NET 7.0 downloads (all platforms)](https://dotnet.microsoft.com/download/dotnet/7.0)** — e.g. macOS
+  Arm64 (`.pkg`), Windows x64 (`.exe`), or Linux.
+
+Confirm it's installed with `dotnet --version` (should print `7.x`), then:
+
 ```sh
 dotnet build                       # build everything
 dotnet test                        # run the coordinate/hashing test suite
