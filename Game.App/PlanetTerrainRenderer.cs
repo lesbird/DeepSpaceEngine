@@ -433,42 +433,88 @@ void main() {
     private const string GpuVertexSource = @"#version 410 core
 layout(location = 0) in vec3 aBasePos;   // R*(dir - centerDir): patch-centre-relative, small & precise
 layout(location = 1) in vec3 aDir;       // outward unit direction at this vertex
-layout(location = 2) in vec2 aTexel;     // (i, j) texel of this vertex in the height tile
+layout(location = 2) in vec2 aTexel;     // guard-offset texel (grid index + 1) of this vertex in its tile
 layout(location = 3) in float aSkirt;    // 1 = skirt vertex (dropped below the surface to hide LOD cracks)
 uniform mat4 uMVP;
 uniform mat4 uModel;        // camera-relative patch-centre translation
 uniform float uMorph;       // geomorph fine→coarse blend
 uniform float uSkirtDepth;
+uniform float uVertexSpacing; // metres between adjacent vertices (for the height-slope normal)
+uniform float uGridN;       // cells per patch edge (= GridN)
+uniform vec4 uRect;         // (u0, v0, u1, v1) of this patch on the cube face
+uniform int uFace;
 uniform vec2 uTileOrigin;   // this patch's tile origin (texels) in the atlas
 uniform sampler2D uHeight;
 out vec3 vWorld;
 out vec3 vDir;
+out vec3 vNormal;           // smooth surface normal from the height field (planet-local)
+out float vElev;            // morphed height (for albedo)
+
+vec3 facePoint(int f, float u, float v) {
+    float a = u * 2.0 - 1.0, b = v * 2.0 - 1.0;
+    vec3 p;
+    if (f == 0)      p = vec3( 1.0,  b,  -a);
+    else if (f == 1) p = vec3(-1.0,  b,   a);
+    else if (f == 2) p = vec3(  a, 1.0,  -b);
+    else if (f == 3) p = vec3(  a,-1.0,   b);
+    else if (f == 4) p = vec3(  a,  b,  1.0);
+    else             p = vec3( -a,  b, -1.0);
+    return normalize(p);
+}
+
+float H(ivec2 t) { vec2 hfc = texelFetch(uHeight, t, 0).rg; return mix(hfc.x, hfc.y, uMorph); }
+
 void main() {
-    vec2 hfc = texelFetch(uHeight, ivec2(int(uTileOrigin.x) + int(aTexel.x), int(uTileOrigin.y) + int(aTexel.y)), 0).rg;
-    float h = mix(hfc.x, hfc.y, uMorph);
-    if (aSkirt > 0.5) h -= uSkirtDepth;
-    vec3 posRel = aBasePos + aDir * h;     // base sphere (small) + radial displacement (small) — float-safe
+    ivec2 o = ivec2(int(uTileOrigin.x), int(uTileOrigin.y)) + ivec2(int(aTexel.x), int(aTexel.y));
+    float h   = H(o);
+    float hu1 = H(o + ivec2(1, 0)), hu0 = H(o - ivec2(1, 0));   // guard ring makes these valid at edges
+    float hv1 = H(o + ivec2(0, 1)), hv0 = H(o - ivec2(0, 1));
+
+    // Surface tangents from the cube-face mapping (unit-direction differences — float-precise), and the
+    // height slope along each → a smooth per-vertex normal (interpolated to per-pixel in the fragment).
+    vec2 g = aTexel - vec2(1.0);
+    float u = mix(uRect.x, uRect.z, g.x / uGridN);
+    float v = mix(uRect.y, uRect.w, g.y / uGridN);
+    vec3 tangU = normalize(facePoint(uFace, u + 0.0005, v) - facePoint(uFace, u - 0.0005, v));
+    vec3 tangV = normalize(facePoint(uFace, u, v + 0.0005) - facePoint(uFace, u, v - 0.0005));
+    float slopeU = (hu1 - hu0) / (2.0 * uVertexSpacing);
+    float slopeV = (hv1 - hv0) / (2.0 * uVertexSpacing);
+    vNormal = normalize(aDir - tangU * slopeU - tangV * slopeV);
+
+    float hh = h;
+    if (aSkirt > 0.5) hh -= uSkirtDepth;
+    vec3 posRel = aBasePos + aDir * hh;     // base sphere (small) + radial displacement (small) — float-safe
     vWorld = (uModel * vec4(posRel, 1.0)).xyz;
     vDir = aDir;
+    vElev = h;
     gl_Position = uMVP * vec4(posRel, 1.0);
 }";
 
     private const string GpuFragmentSource = @"#version 410 core
 in vec3 vWorld;
 in vec3 vDir;
+in vec3 vNormal;
+in float vElev;
 uniform vec3 uSunDir;
 uniform float uAmbient;
+uniform float uScale;       // relief amplitude (metres), to normalise elevation for the albedo ramp
 out vec4 FragColor;
 void main() {
-    // Phase 3: flat geometric normal from the screen-space derivative of the displaced position (proves
-    // the relief is real). Per-pixel normal/albedo tiles replace this in the next phase.
-    vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+    vec3 N = normalize(vNormal);
     vec3 up = normalize(vDir);
-    if (dot(N, up) < 0.0) N = -N;
     float diff = max(dot(N, normalize(uSunDir)), 0.0);
-    float slope = clamp(dot(N, up), 0.0, 1.0);           // 1 on flats → 0 on cliffs
-    vec3 col = mix(vec3(0.40, 0.38, 0.36), vec3(0.56, 0.55, 0.52), slope);
-    FragColor = vec4(col * (uAmbient + 0.95 * diff), 1.0);
+    float slope = clamp(dot(N, up), 0.0, 1.0);               // 1 on flats → 0 on cliffs
+    float elev = clamp(vElev / max(1.0, uScale) * 0.5 + 0.5, 0.0, 1.0);
+
+    // Procedural albedo (first cut): rock, snow on high & gentle ground, dark bare rock on cliffs.
+    vec3 rock  = vec3(0.42, 0.40, 0.37);
+    vec3 snow  = vec3(0.90, 0.92, 0.96);
+    vec3 cliff = vec3(0.26, 0.24, 0.22);
+    vec3 col = mix(rock, snow, smoothstep(0.60, 0.80, elev) * smoothstep(0.55, 0.85, slope));
+    col = mix(cliff, col, smoothstep(0.40, 0.70, slope));    // steep faces → bare cliff
+
+    float ambient = uAmbient * mix(0.5, 1.0, 0.5 + 0.5 * dot(N, up)); // hemispheric fill
+    FragColor = vec4(col * (ambient + 0.95 * diff), 1.0);
 }";
 
     // Ocean swell waves (planet-local). The CPU phase base and the shader's spatial term share these,
@@ -823,10 +869,11 @@ void main() {
 
     private void EnsureGpuResources()
     {
-        // Tile = vertex grid res. Pool sized above a deep descent's drawn-leaf count (CPU mode reaches
-        // ~1100 drawn + frontier), so the working set fits without thrashing; AllocateLayer fails soft if
-        // it's ever exceeded. ~17² RG32F × 4096 ≈ 9 MB.
-        _tileCache ??= new TerrainTileCache(_gl, GridN + 1, 4096);
+        // Tile = vertex grid res (GridN+1) plus a 1-texel guard ring on every side (→ GridN+3), so an
+        // edge vertex can central-difference its normal from in-tile texels — no lighting seam. Pool is
+        // sized above a deep descent's drawn-leaf count (CPU mode reaches ~1100 + frontier); AllocateLayer
+        // fails soft if it's ever exceeded.
+        _tileCache ??= new TerrainTileCache(_gl, GridN + 3, 4096);
         _tileGen ??= new TerrainTileGenerator(_gl);
         _gpuShader ??= new Shader(_gl, GpuVertexSource, GpuFragmentSource);
     }
@@ -858,6 +905,8 @@ void main() {
         _gpuShader!.Use();
         _gpuShader.SetVector3("uSunDir", sunDir);
         _gpuShader.SetFloat("uAmbient", Math.Max(0f, TerrainTuning.SurfaceAmbient));
+        _gpuShader.SetFloat("uScale", (float)_terrain!.GpuParams().Scale); // elevation normaliser for albedo
+        _gpuShader.SetFloat("uGridN", GridN);
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _tileCache!.HeightTexture);
         _gpuShader.SetInt("uHeight", 0);
@@ -940,6 +989,10 @@ void main() {
         _gpuShader.SetMatrix("uModel", model);
         _gpuShader.SetFloat("uMorph", morph);
         _gpuShader.SetFloat("uSkirtDepth", (float)(node.WorldSize * 0.06 + 60.0));
+        _gpuShader.SetFloat("uVertexSpacing", (float)(node.WorldSize / GridN));
+        _gpuShader.SetFloat("uGridN", GridN);
+        _gpuShader.SetVector4("uRect", new Vector4D<float>((float)node.U0, (float)node.V0, (float)node.U1, (float)node.V1));
+        _gpuShader.SetInt("uFace", node.Face);
         (int tox, int toy) = _tileCache.TileOrigin(layer);
         _gpuShader.SetVector2("uTileOrigin", new Vector2D<float>(tox, toy));
         node.DrawMorph = morph;
@@ -1001,7 +1054,7 @@ void main() {
             double v = node.V0 + (node.V1 - node.V0) * (j / (double)n);
             Vector3D<double> dir = FacePoint(node.Face, u, v);
             dirGrid[i, j] = dir;
-            AddVert(dir, i, j, 0f);
+            AddVert(dir, i + 1, j + 1, 0f); // +1: the height tile has a 1-texel guard ring
         }
 
         var idx = new List<uint>(n * n * 6 + n * 24);
@@ -1017,7 +1070,7 @@ void main() {
         void Skirt(IReadOnlyList<(int i, int j)> edge)
         {
             int start = verts.Count / stride;
-            foreach ((int i, int j) in edge) AddVert(dirGrid[i, j], i, j, 1f); // dropped in the shader
+            foreach ((int i, int j) in edge) AddVert(dirGrid[i, j], i + 1, j + 1, 1f); // dropped in the shader
             for (int k = 0; k < edge.Count - 1; k++)
             {
                 uint e0 = Vid(edge[k].i, edge[k].j), e1 = Vid(edge[k + 1].i, edge[k + 1].j);

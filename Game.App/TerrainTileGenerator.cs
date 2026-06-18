@@ -128,12 +128,15 @@ float shape(vec3 dir, vec3 oct) {
 }
 
 void main() {
-    // Snap to the mesh vertex grid: texel t holds the height at fraction t/(N-1), exactly where mesh
-    // vertex t sits — so a shared patch edge samples the identical direction from both sides (no seam).
+    // Snap to the mesh vertex grid, with a 1-texel guard ring: texel t holds the height at grid fraction
+    // (t-1)/GridN (GridN = uTexelN-3), so interior texel 1 = vertex 0 (u0) and texel uTexelN-2 = the last
+    // vertex (u1); texels 0 and uTexelN-1 are the guard just outside the patch (for edge-vertex normals).
+    // A shared patch edge samples the identical direction from both sides → no height seam.
+    float gridN = uTexelN - 3.0;
     float gi = min(floor(vUV.x * uTexelN), uTexelN - 1.0);
     float gj = min(floor(vUV.y * uTexelN), uTexelN - 1.0);
-    float u = mix(uRect.x, uRect.z, gi / (uTexelN - 1.0));
-    float v = mix(uRect.y, uRect.w, gj / (uTexelN - 1.0));
+    float u = mix(uRect.x, uRect.z, (gi - 1.0) / gridN);
+    float v = mix(uRect.y, uRect.w, (gj - 1.0) / gridN);
     vec3 dir = facePoint(uFace, u, v);
     float hFine   = uScale * shape(dir, uOctFine);
     float hCoarse = uScale * shape(dir, uOctCoarse);
