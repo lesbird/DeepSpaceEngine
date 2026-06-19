@@ -581,7 +581,9 @@ internal static class Program
                             "  >> press R to drive the rover");
                 }
                 ImGui.Text($"  terrain patches: {_terrainRenderer.PatchCount}  (drawn {_terrainRenderer.LeafCount})");
-                ImGui.Text($"  vegetation: {_vegetation.Count} tufts  ({_terrainRenderer.GrassLeaves.Count} near leaves, finest patch {_terrainRenderer.MinDrawnWorldSize:0} m)");
+                double finestPatch = _terrainRenderer.MinDrawnWorldSize;
+                string finestStr = finestPatch >= 1e12 ? "—" : $"{finestPatch:0} m"; // sentinel when none drawn
+                ImGui.Text($"  vegetation: {_vegetation.Count} tufts  ({_terrainRenderer.GrassLeaves.Count} near leaves, finest patch {finestStr})");
             }
         }
         else
