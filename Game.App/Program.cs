@@ -73,6 +73,17 @@ internal static class Program
     private static bool _hudVisible = true; // 'H' toggles all on-screen UI (reticles + panels)
     private static float _eclipse;          // this frame's solar-eclipse coverage on the focused body [0,1]
     private static bool _prevB, _prevJ;
+    private static bool _prevM;                          // 'M' toggles the system map
+    private static bool _systemMapVisible;               // 2D top-down system map overlay
+    private static CelestialBody? _systemMapSel;         // selected body in the system map
+    private static bool _prevN;                          // 'N' toggles the galaxy/sector map
+    private static bool _galaxyMapVisible;               // 2D top-down galaxy map overlay
+    private static double _galaxyMpp = 0.3 * MathUtil.LightYear; // galaxy-map scale (metres per pixel)
+    private static Vector3D<double> _galaxyPan;          // map-centre offset from the camera (m, XZ plane)
+    private static Star _galaxySel;                      // selected star (valid when _galaxyHasSel)
+    private static bool _galaxyHasSel;
+    private static float _galaxyDragPx;                  // drag accumulated this press (click vs pan)
+    private static readonly List<(System.Numerics.Vector2 pos, float r, uint col, Star star)> _galaxyDots = new();
     private static string _jumpStatus = "";
     private static bool _scannerOpen;
     private static string _starSearch = "";
@@ -225,6 +236,8 @@ internal static class Program
 
         // 'P' toggles the galactic-plane grid: a faint reference plane through the galaxy centre.
         if (Edge(Key.P, ref _prevP)) _galacticGridVisible = !_galacticGridVisible;
+        if (Edge(Key.M, ref _prevM)) _systemMapVisible = !_systemMapVisible;
+        if (Edge(Key.N, ref _prevN)) _galaxyMapVisible = !_galaxyMapVisible;
 
         // 'H' hides/shows the whole HUD (reticles + all panels) for a clean view / screenshots.
         if (Edge(Key.H, ref _prevH)) _hudVisible = !_hudVisible;
@@ -473,6 +486,8 @@ internal static class Program
             DrawHud();
             DrawTuning();
             DrawScanner();
+            DrawSystemMap();
+            DrawGalaxyMap();
         }
         _imgui.Render();
 
@@ -1008,6 +1023,262 @@ internal static class Program
             foreach (Moon mn in pl.Moons) ecl = Math.Max(ecl, Cover(mn));
         }
         return ecl;
+    }
+
+    /// <summary>2D top-down schematic of the active system (toggle with <c>M</c>): sun at centre, planets
+    /// on log-radial orbit rings at their live angle, moons, the asteroid belt, and a "you are here"
+    /// marker. Click a planet/moon to select it; "Travel here" jumps the camera next to it.</summary>
+    private static void DrawSystemMap()
+    {
+        if (!_systemMapVisible || !_systemManager.HasActive) return;
+        SolarSystem sys = _systemManager.Active!;
+
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(560, 640), ImGuiCond.FirstUseEver);
+        if (!ImGui.Begin("System map  [M]", ref _systemMapVisible, ImGuiWindowFlags.NoNav))
+        {
+            ImGui.End();
+            return;
+        }
+
+        System.Numerics.Vector2 canvasPos = ImGui.GetCursorScreenPos();
+        System.Numerics.Vector2 avail = ImGui.GetContentRegionAvail();
+        float side = MathF.Max(120f, MathF.Min(avail.X, avail.Y - 140f)); // reserve the bottom for info
+        var size = new System.Numerics.Vector2(avail.X, side);
+        ImGui.InvisibleButton("##mapcanvas", size);
+        bool hovered = ImGui.IsItemHovered();
+        bool clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left);
+        System.Numerics.Vector2 mouse = ImGui.GetIO().MousePos;
+
+        var dl = ImGui.GetWindowDrawList();
+        var center = canvasPos + new System.Numerics.Vector2(avail.X * 0.5f, side * 0.5f);
+        float radiusPx = side * 0.5f - 18f;
+        dl.AddRectFilled(canvasPos, canvasPos + size, Col(0.03f, 0.04f, 0.06f));
+
+        double au = MathUtil.AstronomicalUnit;
+        double maxAu = Math.Max(sys.MaxOrbitRadius / au, 1e-3);
+        float Rpx(double a) => (float)(radiusPx * Math.Log(1.0 + Math.Max(a, 0.0)) / Math.Log(1.0 + maxAu));
+        System.Numerics.Vector2 Project(double aAu, double ang)
+        {
+            float rp = Rpx(aAu);
+            return center + new System.Numerics.Vector2((float)Math.Cos(ang) * rp, (float)Math.Sin(ang) * rp);
+        }
+        (double a, double ang) Polar(in UniversePosition p, in UniversePosition origin)
+        {
+            Vector3D<double> d = p.DeltaMeters(origin); // p - origin
+            return (Math.Sqrt(d.X * d.X + d.Z * d.Z) / au, Math.Atan2(d.Z, d.X));
+        }
+
+        CelestialBody? hit = null;
+        void Consider(CelestialBody b, System.Numerics.Vector2 p, float r)
+        {
+            if (hovered && System.Numerics.Vector2.Distance(mouse, p) < r + 4f) hit = b;
+        }
+
+        // Asteroid belt: a faint band between inner and outer radius.
+        if (sys.Belt != null)
+        {
+            dl.AddCircle(center, Rpx(sys.Belt.InnerRadius / au), Col(0.5f, 0.45f, 0.35f, 0.4f), 96);
+            dl.AddCircle(center, Rpx(sys.Belt.OuterRadius / au), Col(0.5f, 0.45f, 0.35f, 0.4f), 96);
+        }
+
+        // Planets on their orbit rings, moons on a small fixed ring around each planet.
+        foreach (Planet p in sys.Planets)
+        {
+            (double pa, double pang) = Polar(p.CurrentPosition, sys.Sun.Position);
+            dl.AddCircle(center, Rpx(pa), Col(0.30f, 0.40f, 0.55f, 0.5f), 96);
+            System.Numerics.Vector2 pp = Project(pa, pang);
+            float pr = 3f + (float)Math.Clamp(p.RadiusMeters / MathUtil.EarthRadiusM, 0.4, 3.0);
+            dl.AddCircleFilled(pp, pr, ColorFor(p));
+            Consider(p, pp, pr);
+            if (ReferenceEquals(p, _systemMapSel)) dl.AddCircle(pp, pr + 4f, Col(1f, 1f, 1f, 0.9f), 20, 2f);
+
+            int mi = 0;
+            foreach (Moon mn in p.Moons)
+            {
+                (double _, double mang) = Polar(mn.CurrentPosition, p.CurrentPosition);
+                float mr = 11f + mi * 5f;
+                var mp = pp + new System.Numerics.Vector2((float)Math.Cos(mang) * mr, (float)Math.Sin(mang) * mr);
+                dl.AddCircleFilled(mp, 2.2f, ColorFor(mn));
+                Consider(mn, mp, 2.2f);
+                if (ReferenceEquals(mn, _systemMapSel)) dl.AddCircle(mp, 5f, Col(1f, 1f, 1f, 0.9f), 14, 1.5f);
+                mi++;
+            }
+        }
+
+        // Sun (drawn last over the inner rings) and the camera's "you are here" marker.
+        dl.AddCircleFilled(center, 7f, Col(1f, 0.85f, 0.3f));
+        (double ca, double cang) = Polar(_camera.Position, sys.Sun.Position);
+        System.Numerics.Vector2 cp = Project(ca, cang);
+        dl.AddCircle(cp, 5f, Col(0.4f, 1f, 0.6f), 14, 2f);
+        dl.AddLine(cp - new System.Numerics.Vector2(7, 0), cp + new System.Numerics.Vector2(7, 0), Col(0.4f, 1f, 0.6f));
+        dl.AddLine(cp - new System.Numerics.Vector2(0, 7), cp + new System.Numerics.Vector2(0, 7), Col(0.4f, 1f, 0.6f));
+
+        if (clicked) _systemMapSel = hit; // click empty space to deselect
+
+        // Info + travel.
+        ImGui.Spacing();
+        ImGui.Separator();
+        if (_systemMapSel is { } b2)
+        {
+            ImGui.Text(b2.Designation.Length > 0 ? b2.Designation : b2.Type.ToString());
+            ImGui.TextDisabled($"{b2.Type}  •  r {b2.RadiusMeters / 1000.0:0} km  •  {b2.SurfaceTempK:0} K");
+            if (b2.HasAtmosphere)
+                ImGui.TextDisabled($"atmosphere {b2.SurfacePressureBar:0.000} bar{(b2.Habitable ? "  •  habitable" : "")}");
+            double distM = _camera.Position.DistanceTo(b2.CurrentPosition);
+            ImGui.TextDisabled($"distance {distM / au:0.000} AU");
+            if (ImGui.Button("Travel here"))
+                _camera.Position = b2.CurrentPosition.Translated(
+                    new Vector3D<double>(Math.Max(b2.RadiusMeters * 3.0, 1.0e7), 0, 0));
+        }
+        else
+        {
+            ImGui.TextDisabled("click a planet or moon to select it");
+        }
+        ImGui.End();
+    }
+
+    /// <summary>Pack a colour for an ImGui draw list.</summary>
+    private static uint Col(float r, float g, float b, float a = 1f)
+        => ImGui.ColorConvertFloat4ToU32(new System.Numerics.Vector4(r, g, b, a));
+
+    /// <summary>Map-dot colour from a body's surface albedo (floored so dark worlds still read).</summary>
+    private static uint ColorFor(CelestialBody b)
+    {
+        Vector3D<float> c = b.SurfaceAlbedo;
+        return Col(MathF.Max(c.X, 0.12f), MathF.Max(c.Y, 0.12f), MathF.Max(c.Z, 0.12f));
+    }
+
+    /// <summary>2D top-down galaxy/sector map (toggle with <c>N</c>): the pager's resident catalog stars
+    /// projected onto the galactic plane (world XZ), drag to pan and wheel to zoom. Markers for the
+    /// camera, the active system, and the search target. Click a star to select it, then jump to it or
+    /// set it as the navigation search target. Resident-bubble only for now (panning past it shows no
+    /// new stars until the streamer is taught to follow the map centre).</summary>
+    private static void DrawGalaxyMap()
+    {
+        if (!_galaxyMapVisible) return;
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(640, 700), ImGuiCond.FirstUseEver);
+        if (!ImGui.Begin("Galaxy map  [N]", ref _galaxyMapVisible, ImGuiWindowFlags.NoNav))
+        {
+            ImGui.End();
+            return;
+        }
+
+        var io = ImGui.GetIO();
+        System.Numerics.Vector2 canvasPos = ImGui.GetCursorScreenPos();
+        System.Numerics.Vector2 avail = ImGui.GetContentRegionAvail();
+        float ch = MathF.Max(120f, avail.Y - 116f); // reserve the bottom for footer + info
+        var size = new System.Numerics.Vector2(avail.X, ch);
+        ImGui.InvisibleButton("##galaxycanvas", size);
+        bool hovered = ImGui.IsItemHovered();
+
+        var dl = ImGui.GetWindowDrawList();
+        var c1 = canvasPos + size;
+        var canvasCenter = canvasPos + size * 0.5f;
+        dl.PushClipRect(canvasPos, c1, true);
+        dl.AddRectFilled(canvasPos, c1, Col(0.02f, 0.02f, 0.04f));
+
+        // Zoom on the wheel, pan on a left-drag (a press that barely moves counts as a click → select).
+        if (hovered && io.MouseWheel != 0f)
+            _galaxyMpp = Math.Clamp(_galaxyMpp * Math.Pow(1.2, -io.MouseWheel),
+                0.02 * MathUtil.LightYear, 80.0 * MathUtil.LightYear);
+        if (ImGui.IsItemActivated()) _galaxyDragPx = 0f;
+        if (ImGui.IsItemActive() && (io.MouseDelta.X != 0f || io.MouseDelta.Y != 0f))
+        {
+            _galaxyDragPx += MathF.Abs(io.MouseDelta.X) + MathF.Abs(io.MouseDelta.Y);
+            _galaxyPan = new Vector3D<double>(
+                _galaxyPan.X - io.MouseDelta.X * _galaxyMpp, 0,
+                _galaxyPan.Z - io.MouseDelta.Y * _galaxyMpp);
+        }
+        bool click = ImGui.IsItemDeactivated() && _galaxyDragPx < 4f;
+
+        double mpp = _galaxyMpp;
+        UniversePosition mapCenter = _camera.Position.Translated(_galaxyPan);
+        double halfW = size.X * 0.5 * mpp, halfH = ch * 0.5 * mpp;
+        float minCue = (float)Math.Clamp(mpp / MathUtil.LightYear * 0.12, 0.0, 6.0); // hide faint stars when zoomed out
+
+        System.Numerics.Vector2 ToScreen(in Vector3D<double> relMeters) =>
+            canvasCenter + new System.Numerics.Vector2((float)(relMeters.X / mpp), (float)(relMeters.Z / mpp));
+
+        // Collect in-view stars, block-culled (skip whole blocks whose XZ box misses the view).
+        _galaxyDots.Clear();
+        const int CollectCap = 60000;
+        int candidates = 0;
+        foreach (StarCatalog block in _starPager.LoadedBlocks)
+        {
+            Vector3D<double> bo = block.Origin.DeltaMeters(mapCenter); // block min corner relative to centre
+            double bs = block.SideMeters;
+            if (bo.X + bs < -halfW || bo.X > halfW || bo.Z + bs < -halfH || bo.Z > halfH) continue;
+            foreach (Star st in block.Stars)
+            {
+                if (st.SizeCue < minCue) continue;
+                Vector3D<double> d = st.Position.DeltaMeters(mapCenter);
+                if (d.X < -halfW || d.X > halfW || d.Z < -halfH || d.Z > halfH) continue;
+                candidates++;
+                if (_galaxyDots.Count >= CollectCap) continue;
+                float r = Math.Clamp(0.8f + st.SizeCue * 1.4f, 0.8f, 4.0f);
+                uint col = Col(MathF.Max(st.Color.X, 0.15f), MathF.Max(st.Color.Y, 0.15f), MathF.Max(st.Color.Z, 0.15f));
+                _galaxyDots.Add((ToScreen(d), r, col, st));
+            }
+        }
+
+        // Draw (uniformly thinned if over the cap) and hit-test against the mouse.
+        const int DrawCap = 8000;
+        int stride = Math.Max(1, (_galaxyDots.Count + DrawCap - 1) / DrawCap);
+        Star hitStar = default;
+        bool hasHit = false;
+        float hitD = 6f;
+        for (int i = 0; i < _galaxyDots.Count; i += stride)
+        {
+            var (p, r, col, st) = _galaxyDots[i];
+            dl.AddCircleFilled(p, r, col, 6);
+            if (hovered)
+            {
+                float dd = System.Numerics.Vector2.Distance(io.MousePos, p);
+                if (dd < hitD + r) { hitD = dd; hitStar = st; hasHit = true; }
+            }
+        }
+
+        void Marker(in UniversePosition pos, uint col, float rad) =>
+            dl.AddCircle(ToScreen(pos.DeltaMeters(mapCenter)), rad, col, 16, 2f);
+        if (_systemManager.HasActive) Marker(_systemManager.Active!.Sun.Position, Col(1f, 0.85f, 0.3f), 7f);
+        if (_hasSearchTarget) Marker(_searchTarget.Position, Col(0.4f, 0.8f, 1f), 7f);
+        if (_galaxyHasSel) Marker(_galaxySel.Position, Col(1f, 1f, 1f), 6f);
+
+        // Camera "you are here" crosshair.
+        System.Numerics.Vector2 me = ToScreen(_camera.Position.DeltaMeters(mapCenter));
+        dl.AddCircle(me, 5f, Col(0.4f, 1f, 0.6f), 12, 2f);
+        dl.AddLine(me - new System.Numerics.Vector2(8, 0), me + new System.Numerics.Vector2(8, 0), Col(0.4f, 1f, 0.6f));
+        dl.AddLine(me - new System.Numerics.Vector2(0, 8), me + new System.Numerics.Vector2(0, 8), Col(0.4f, 1f, 0.6f));
+        dl.PopClipRect();
+
+        if (click) { _galaxyHasSel = hasHit; if (hasHit) _galaxySel = hitStar; }
+
+        // Footer + selection info.
+        double acrossLy = size.X * mpp / MathUtil.LightYear;
+        ImGui.TextDisabled($"view {acrossLy:0.0} ly across  •  {candidates:n0} in view / {_starPager.LoadedStarCount:n0} resident  •  drag = pan, wheel = zoom");
+        if (ImGui.Button("Center on me")) _galaxyPan = default;
+        ImGui.SameLine();
+        if (ImGui.Button("Reset zoom")) _galaxyMpp = 0.3 * MathUtil.LightYear;
+
+        ImGui.Separator();
+        if (_galaxyHasSel)
+        {
+            Star s2 = _galaxySel;
+            double ly = s2.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
+            ImGui.Text($"#{s2.Id}  •  {s2.ClassLetter}-class  •  {s2.Temperature:0} K  •  {ly:0.000} ly");
+            if (ImGui.Button("Jump here"))
+            {
+                _camera.Position = s2.Position.Translated(new Vector3D<double>(8.0 * MathUtil.AstronomicalUnit, 0, 0));
+                _jumpStatus = $"Jumped to star #{s2.Id} ({s2.ClassLetter}-class)";
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Set as search target")) { _starSearch = s2.Id.ToString(); FindStar(); }
+        }
+        else
+        {
+            ImGui.TextDisabled("click a star to select it");
+        }
+        ImGui.End();
     }
 
     /// <summary>Surface-object scatter controls: a master toggle + spawn range, then a live-editable
