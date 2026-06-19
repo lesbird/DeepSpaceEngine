@@ -47,6 +47,26 @@ public sealed class TuningConfig
     /// <summary>Enabled per-planet-type overrides (absent types fall back to the globals above).</summary>
     public List<ProfileDto> Overrides { get; set; } = new();
 
+    /// <summary>Saved surface-object scatter layers. Empty = keep the renderer's built-in defaults
+    /// (so an older tuning.json without this section doesn't wipe them).</summary>
+    public List<SpawnerDto> Spawners { get; set; } = new();
+
+    /// <summary>One scatter layer (see <see cref="Spawner"/>). Trait masks stored as ints.</summary>
+    public sealed class SpawnerDto
+    {
+        public string Name { get; set; } = "Spawner";
+        public bool Enabled { get; set; } = true;
+        public int MeshId { get; set; }
+        public float Density { get; set; } = 0.4f;
+        public float MinSize { get; set; } = 4f;
+        public float MaxSize { get; set; } = 10f;
+        public int Orient { get; set; }
+        public uint Seed { get; set; } = 1;
+        public int Require { get; set; } = (int)EnvTrait.Surface;
+        public int Forbid { get; set; }
+        public float SpawnChance { get; set; } = 1f;
+    }
+
     /// <summary>One per-type override profile (terrain relief + biome colour).</summary>
     public sealed class ProfileDto
     {
@@ -73,7 +93,7 @@ public sealed class TuningConfig
     private static float[] ToArr(Vector3D<float> v) => new[] { v.X, v.Y, v.Z };
 
     /// <summary>Read the current live values into a config snapshot.</summary>
-    public static TuningConfig Capture(AtmosphereRenderer a, GalaxyBackdrop b) => new()
+    public static TuningConfig Capture(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s) => new()
     {
         RenderBackdrop = b.Enabled,
         BandBrightness = b.BandBrightness,
@@ -99,7 +119,29 @@ public sealed class TuningConfig
         SnowColor = ToArr(BiomeTuning.SnowColor),
         CliffColor = ToArr(BiomeTuning.CliffColor),
         Overrides = CaptureOverrides(),
+        Spawners = CaptureSpawners(s),
     };
+
+    private static List<SpawnerDto> CaptureSpawners(ScatterRenderer s)
+    {
+        var list = new List<SpawnerDto>();
+        foreach (Spawner sp in s.Spawners)
+            list.Add(new SpawnerDto
+            {
+                Name = sp.Name,
+                Enabled = sp.Enabled,
+                MeshId = sp.MeshId,
+                Density = sp.Density,
+                MinSize = sp.MinSize,
+                MaxSize = sp.MaxSize,
+                Orient = sp.Orient,
+                Seed = sp.Seed,
+                Require = (int)sp.Require,
+                Forbid = (int)sp.Forbid,
+                SpawnChance = sp.SpawnChance,
+            });
+        return list;
+    }
 
     private static List<ProfileDto> CaptureOverrides()
     {
@@ -129,7 +171,7 @@ public sealed class TuningConfig
     }
 
     /// <summary>Push this snapshot back onto the live backdrop / atmosphere / terrain / biome state.</summary>
-    public void Apply(AtmosphereRenderer a, GalaxyBackdrop b)
+    public void Apply(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s)
     {
         b.Enabled = RenderBackdrop;
         b.BandBrightness = BandBrightness;
@@ -175,14 +217,37 @@ public sealed class TuningConfig
             p.SnowColor = ToVec(d.SnowColor);
             p.CliffColor = ToVec(d.CliffColor);
         }
+
+        // Replace the scatter layers only if the file actually carried some — an older tuning.json
+        // (no Spawners section) deserializes to an empty list and must NOT wipe the built-in defaults.
+        if (Spawners.Count > 0)
+        {
+            s.Spawners.Clear();
+            foreach (SpawnerDto d in Spawners)
+                s.Spawners.Add(new Spawner
+                {
+                    Name = d.Name,
+                    Enabled = d.Enabled,
+                    MeshId = d.MeshId,
+                    Density = d.Density,
+                    MinSize = d.MinSize,
+                    MaxSize = d.MaxSize,
+                    Orient = d.Orient,
+                    Seed = d.Seed,
+                    Require = (EnvTrait)d.Require,
+                    Forbid = (EnvTrait)d.Forbid,
+                    SpawnChance = d.SpawnChance,
+                });
+            s.InvalidateActivation();
+        }
     }
 
     /// <summary>Serialize the current live values to <paramref name="path"/>. Returns false on IO error.</summary>
-    public static bool Save(AtmosphereRenderer a, GalaxyBackdrop b, string path)
+    public static bool Save(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, string path)
     {
         try
         {
-            File.WriteAllText(path, JsonSerializer.Serialize(Capture(a, b), Options));
+            File.WriteAllText(path, JsonSerializer.Serialize(Capture(a, b, s), Options));
             return true;
         }
         catch
@@ -192,14 +257,14 @@ public sealed class TuningConfig
     }
 
     /// <summary>Load and apply values from <paramref name="path"/> if it exists. Returns false if absent/invalid.</summary>
-    public static bool Load(AtmosphereRenderer a, GalaxyBackdrop b, string path)
+    public static bool Load(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, string path)
     {
         if (!File.Exists(path)) return false;
         try
         {
             TuningConfig? c = JsonSerializer.Deserialize<TuningConfig>(File.ReadAllText(path));
             if (c == null) return false;
-            c.Apply(a, b);
+            c.Apply(a, b, s);
             return true;
         }
         catch

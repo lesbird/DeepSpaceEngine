@@ -91,6 +91,23 @@ public abstract class CelestialBody
     /// <summary>True for worlds with surface liquid water (the ocean worlds).</summary>
     public bool HasLiquidWater => Type == PlanetType.Ocean;
 
+    /// <summary>Coarse environmental traits derived from this body's state, for spawner gating
+    /// (which surface-object spawners are eligible here). See <see cref="EnvTrait"/>.</summary>
+    public EnvTrait Traits
+    {
+        get
+        {
+            EnvTrait t = EnvTrait.None;
+            if (HasSurface)              t |= EnvTrait.Surface;
+            if (HasAtmosphere)           t |= EnvTrait.Atmosphere;
+            if (Habitable)               t |= EnvTrait.Life;
+            if (HasLiquidWater)          t |= EnvTrait.Water;
+            if (Type == PlanetType.Lava) t |= EnvTrait.Molten;
+            if (Type == PlanetType.Ice)  t |= EnvTrait.Frozen;
+            return t;
+        }
+    }
+
     /// <summary>Surface gravity (m/s²) from mass and radius; 0 for bodies with no solid surface.</summary>
     public double SurfaceGravity => MassKg > 0 && RadiusMeters > 0
         ? MathUtil.GravitationalConstant * MassKg / (RadiusMeters * RadiusMeters)

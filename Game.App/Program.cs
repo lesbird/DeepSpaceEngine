@@ -38,7 +38,7 @@ internal static class Program
     private static AtmosphereRenderer _atmosphereRenderer = null!;
     private static CloudRenderer _cloudRenderer = null!;
     private static PlanetTerrainRenderer _terrainRenderer = null!;
-    private static VegetationRenderer _vegetation = null!;
+    private static ScatterRenderer _scatter = null!;
     private static PlanetSurfaceMap _surfaceMap = null!;
     private static ulong _mapBodyId = ulong.MaxValue;
     private static RoverController _rover = null!;
@@ -156,7 +156,7 @@ internal static class Program
         _atmosphereRenderer = new AtmosphereRenderer(_gl);
         _cloudRenderer = new CloudRenderer(_gl);
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
-        _vegetation = new VegetationRenderer(_gl);
+        _scatter = new ScatterRenderer(_gl);
         _surfaceMap = new PlanetSurfaceMap(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse, _terrainRenderer);
         _roverRenderer = new RoverRenderer(_gl);
@@ -171,7 +171,7 @@ internal static class Program
         _imgui = new ImGuiController(_gl, _window.Window, _window.Input);
 
         // Restore previously-saved tuning so the sliders persist across launches.
-        if (TuningConfig.Load(_atmosphereRenderer, _backdrop, TuningPath))
+        if (TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, TuningPath))
             _tuningStatus = $"Loaded {TuningPath}";
 
         SetMouseCaptured(true);
@@ -414,7 +414,9 @@ internal static class Program
             Vector3D<float> planetRel = _terrainTarget.CurrentPosition.ToCameraRelative(_camera.Position);
             Vector3D<float> sunDir = Vector3D.Normalize(sunRel - planetRel);
             sunDir = _terrainTarget.ApparentSunDir(sunDir, _systemManager.SimTime); // axial-rotation day/night
-            _eclipse = EclipseFactor(_terrainTarget, sys);  // a moon/planet occluding the sun → twilight
+            // Eclipse dimming DISABLED: the surface dropped to twilight too abruptly and read as a bug, not a
+            // celestial event. Plumbing (uEclipse / AtmosphereRenderer) stays inert with _eclipse pinned at 0.
+            // Re-enable with a gradual ramp:  _eclipse = EclipseFactor(_terrainTarget, sys);
             _terrainRenderer.Eclipse = _eclipse;
 
             // Reset depth before the terrain pass: the sun/planets/moons SystemRenderer just drew keep
@@ -436,7 +438,7 @@ internal static class Program
 
             // Surface vegetation: tufts instanced over the terrain's own near leaves, sampling their height
             // tiles so they sit exactly on the drawn surface.
-            _vegetation.Render(_camera, _terrainTarget, _terrainRenderer, sunDir,
+            _scatter.Render(_camera, _terrainTarget, _terrainRenderer, sunDir,
                 _terrainRenderer.LastNear, _terrainRenderer.LastFar, (float)_renderClock);
         }
 
@@ -583,7 +585,7 @@ internal static class Program
                 ImGui.Text($"  terrain patches: {_terrainRenderer.PatchCount}  (drawn {_terrainRenderer.LeafCount})");
                 double finestPatch = _terrainRenderer.MinDrawnWorldSize;
                 string finestStr = finestPatch >= 1e12 ? "—" : $"{finestPatch:0} m"; // sentinel when none drawn
-                ImGui.Text($"  vegetation: {_vegetation.Count} tufts  ({_terrainRenderer.GrassLeaves.Count} near leaves, finest patch {finestStr})");
+                ImGui.Text($"  scatter: {_scatter.Count} objects  ({_terrainRenderer.GrassLeaves.Count} near leaves, finest patch {finestStr})");
             }
         }
         else
@@ -796,13 +798,7 @@ internal static class Program
             ImGui.SliderFloat("Material detail", ref TerrainTuning.MaterialDetail, 0f, 1.5f);
             ImGui.SliderFloat("Surface specular", ref TerrainTuning.SurfaceSpecular, 0f, 1f);
             ImGui.SliderFloat("Surface ambient", ref TerrainTuning.SurfaceAmbient, 0f, 0.3f);
-            ImGui.Checkbox("Surface objects", ref _vegetation.Enabled);
-            ImGui.SliderFloat("spawn range (m)##veg", ref TerrainTuning.ScatterRange, 100f, 9000f);
-            ImGui.SliderFloat("density##veg", ref _vegetation.Density, 0f, 1f);
-            ImGui.SliderFloat("min size (m)##veg", ref _vegetation.MinSize, 0.5f, 40f);
-            ImGui.SliderFloat("max size (m)##veg", ref _vegetation.MaxSize, 0.5f, 40f);
-            ImGui.Combo("orient##veg", ref _vegetation.Orient, "World up\0Surface normal\0Random\0");
-            ImGui.TextDisabled("(objects scatter on the drawn surface; size rolls between min and max)");
+            DrawScatterUI();
             if (ImGui.Button("Reset detail"))
             {
                 TerrainTuning.LodDistanceFactor = 4f;
@@ -863,12 +859,12 @@ internal static class Program
 
         ImGui.Separator();
         if (ImGui.Button("Save settings"))
-            _tuningStatus = TuningConfig.Save(_atmosphereRenderer, _backdrop, TuningPath)
+            _tuningStatus = TuningConfig.Save(_atmosphereRenderer, _backdrop, _scatter, TuningPath)
                 ? $"Saved {TuningPath}" : "Save failed";
         ImGui.SameLine();
         if (ImGui.Button("Reload"))
         {
-            _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, TuningPath)
+            _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, TuningPath)
                 ? $"Loaded {TuningPath}" : "No saved file";
             _terrainRenderer.Rebuild();
         }
@@ -1012,6 +1008,63 @@ internal static class Program
             foreach (Moon mn in pl.Moons) ecl = Math.Max(ecl, Cover(mn));
         }
         return ecl;
+    }
+
+    /// <summary>Surface-object scatter controls: a master toggle + spawn range, then a live-editable
+    /// list of spawner layers (mesh, density, size, orientation, env-trait gate, per-world spawn chance).</summary>
+    private static void DrawScatterUI()
+    {
+        ImGui.Checkbox("Surface objects", ref _scatter.Enabled);
+        ImGui.SameLine();
+        ImGui.SliderFloat("spawn range (m)##scatter", ref TerrainTuning.ScatterRange, 100f, 9000f);
+
+        int remove = -1;
+        for (int i = 0; i < _scatter.Spawners.Count; i++)
+        {
+            Spawner sp = _scatter.Spawners[i];
+            ImGui.PushID(i);
+            string label = (sp.Name.Length > 0 ? sp.Name : "(spawner)") + (sp.ActiveHere ? "  [active here]" : "  [inactive here]");
+            if (ImGui.TreeNodeEx(label, ImGuiTreeNodeFlags.DefaultOpen))
+            {
+                ImGui.Checkbox("enabled", ref sp.Enabled);
+                ImGui.InputText("name", ref sp.Name, 32);
+                ImGui.Combo("mesh", ref sp.MeshId, ScatterRenderer.MeshCombo);
+                ImGui.Combo("orient", ref sp.Orient, "World up\0Surface normal\0Random\0");
+                ImGui.SliderFloat("density", ref sp.Density, 0f, 1f);
+                ImGui.SliderFloat("min size (m)", ref sp.MinSize, 0.5f, 40f);
+                ImGui.SliderFloat("max size (m)", ref sp.MaxSize, 0.5f, 40f);
+                ImGui.SliderFloat("spawn chance", ref sp.SpawnChance, 0f, 1f);
+
+                ImGui.TextDisabled("require these traits on the world:");
+                TraitCheckbox("surface", ref sp.Require, EnvTrait.Surface); ImGui.SameLine();
+                TraitCheckbox("atmosphere", ref sp.Require, EnvTrait.Atmosphere); ImGui.SameLine();
+                TraitCheckbox("life", ref sp.Require, EnvTrait.Life);
+                TraitCheckbox("water", ref sp.Require, EnvTrait.Water); ImGui.SameLine();
+                TraitCheckbox("molten", ref sp.Require, EnvTrait.Molten); ImGui.SameLine();
+                TraitCheckbox("frozen", ref sp.Require, EnvTrait.Frozen);
+
+                if (ImGui.Button("remove")) remove = i;
+                ImGui.TreePop();
+            }
+            ImGui.PopID();
+        }
+        if (remove >= 0) _scatter.Spawners.RemoveAt(remove);
+        if (ImGui.Button("Add spawner"))
+        {
+            int n = _scatter.Spawners.Count + 1;
+            _scatter.Spawners.Add(new Spawner { Name = $"Spawner {n}", Seed = (uint)(n * 131 + 17) });
+        }
+        // Edits to traits / chance / seed change which spawners are active here → recompute next frame.
+        _scatter.InvalidateActivation();
+        ImGui.TextDisabled("(gates: required env traits + per-world spawn chance; layers roll independently)");
+    }
+
+    /// <summary>An ImGui checkbox bound to one bit of an <see cref="EnvTrait"/> flags mask.</summary>
+    private static void TraitCheckbox(string label, ref EnvTrait mask, EnvTrait bit)
+    {
+        bool on = (mask & bit) != 0;
+        if (ImGui.Checkbox(label, ref on))
+            mask = on ? (mask | bit) : (mask & ~bit);
     }
 
     /// <summary>ImGui colour swatch bound to a Silk <see cref="Vector3D{T}"/>. Returns true on edit.</summary>

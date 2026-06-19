@@ -252,15 +252,9 @@ public static class SystemGenerator
         body.Habitable = body.Type == PlanetType.Ocean && body.HasAtmosphere
                          && body.SurfaceTempK is >= 255f and <= 320f;
 
-        // Axial rotation / day-night is DISABLED for now (the sun-direction-sweep approach didn't read right).
-        // RotationPeriodSeconds = 0 makes CelestialBody.ApparentSunDir return the true sun, so the terrain,
-        // rover and atmosphere all use the un-rotated sun (no day/night sweep). To re-enable, seed a period:
-        //   double hours = body.HasSurface ? r.Range(8.0, 48.0) : r.Range(6.0, 16.0);
-        //   body.RotationPeriodSeconds = hours * 3600.0;
-        //   double tilt = r.Range(0.0, 0.6) + (r.NextDouble() < 0.1 ? r.Range(0.0, 1.4) : 0.0);
-        //   double az = r.Range(0.0, 2.0 * Math.PI);
-        //   body.SpinAxis = Vector3D.Normalize(new Vector3D<double>(
-        //       Math.Sin(tilt) * Math.Cos(az), Math.Cos(tilt), Math.Sin(tilt) * Math.Sin(az)));
+        // Axial rotation / day-night is DISABLED (the sun-direction-sweep read wrong, and real geometric
+        // spin was scrapped). RotationPeriodSeconds = 0 makes CelestialBody.ApparentSunDir return the true
+        // sun, so the terrain, rover and atmosphere all use the un-rotated sun (no day/night sweep).
         body.RotationPeriodSeconds = 0.0;
     }
 
