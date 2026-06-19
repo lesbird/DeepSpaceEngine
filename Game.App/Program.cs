@@ -38,6 +38,7 @@ internal static class Program
     private static AtmosphereRenderer _atmosphereRenderer = null!;
     private static CloudRenderer _cloudRenderer = null!;
     private static PlanetTerrainRenderer _terrainRenderer = null!;
+    private static VegetationRenderer _vegetation = null!;
     private static PlanetSurfaceMap _surfaceMap = null!;
     private static ulong _mapBodyId = ulong.MaxValue;
     private static RoverController _rover = null!;
@@ -155,6 +156,7 @@ internal static class Program
         _atmosphereRenderer = new AtmosphereRenderer(_gl);
         _cloudRenderer = new CloudRenderer(_gl);
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
+        _vegetation = new VegetationRenderer(_gl);
         _surfaceMap = new PlanetSurfaceMap(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse, _terrainRenderer);
         _roverRenderer = new RoverRenderer(_gl);
@@ -431,6 +433,11 @@ internal static class Program
             if (_driving)
                 _roverRenderer.Render(_camera, _rover.BodyPosition, _rover.Forward, _rover.Up,
                     _rover.WheelTravel, sunDir, _terrainRenderer.LastNear, _terrainRenderer.LastFar);
+
+            // Surface vegetation: tufts instanced over the terrain's own near leaves, sampling their height
+            // tiles so they sit exactly on the drawn surface.
+            _vegetation.Render(_camera, _terrainTarget, _terrainRenderer, sunDir,
+                _terrainRenderer.LastNear, _terrainRenderer.LastFar, (float)_renderClock);
         }
 
         // Capture the finished scene into a sampleable colour buffer, then composite the depth-aware
@@ -574,6 +581,7 @@ internal static class Program
                             "  >> press R to drive the rover");
                 }
                 ImGui.Text($"  terrain patches: {_terrainRenderer.PatchCount}  (drawn {_terrainRenderer.LeafCount})");
+                ImGui.Text($"  vegetation: {_vegetation.Count} tufts  ({_terrainRenderer.GrassLeaves.Count} near leaves, finest patch {_terrainRenderer.MinDrawnWorldSize:0} m)");
             }
         }
         else
@@ -786,7 +794,13 @@ internal static class Program
             ImGui.SliderFloat("Material detail", ref TerrainTuning.MaterialDetail, 0f, 1.5f);
             ImGui.SliderFloat("Surface specular", ref TerrainTuning.SurfaceSpecular, 0f, 1f);
             ImGui.SliderFloat("Surface ambient", ref TerrainTuning.SurfaceAmbient, 0f, 0.3f);
-            ImGui.TextDisabled("(detail appears only as you get close to the surface)");
+            ImGui.Checkbox("Surface objects", ref _vegetation.Enabled);
+            ImGui.SliderFloat("spawn range (m)##veg", ref TerrainTuning.ScatterRange, 100f, 9000f);
+            ImGui.SliderFloat("density##veg", ref _vegetation.Density, 0f, 1f);
+            ImGui.SliderFloat("min size (m)##veg", ref _vegetation.MinSize, 0.5f, 40f);
+            ImGui.SliderFloat("max size (m)##veg", ref _vegetation.MaxSize, 0.5f, 40f);
+            ImGui.Combo("orient##veg", ref _vegetation.Orient, "World up\0Surface normal\0Random\0");
+            ImGui.TextDisabled("(objects scatter on the drawn surface; size rolls between min and max)");
             if (ImGui.Button("Reset detail"))
             {
                 TerrainTuning.LodDistanceFactor = 4f;

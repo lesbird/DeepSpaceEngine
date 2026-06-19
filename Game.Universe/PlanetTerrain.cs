@@ -442,6 +442,10 @@ public sealed class PlanetTerrain
         public float IsCratered;             // 1 = crater albedo + maria apply (genuinely cratered world)
         public double VolcanoWeight, VolcanoFreq, VolcanoDensity; // raised volcano cones (lava worlds)
         public float IsLava;                 // 1 = lava world (emissive lava fields + glowing vents)
+        public double MicroWeight, MicroFreq, MicroGain;     // fine LOD-gated micro-relief
+        public int MaxMicroOctaves;
+        public double StrataWeight, StrataFreq, StrataSharp; // sedimentary terracing (mesas/canyons)
+        public int StrataSteps;
 
         // Biome / colour (for the per-pixel albedo in the render shader, mirroring ColorAt/LandBand).
         public Vector3D<float> BaseColor, Rock, Snow, Cliff, Lowland, SubstrateTint;
@@ -472,6 +476,9 @@ public sealed class PlanetTerrain
             IsCratered = IsCratered ? 1f : 0f,
             VolcanoWeight = _volcanoWeight, VolcanoFreq = _volcanoFreq * fs, VolcanoDensity = _volcanoDensity,
             IsLava = Type == PlanetType.Lava ? 1f : 0f,
+            MicroWeight = MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale),
+            MicroFreq = _microFreq * fs, MicroGain = MicroGain, MaxMicroOctaves = MaxMicroOctaves,
+            StrataWeight = _strataWeight, StrataFreq = _strataFreq * fs, StrataSteps = _strataSteps, StrataSharp = _strataSharp,
             BaseColor = _baseColor, SubstrateTint = _substrateTint,
             Rock = PlanetTuning.EffectiveRock(Type), Snow = PlanetTuning.EffectiveSnow(Type),
             Cliff = PlanetTuning.EffectiveCliff(Type), Lowland = PlanetTuning.EffectiveLowland(Type),
@@ -488,6 +495,10 @@ public sealed class PlanetTerrain
     /// returns the full budget.</summary>
     public double OctavesForSpacing(double baseFreq, double sampleSpacing, int max)
         => OctavesFor(baseFreq, sampleSpacing, max);
+
+    /// <summary>The smooth LOD gate for a layer at a vertex spacing (1 = fully resolved, 0 = too coarse to
+    /// show); public so the GPU generator fades the micro-relief layer in identically to the CPU path.</summary>
+    public double LayerGateForSpacing(double baseFreq, double sampleSpacing) => LayerGate(baseFreq, sampleSpacing);
 
     /// <summary>Fractional crater-octave count the GPU generator should bake at this vertex spacing: the
     /// sum of each crater size class's smooth LOD gate (coarse basins open first, finer pits fade in on
@@ -537,6 +548,21 @@ public sealed class PlanetTerrain
         float detailGate = (float)p.DetailFloor + (1f - (float)p.DetailFloor) * rugged;
         float shape = (float)p.ContinentWeight * cont + (float)p.MountainWeight * mtn * mask * rugged
                     + (float)p.DetailWeight * det * detailGate;
+        if (p.MicroWeight > 0.0)
+        {
+            float microGate = (float)LayerGateForSpacing(p.MicroFreq, sampleSpacing);
+            if (microGate > 0f)
+            {
+                float microOct = (float)OctavesFor(p.MicroFreq, sampleSpacing, p.MaxMicroOctaves);
+                float micro = GpuFbm(dir, (float)p.MicroFreq, microOct, (float)p.MicroGain, seed) * microGate * detailGate;
+                shape += (float)p.MicroWeight * micro;
+            }
+        }
+        if (p.StrataWeight > 0.0)
+        {
+            float low = GpuFbm(dir + new Vector3D<float>(8.2f, 71.5f, 3.6f), (float)p.StrataFreq, 4f, 0.5f, seed);
+            shape += (float)p.StrataWeight * GpuTerrace(low, p.StrataSteps, (float)p.StrataSharp);
+        }
         if (p.CraterWeight > 0.0)
         {
             float crater = GpuCraterField(dir, (float)p.CraterFreq,
@@ -546,6 +572,16 @@ public sealed class PlanetTerrain
         if (p.VolcanoWeight > 0.0)
             shape += (float)p.VolcanoWeight * GpuVolcano(dir, (float)p.VolcanoFreq, (float)p.VolcanoDensity, seed);
         return p.Scale * shape;
+    }
+
+    /// <summary>Float mirror of the gen shader's <c>terrace</c> (mesas/banded canyon walls).</summary>
+    private static float GpuTerrace(float v, int steps, float sharp)
+    {
+        float s = v * steps;
+        float fl = MathF.Floor(s);
+        float frac = MathF.Pow(s - fl, sharp);
+        float riser = frac * frac * (3f - 2f * frac);
+        return (fl + riser) / steps;
     }
 
     /// <summary>Float mirror of the gen shader's <c>volcanoField</c> height (.x): sparse raised cones with a
@@ -950,6 +986,26 @@ public sealed class PlanetTerrain
 
     /// <summary>Ocean surface height (metres, signed) relative to the base radius; sea floor lies below.</summary>
     public double SeaLevelMeters => SeaLevel;
+
+    /// <summary>True if this world can grow vegetation (the surface renderer scatters grass billboards).</summary>
+    public bool HasVegetation => _hasLife;
+
+    /// <summary>Vegetation density in [0,1] at a surface point (unit dir + its height in metres): the same
+    /// warm-and-moist lushness the biome colouring uses, kept off the seas, snow and bare peaks. 0 on worlds
+    /// without life. Drives where the surface renderer scatters grass.</summary>
+    public double VegetationDensity(Vector3D<double> dir, double height)
+    {
+        if (!_hasLife) return 0.0;
+        double amp = Amplitude;
+        if (_hasOcean && height < SeaLevel + amp * 0.012) return 0.0;     // not in/at the water
+        double temp = Temperature01(dir, height, amp);
+        double moist = Moisture01(dir, height, amp);
+        double lush = Smoothstep(0.12, 0.35, temp) * Smoothstep(0.2, 0.55, moist);
+        double snowLine = Math.Clamp(PlanetTuning.EffectiveSnowLine(Type), 0.02, 0.98);
+        double t = Math.Clamp((height / amp + 0.3) / 1.3, 0.0, 1.0);
+        double notSnow = 1.0 - Smoothstep(snowLine * 0.75, snowLine, t);     // bare/snowy peaks stay clear
+        return Math.Clamp(lush * notSnow, 0.0, 1.0);
+    }
 
     /// <summary>
     /// Mean surface albedo over the whole globe — the flat colour the body shows from far away.

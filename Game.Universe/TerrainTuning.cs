@@ -109,4 +109,10 @@ public static class TerrainTuning
     /// earlier on approach; the match still holds because it only widens the band, capped at the mountain
     /// octave budget). CPU path: scales the approximate relief's base frequency. Live (no rebuild).</summary>
     public static float OrbitalReliefScale = 1.0f;
+
+    // --- Surface object scatter (grass/pickups/trees instanced on the drawn terrain; see VegetationRenderer) ---
+
+    /// <summary>How far (tangential metres around the camera's ground point) scattered surface objects spawn
+    /// in. Larger = objects appear from farther out (more draw work). Relief-independent. Live (no rebuild).</summary>
+    public static float ScatterRange = 1500f;
 }

@@ -434,6 +434,37 @@ void main() {
     private long _nextTileId = 1;
     private int _gpuGenBudget;
 
+    // Near drawn leaves collected during the GPU pass so VegetationRenderer can scatter grass on them by
+    // INSTANCING over each leaf's terrain vertices and sampling the SAME height tile the mesh used — exact
+    // placement on the drawn surface, no CPU height-mirror divergence. Only leaves within GrassRange.
+    public readonly struct GrassLeaf
+    {
+        public readonly uint BaseVbo;            // the leaf's base mesh (basePos/dir/texel/skirt per vertex)
+        public readonly Vector3D<float> Rel;     // camera-relative patch centre (the uModel translation)
+        public readonly Vector2D<float> TileOrigin;
+        public readonly float Morph;
+        public readonly int Face;                // cube face + rect + vertex spacing → surface-normal in shader
+        public readonly Vector4D<float> Rect;    // (u0,v0,u1,v1) of this patch on the face
+        public readonly float VertexSpacing;     // metres between adjacent tile texels (for the slope normal)
+        public GrassLeaf(uint vbo, Vector3D<float> rel, Vector2D<float> origin, float morph,
+                         int face, Vector4D<float> rect, float spacing)
+        { BaseVbo = vbo; Rel = rel; TileOrigin = origin; Morph = morph; Face = face; Rect = rect; VertexSpacing = spacing; }
+    }
+    // Gauge "near the camera's ground point" by DIRECTION, not by distance to the patch's base-sphere centre:
+    // on high-relief worlds the surface sits tens of km above the base sphere, so node.CenterLocal can be tens
+    // of km from the camera even when its surface is underfoot (and that radial offset also inflates the LOD
+    // distance, so patch size alone isn't a reliable proxy). Comparing the camera's nadir direction to the
+    // patch's direction is relief-independent — the same idea the rover uses to find its ground leaf.
+    private const int GrassMaxLeaves = 512;         // cap draw calls per frame
+    private Vector3D<double> _grassCamDir;          // camera nadir (planet-local unit), set each GPU draw
+    public double MinDrawnWorldSize { get; private set; } // smallest drawn leaf this frame (HUD diagnostic)
+    private readonly List<GrassLeaf> _grassLeaves = new();
+    public IReadOnlyList<GrassLeaf> GrassLeaves => _grassLeaves;
+    public int GrassVertsPerLeaf => (GridN + 1) * (GridN + 1); // grid verts come first in the base VBO
+    public int GrassVertexStrideFloats => 9;     // basePos(3)+dir(3)+texel(2)+skirt(1)
+    public int GrassGridN => GridN;
+    public uint HeightTexture => _tileCache?.HeightTexture ?? 0;
+
     // The rover's current leaf tile, read back once per leaf during render: all four wheels sample THIS
     // one buffer (clamped to its u,v rect), so the footprint has a single consistent, exact source —
     // mixing per-wheel sources or an analytic fallback either floated the body or ratcheted it upward.
@@ -954,6 +985,9 @@ void main() {
     /// sit. The atmosphere uses this to drop its ground/clip radius so low terrain still gets hazed.</summary>
     public double ActiveAmplitude => _terrain?.Amplitude ?? 0.0;
 
+    /// <summary>The active body's terrain field (height/biome/vegetation queries); null when none is set.</summary>
+    public PlanetTerrain? ActiveTerrain => _terrain;
+
     /// <summary>
     /// Optional extra LOD focus (e.g. the rover) — patches refine toward whichever is closer, the
     /// camera or this point, so the ground directly under the vehicle stays at fine vertex spacing
@@ -1382,7 +1416,11 @@ void main() {
         _gpuShader.SetInt("uHeight", 0);
 
         LeafCount = 0;
+        MinDrawnWorldSize = double.MaxValue;
         _gpuWaterFrame.Clear();
+        _grassLeaves.Clear();
+        Vector3D<double> camOff = camera.Position.DeltaMeters(_body!.CurrentPosition);
+        _grassCamDir = camOff.LengthSquared > 0 ? Vector3D.Normalize(camOff) : new Vector3D<double>(0, 1, 0);
         foreach (QuadNode root in _roots!) DrawSubtreeGpu(root, camera, viewProj);
 
         // Ocean pass: a translucent sea-level shell over the opaque sea floor (depth-tested + depth-writing
@@ -1548,6 +1586,26 @@ void main() {
         // Ocean worlds: this drawn leaf also gets a translucent water shell (reusing its base mesh), drawn
         // in the later water pass over the opaque sea floor.
         if (_terrain!.HasOcean) _gpuWaterFrame.Add((node, rel));
+
+        if (node.WorldSize < MinDrawnWorldSize) MinDrawnWorldSize = node.WorldSize;
+
+        // Near the camera's ground point (tangentially)? Hand it to the vegetation pass — it instances grass
+        // over this leaf's terrain vertices and samples this same tile for the exact drawn height. Direction
+        // comparison is relief-independent: a patch whose surface is underfoot has patchDir ≈ camDir even when
+        // its base-sphere centre is tens of km below. chord ≈ angle for the small angles grass cares about.
+        if (_grassLeaves.Count < GrassMaxLeaves)
+        {
+            Vector3D<double> patchDir = Vector3D.Normalize(node.CenterLocal);
+            double chord = (patchDir - _grassCamDir).Length;          // |Δ unit vectors|
+            double tangential = chord * _terrain.Radius;              // ≈ along-surface dist to patch CENTRE
+            // Subtract the patch's own tangential reach so the patch the camera stands on always qualifies
+            // even when the ground point is out near its edge (patches are huge on high-relief worlds).
+            double edgeDist = tangential - node.WorldSize * 0.75;
+            if (edgeDist < TerrainTuning.ScatterRange)
+                _grassLeaves.Add(new GrassLeaf(node.BaseVbo, rel, new Vector2D<float>(tox, toy), morph,
+                    node.Face, new Vector4D<float>((float)node.U0, (float)node.V0, (float)node.U1, (float)node.V1),
+                    (float)(node.WorldSize / GridN)));
+        }
     }
 
     /// <summary>Ensure a node has its base mesh and a resident height tile so it can be drawn this frame.
@@ -1786,6 +1844,27 @@ void main() {
             node = kids[(v >= vm ? 2 : 0) + (u >= um ? 1 : 0)];
         }
         return leaf;
+    }
+
+    /// <summary>Height (metres, signed vs base radius) of the DRAWN GPU surface at any direction — sampled at
+    /// the drawn leaf's own spacing + geomorph, so it matches what's on screen (a fixed fine spacing would
+    /// add octaves the coarse leaf never baked and read too high). For scattering surface props (vegetation).</summary>
+    public bool DrawnSurfaceHeight(Vector3D<double> localDir, out double height)
+    {
+        height = 0.0;
+        if (_terrain == null || _roots == null || !TerrainTuning.GpuTerrain) return false;
+        DirToFaceUV(localDir, out int face, out double u, out double v);
+        QuadNode leaf = FindDrawnLeaf(face, u, v) ?? _roots[face];
+        // Never sample finer than the float-safe spacing: the CPU float mirror (GpuHeightAt) diverges from
+        // the GPU-baked tile by up to KILOMETRES at the top octaves (which is why the rover uses tile
+        // read-back, not this). The coarse cap matches the drawn surface's stable low-frequency shape — the
+        // same trick FitProjection uses for the near plane — so scattered props sit near the ground instead
+        // of floating on the divergent fine octaves.
+        double sp = Math.Max(leaf.WorldSize / GridN, _terrain.Radius * 5e-5);
+        double hf = _terrain.GpuHeightAt(localDir, sp);
+        double hc = _terrain.GpuHeightAt(localDir, sp * 2.0);
+        height = hf + (hc - hf) * leaf.DrawMorph;
+        return true;
     }
 
     public bool TrySurfaceHeight(Vector3D<double> localDir, out double height)

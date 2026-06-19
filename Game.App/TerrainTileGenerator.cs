@@ -204,6 +204,9 @@ uniform float uDetailFloor;                        // min detail roughness in th
 uniform float uCraterWeight, uCraterDensity, uCraterFreq; // impact craters (0 weight = none)
 uniform float uCraterOctFine, uCraterOctCoarse;    // crater size classes resolved at each band-limit
 uniform float uVolcanoWeight, uVolcanoFreq, uVolcanoDensity; // raised volcano cones (lava worlds; 0 = none)
+uniform float uMicroWeight, uMicroFreq, uMicroGain;         // fine micro-relief (LOD-gated; 0 = none)
+uniform float uMicroOctFine, uMicroOctCoarse, uMicroGateFine, uMicroGateCoarse; // micro octave count + LOD gate
+uniform float uStrataWeight, uStrataFreq, uStrataSteps, uStrataSharp; // sedimentary terracing (mesas/canyons)
 layout(location = 0) out vec4 oHeight;
 
 const int MaxOct = 32;
@@ -394,7 +397,17 @@ vec2 volcanoField(vec3 dir, float freq, float density) {
     return vec2(h, vent);
 }
 
-float shape(vec3 dir, vec3 oct) {
+// Sedimentary terrace: snap a value to `steps` levels with a smooth (no vertical cliff) riser biased toward
+// the flat tread — gives mesas and banded canyon walls. Mirrors PlanetTerrain.Terrace.
+float terrace(float v, float steps, float sharp) {
+    float s = v * steps;
+    float fl = floor(s);
+    float frac = pow(s - fl, sharp);                    // bias toward the flat tread
+    float riser = frac * frac * (3.0 - 2.0 * frac);     // smoothstep the rise
+    return (fl + riser) / steps;
+}
+
+float shape(vec3 dir, vec3 oct, float microOct, float microGate) {
     float cont = fbm(dir, uFreq.x, oct.x, uGain.x);     // broad continents / basins
     float rugged = ruggedness(dir);                     // where rugged terrain belongs
     float mask = smoothstep(-0.2, 0.4, cont);           // highlands carry the mountains
@@ -402,7 +415,13 @@ float shape(vec3 dir, vec3 oct) {
     float mtn  = ridged(warped, uFreq.y, oct.y, uGain.y);
     float det  = erodedFbm(dir, uFreq.z, oct.z, uGain.z); // high-frequency roughness, slope-damped (eroded)
     float detailGate = uDetailFloor + (1.0 - uDetailFloor) * rugged; // calmer detail on plains
-    return uWeight.x * cont + uWeight.y * mtn * mask * rugged + uWeight.z * det * detailGate;
+    // Fine micro-relief (LOD-gated so it only resolves up close) + sedimentary strata (fixed-octave terrace).
+    float micro = (uMicroWeight > 0.0 && microGate > 0.0)
+        ? fbm(dir, uMicroFreq, microOct, uMicroGain) * microGate * detailGate : 0.0;
+    float strata = (uStrataWeight > 0.0)
+        ? terrace(fbm(dir + vec3(8.2, 71.5, 3.6), uStrataFreq, 4.0, 0.5), uStrataSteps, uStrataSharp) : 0.0;
+    return uWeight.x * cont + uWeight.y * mtn * mask * rugged + uWeight.z * det * detailGate
+         + uMicroWeight * micro + uStrataWeight * strata;
 }
 
 void main() {
@@ -426,8 +445,8 @@ void main() {
     }
     // Volcano cones: large, LOD-independent → added equally to both band-limits (no pop). Lava worlds only.
     float volcano = uVolcanoWeight > 0.0 ? volcanoField(dir, uVolcanoFreq, uVolcanoDensity).x : 0.0;
-    float hFine   = uScale * (shape(dir, uOctFine)   + uCraterWeight * craterFine   + uVolcanoWeight * volcano);
-    float hCoarse = uScale * (shape(dir, uOctCoarse) + uCraterWeight * craterCoarse + uVolcanoWeight * volcano);
+    float hFine   = uScale * (shape(dir, uOctFine,   uMicroOctFine,   uMicroGateFine)   + uCraterWeight * craterFine   + uVolcanoWeight * volcano);
+    float hCoarse = uScale * (shape(dir, uOctCoarse, uMicroOctCoarse, uMicroGateCoarse) + uCraterWeight * craterCoarse + uVolcanoWeight * volcano);
     oHeight = vec4(hFine, hCoarse, craterFine, craterCoarse);
 }";
 
@@ -485,6 +504,17 @@ void main() {
         _shader.SetFloat("uVolcanoWeight", (float)p.VolcanoWeight);
         _shader.SetFloat("uVolcanoFreq", (float)p.VolcanoFreq);
         _shader.SetFloat("uVolcanoDensity", (float)p.VolcanoDensity);
+        _shader.SetFloat("uMicroWeight", (float)p.MicroWeight);
+        _shader.SetFloat("uMicroFreq", (float)p.MicroFreq);
+        _shader.SetFloat("uMicroGain", (float)p.MicroGain);
+        _shader.SetFloat("uMicroOctFine", (float)(p.MicroWeight > 0.0 ? terrain.OctavesForSpacing(p.MicroFreq, spacingFine, p.MaxMicroOctaves) : 0.0));
+        _shader.SetFloat("uMicroOctCoarse", (float)(p.MicroWeight > 0.0 ? terrain.OctavesForSpacing(p.MicroFreq, spacingCoarse, p.MaxMicroOctaves) : 0.0));
+        _shader.SetFloat("uMicroGateFine", (float)(p.MicroWeight > 0.0 ? terrain.LayerGateForSpacing(p.MicroFreq, spacingFine) : 0.0));
+        _shader.SetFloat("uMicroGateCoarse", (float)(p.MicroWeight > 0.0 ? terrain.LayerGateForSpacing(p.MicroFreq, spacingCoarse) : 0.0));
+        _shader.SetFloat("uStrataWeight", (float)p.StrataWeight);
+        _shader.SetFloat("uStrataFreq", (float)p.StrataFreq);
+        _shader.SetFloat("uStrataSteps", p.StrataSteps);
+        _shader.SetFloat("uStrataSharp", (float)p.StrataSharp);
 
         // Render the noise into the tile, then restore exactly the framebuffer + viewport that were bound
         // (the scene FBO mid-render): generation can run inside the terrain pass, so it must leave no trace.
