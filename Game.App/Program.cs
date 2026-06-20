@@ -348,6 +348,14 @@ internal static class Program
     private static void OnRender(double dt)
     {
         _renderClock += dt; // real elapsed seconds, for time-animated effects (e.g. ocean swell)
+
+        // While the cursor is locked for flight, the wheel drives speed — so keep ImGui from also
+        // consuming it (which would scroll whatever window the hidden cursor sits over, e.g. the tuning
+        // panel). NoMouse makes NewFrame ignore mouse pos/buttons/wheel; cleared once the cursor is freed.
+        ImGuiIOPtr io = ImGui.GetIO();
+        if (_mouseCaptured) io.ConfigFlags |= ImGuiConfigFlags.NoMouse;
+        else io.ConfigFlags &= ~ImGuiConfigFlags.NoMouse;
+
         _imgui.Update((float)dt);
 
         // The 3D galaxy map is its own full-screen mode: an orbit camera over the resident star cloud,
@@ -914,6 +922,8 @@ internal static class Program
     /// The scanner panel (toggled with F): a detailed readout — class, gravity, temperature,
     /// hydrosphere, and atmosphere/surface composition — for the nearest body once we're close
     /// enough to scan it. Works for planets and moons alike (both now carry the same scan data).
+    /// When no body is within scan range it falls back to a wider readout: the star + system if a
+    /// system is active, otherwise the sector (position + nearest star).
     /// </summary>
     private static void DrawScanner()
     {
@@ -925,31 +935,22 @@ internal static class Program
 
         if (!_systemManager.HasActive)
         {
-            ImGui.TextDisabled("No system in range. Approach a star.");
+            // Out in interstellar space — no system to scan. Report the sector instead.
+            DrawSectorScan();
             ImGui.End();
             return;
         }
 
         CelestialBody? target = NearestBody(out double dist);
-        if (target == null)
+        // No body within scan range → widen the scan to the star + system rather than a dead end.
+        if (target == null || dist > target.RadiusMeters * ScanRangeRadii)
         {
-            ImGui.TextDisabled("No bodies detected.");
+            DrawSystemScan(_systemManager.Active!, target, dist);
             ImGui.End();
             return;
         }
 
-        double alt = dist - target.RadiusMeters;
-        double range = target.RadiusMeters * ScanRangeRadii;
         ImGui.Text($"Nearest: {target.Designation}");
-        if (dist > range)
-        {
-            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.7f, 0.4f, 1f),
-                $"OUT OF SCAN RANGE - {FormatDistance(Math.Max(0, alt))}");
-            ImGui.TextDisabled($"Approach to within {FormatDistance(range)} to scan.");
-            ImGui.End();
-            return;
-        }
-
         ImGui.Separator();
         ImGui.Text($"Class: {target.Type}");
         if (target.Habitable)
@@ -997,6 +998,81 @@ internal static class Program
         }
 
         ImGui.End();
+    }
+
+    /// <summary>Scanner fallback when a system is active but no body is in scan range: read out the
+    /// star and its system (the nearest body, if any, is noted with how close to approach to scan it).</summary>
+    private static void DrawSystemScan(SolarSystem sys, CelestialBody? nearest, double nearestDist)
+    {
+        Star sun = sys.Sun;
+        ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"STAR SCAN — {sun.Designation}");
+        ImGui.Separator();
+        ImGui.Text($"Class: {sun.ClassLetter}  ({sun.Class}-type)");
+        ImGui.Text($"Temperature: {sun.Temperature:0} K");
+        ImGui.Text($"Luminosity: {sun.Luminosity:0.00} Lsun");
+        ImGui.Text($"Mass: {sun.MassSolar:0.00} Msun");
+        ImGui.Text($"Radius: {sun.RadiusMeters / MathUtil.SolarRadiusM:0.00} Rsun");
+        ImGui.Spacing();
+
+        string belt = sys.Belt != null ? "  + asteroid belt" : "";
+        ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.85f, 1f, 1f),
+            $"System: {sys.Planets.Length} planet(s){belt}");
+        foreach (Planet pl in sys.Planets)
+        {
+            string moons = pl.Moons.Length > 0 ? $"  ({pl.Moons.Length} moons)" : "";
+            ImGui.Text($"  {pl.Designation}  {pl.Type,-9} a={pl.SemiMajorAxis / MathUtil.AstronomicalUnit:0.00} AU{moons}");
+        }
+        if (sys.Planets.Length > 0)
+            ImGui.Text($"Outermost orbit: {sys.MaxOrbitRadius / MathUtil.AstronomicalUnit:0.00} AU");
+        ImGui.Spacing();
+
+        if (nearest != null)
+        {
+            double range = nearest.RadiusMeters * ScanRangeRadii;
+            double alt = nearestDist - nearest.RadiusMeters;
+            ImGui.TextDisabled($"Nearest body: {nearest.Designation} ({FormatDistance(Math.Max(0, alt))} away)");
+            ImGui.TextDisabled($"Approach to within {FormatDistance(range)} to scan it.");
+        }
+        else
+        {
+            ImGui.TextDisabled("No planetary bodies in this system.");
+        }
+    }
+
+    /// <summary>Scanner fallback in interstellar space (no active system): read out the sector —
+    /// galactic position and the nearest catalog star (the one whose system would spawn).</summary>
+    private static void DrawSectorScan()
+    {
+        var p = _camera.Position;
+        double distLy = p.DistanceTo(UniversePosition.Origin) / MathUtil.LightYear;
+        ImGui.TextColored(new System.Numerics.Vector4(0.6f, 0.85f, 1f, 1f), "SECTOR SCAN");
+        ImGui.Separator();
+        ImGui.Text($"Sector: {p.Sector.X}, {p.Sector.Y}, {p.Sector.Z}");
+        ImGui.Text($"From origin: {distLy:0.000} ly");
+        ImGui.Text($"Resident: {_starPager.LoadedStarCount:N0} stars in {_starPager.LoadedBlockCount} blocks");
+        ImGui.TextDisabled($"  ({StarCatalog.BlockSideLy:0} ly per block)");
+        ImGui.Spacing();
+
+        if (_starPager.HasNearest)
+        {
+            Star s = _starPager.Nearest;
+            double nLy = _starPager.NearestDistanceMeters / MathUtil.LightYear;
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"Nearest star — {s.Designation}");
+            ImGui.Text($"Class: {s.ClassLetter}  ({s.Class}-type)");
+            ImGui.Text($"Temperature: {s.Temperature:0} K");
+            ImGui.Text($"Luminosity: {s.Luminosity:0.00} Lsun");
+            ImGui.Text($"Mass: {s.MassSolar:0.00} Msun");
+            ImGui.Text($"Distance: {nLy:0.0000} ly");
+            if (nLy < _systemManager.SpawnLightYears)
+                ImGui.TextColored(new System.Numerics.Vector4(0.4f, 1f, 0.5f, 1f),
+                    $"  >> within {_systemManager.SpawnLightYears:0.###} ly — system in range");
+            else
+                ImGui.TextDisabled($"  Approach within {_systemManager.SpawnLightYears:0.###} ly to spawn its system.");
+        }
+        else
+        {
+            ImGui.TextDisabled("No stars within tracking range.");
+        }
     }
 
     /// <summary>Nearest body (planet or moon) to the camera, with its centre distance.</summary>

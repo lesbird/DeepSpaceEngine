@@ -207,7 +207,11 @@ stars in as you roam past it is a follow-up.)
 range — class, radius, surface gravity, temperature, hydrosphere, surface pressure, and
 atmosphere/surface composition (works for planets and moons alike), with habitable worlds flagged.
 The composition is the **same data that drives the atmosphere's appearance**, so the sky you see
-matches the gases (and pressure) the scanner reports.
+matches the gases (and pressure) the scanner reports. When **no body is in scan range** the panel
+widens out: inside a system it reports the **star and its system** (spectral class, temperature,
+luminosity, mass, radius, and the planet roster); out in interstellar space it reports the **sector**
+(galactic position, resident star count, and the nearest catalog star — the one whose system would
+spawn).
 
 **HUD.** Shows sector/local position, distance from origin (ly), speed, FPS, the active
 system (planets, moons, orbit time-lapse with apparent speed in `c`), and — when landing —
