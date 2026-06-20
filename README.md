@@ -61,7 +61,9 @@ interstellar flight down to standing on a planet. See the full design in
 > sits exactly on the surface no matter how extreme the world's relief. Each spawner is its own layer
 > (rocks, trees, pickups…) with its own mesh, density, size and orientation (world-up / surface-normal /
 > random), decorrelated so layers don't stack, and gated per world by **environment traits** (so
-> vegetation skips airless moons) plus a **spawn-chance** dice-roll: the foundation for trees, grass and
+> vegetation skips airless moons), a **spawn-chance** dice-roll, and an optional **altitude band** (a
+> min/max height above the base radius, so a layer can stay out of the oceans and off the high peaks):
+> the foundation for trees, grass and
 > pickups. Generation is fully deterministic. M5 (fidelity) is underway.
 
 ## Screenshots
@@ -220,7 +222,8 @@ and a *Debug: transmittance* toggle that shows the ray-march geometry), **terrai
 (relief scale, mountain bias, feature frequency), **surface detail** (LOD distance — how aggressively
 the terrain subdivides on approach — plus detail-normal strength/fineness/range and material breakup),
 **surface objects** (the up-close scatter — a live add/remove list of spawner layers, each with its own
-mesh, density, size range, orientation, required environment traits and per-world spawn chance),
+mesh, density, size range, orientation, required environment traits, per-world spawn chance and an
+optional **altitude band** that keeps a layer out of the oceans and off the high peaks),
 and **biome/colour** (snow line, cliff threshold and strength, lowland tint, rock/snow/cliff colours).
 Atmosphere updates instantly;
 terrain/biome changes regenerate the meshes live. Turning the atmosphere off renders the bare

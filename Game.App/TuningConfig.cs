@@ -65,6 +65,8 @@ public sealed class TuningConfig
         public int Require { get; set; } = (int)EnvTrait.Surface;
         public int Forbid { get; set; }
         public float SpawnChance { get; set; } = 1f;
+        public float MinAltitude { get; set; } = -Spawner.NoAltLimit;   // metres above base radius; sentinel = no lower limit
+        public float MaxAltitude { get; set; } = Spawner.NoAltLimit;    // metres above base radius; sentinel = no upper limit
     }
 
     /// <summary>One per-type override profile (terrain relief + biome colour).</summary>
@@ -139,6 +141,8 @@ public sealed class TuningConfig
                 Require = (int)sp.Require,
                 Forbid = (int)sp.Forbid,
                 SpawnChance = sp.SpawnChance,
+                MinAltitude = sp.MinAltitude,
+                MaxAltitude = sp.MaxAltitude,
             });
         return list;
     }
@@ -237,6 +241,8 @@ public sealed class TuningConfig
                     Require = (EnvTrait)d.Require,
                     Forbid = (EnvTrait)d.Forbid,
                     SpawnChance = d.SpawnChance,
+                    MinAltitude = d.MinAltitude,
+                    MaxAltitude = d.MaxAltitude,
                 });
             s.InvalidateActivation();
         }

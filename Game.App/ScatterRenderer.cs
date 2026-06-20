@@ -26,6 +26,11 @@ public sealed class Spawner
     public EnvTrait Require = EnvTrait.Surface;      // body must have ALL these traits
     public EnvTrait Forbid = EnvTrait.None;          // body must have NONE of these traits
     public float SpawnChance = 1f;                   // per-world probability this spawner appears at all
+    public float MinAltitude = -NoAltLimit;          // metres of relief above base radius — skip sites below (keeps out of oceans)
+    public float MaxAltitude = NoAltLimit;           // metres of relief above base radius — skip sites above (keeps off peaks)
+
+    /// <summary>Sentinel magnitude meaning "don't clamp this altitude bound" (1e9 m dwarfs any real relief).</summary>
+    public const float NoAltLimit = 1e9f;
 
     /// <summary>Runtime: passes both gates on the current body (recomputed when the body changes).</summary>
     public bool ActiveHere;
@@ -91,6 +96,8 @@ uniform sampler2D uHeight;  // the terrain height atlas (RG = fine/coarse metres
 uniform float uMinSize;     // per-object size is rolled between these (m)
 uniform float uMaxSize;
 uniform float uThin;        // keep a site if its spawn hash < uThin
+uniform float uMinAlt;      // skip sites whose drawn height (m above base radius) is below this
+uniform float uMaxAlt;      // skip sites whose drawn height (m above base radius) is above this
 uniform int uOrient;        // 0 = world (radial) up, 1 = surface-normal up, 2 = random up
 uniform int uFace;          // for the surface-normal slope basis
 uniform vec4 uRect;         // (u0,v0,u1,v1) of this patch on the face
@@ -118,6 +125,7 @@ void main() {
     vec3 base = (uModel * vec4(surf, 1.0)).xyz;   // camera-relative surface point
 
     float keep = step(hash(aTexel, 0.0), uThin);  // spawn/skip roll
+    keep *= step(uMinAlt, h) * step(h, uMaxAlt);  // altitude band: drop oceans (below min) / peaks (above max)
     float sizeT = hash(aTexel, 7.31);             // independent size roll → variety
     vKeep = keep;
     float s = mix(uMinSize, uMaxSize, sizeT) * keep; // random size in [min,max]; culled sites collapse to 0
@@ -225,6 +233,8 @@ void main() {
             _shader.SetFloat("uMinSize", lo);
             _shader.SetFloat("uMaxSize", hi);
             _shader.SetFloat("uThin", thin);
+            _shader.SetFloat("uMinAlt", Math.Min(sp.MinAltitude, sp.MaxAltitude));
+            _shader.SetFloat("uMaxAlt", Math.Max(sp.MinAltitude, sp.MaxAltitude));
             _shader.SetInt("uOrient", sp.Orient);
             // Golden-ratio scramble of the seed → a well-spread per-spawner hash offset.
             _shader.SetFloat("uHashSalt", (sp.Seed & 0xFFFFu) * 0.6180339887f);

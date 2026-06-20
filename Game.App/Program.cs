@@ -1515,6 +1515,17 @@ internal static class Program
         ImGui.SameLine();
         ImGui.SliderFloat("spawn range (m)##scatter", ref TerrainTuning.ScatterRange, 100f, 9000f);
 
+        // Context for the altitude limits: this world's relief envelope (metres above the base radius),
+        // so the user can pick min/max altitude against real numbers instead of guessing.
+        PlanetTerrain? terr = _terrainRenderer.ActiveTerrain;
+        float worldAmp = terr != null ? (float)terr.Amplitude : 1000f;
+        bool hasSea = terr != null && !double.IsInfinity(terr.SeaLevelMeters);
+        float worldSea = hasSea ? (float)terr!.SeaLevelMeters : 0f;
+        if (terr != null)
+            ImGui.TextDisabled(hasSea
+                ? $"world relief: ±{worldAmp:0} m,  sea level {worldSea:0} m"
+                : $"world relief: ±{worldAmp:0} m,  no ocean");
+
         int remove = -1;
         for (int i = 0; i < _scatter.Spawners.Count; i++)
         {
@@ -1531,6 +1542,22 @@ internal static class Program
                 ImGui.SliderFloat("min size (m)", ref sp.MinSize, 0.5f, 40f);
                 ImGui.SliderFloat("max size (m)", ref sp.MaxSize, 0.5f, 40f);
                 ImGui.SliderFloat("spawn chance", ref sp.SpawnChance, 0f, 1f);
+
+                // Altitude band (metres of relief above the base radius). Off by default; enabling seeds it
+                // to "above sea level, up to the peaks" so it immediately keeps objects out of the ocean.
+                bool limitAlt = sp.MinAltitude > -Spawner.NoAltLimit || sp.MaxAltitude < Spawner.NoAltLimit;
+                if (ImGui.Checkbox("limit altitude", ref limitAlt))
+                {
+                    if (limitAlt) { sp.MinAltitude = hasSea ? worldSea : 0f; sp.MaxAltitude = worldAmp; }
+                    else { sp.MinAltitude = -Spawner.NoAltLimit; sp.MaxAltitude = Spawner.NoAltLimit; }
+                }
+                if (limitAlt)
+                {
+                    float lim = MathF.Max(2000f, worldAmp * 1.1f);
+                    ImGui.DragFloat("min alt (m)", ref sp.MinAltitude, lim / 400f, -lim, lim, "%.0f");
+                    ImGui.DragFloat("max alt (m)", ref sp.MaxAltitude, lim / 400f, -lim, lim, "%.0f");
+                    if (sp.MaxAltitude < sp.MinAltitude) sp.MaxAltitude = sp.MinAltitude;
+                }
 
                 ImGui.TextDisabled("require these traits on the world:");
                 TraitCheckbox("surface", ref sp.Require, EnvTrait.Surface); ImGui.SameLine();
