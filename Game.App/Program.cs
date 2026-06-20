@@ -84,6 +84,18 @@ internal static class Program
     private static bool _galaxyHasSel;
     private static float _galaxyDragPx;                  // drag accumulated this press (click vs pan)
     private static readonly List<(System.Numerics.Vector2 pos, float r, uint col, Star star)> _galaxyDots = new();
+    private static bool _galaxy3DVisible;                // full-screen 3D galaxy map mode
+    private static Camera _mapCamera = null!;            // orbit camera for the 3D map
+    private static UniversePosition _mapFocus;           // point the 3D map orbits around
+    private static float _mapYaw, _mapPitch = 0.5f;      // orbit angles (radians)
+    private static double _mapDistLy = 80.0;             // orbit distance (light-years)
+    private static readonly List<Star> _mapChain = new(); // in-range stars in greedy nearest-neighbour order
+    private static bool _mapChainValid;                  // recompute the chain when the focus moves
+    private static float _mapRangeLy = 10f;              // 3D map shows stars within this radius of the focus (slider)
+    private static bool _mapPressed;                     // a left-press is in progress on the map background
+    private static float _mapDragPx;                     // accumulated drag this press (distinguishes click from orbit)
+    private static bool _mapClick;                       // a click (not a drag) was released this frame
+    private static ulong _mapFocusStarId;               // 0 = focus is the ship; else the id of the picked centre star
     private static string _jumpStatus = "";
     private static bool _scannerOpen;
     private static string _starSearch = "";
@@ -237,7 +249,12 @@ internal static class Program
         // 'P' toggles the galactic-plane grid: a faint reference plane through the galaxy centre.
         if (Edge(Key.P, ref _prevP)) _galacticGridVisible = !_galacticGridVisible;
         if (Edge(Key.M, ref _prevM)) _systemMapVisible = !_systemMapVisible;
-        if (Edge(Key.N, ref _prevN)) _galaxyMapVisible = !_galaxyMapVisible;
+        // 'N' opens the 2D galaxy map; if the 3D map is already up, 'N' closes it instead.
+        if (Edge(Key.N, ref _prevN))
+        {
+            if (_galaxy3DVisible) _galaxy3DVisible = false;
+            else _galaxyMapVisible = !_galaxyMapVisible;
+        }
 
         // 'H' hides/shows the whole HUD (reticles + all panels) for a clean view / screenshots.
         if (Edge(Key.H, ref _prevH)) _hudVisible = !_hudVisible;
@@ -266,7 +283,7 @@ internal static class Program
         // Capture the active planet's position before it advances, so we can ride its frame.
         UniversePosition? ridePrev = _terrainTarget?.CurrentPosition;
 
-        if (!_driving) _controller.Update(dt);
+        if (!_driving && !_galaxy3DVisible) _controller.Update(dt); // ship is frozen while orbiting the 3D map
         _starPager.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
         _asteroidFields.Update(_camera.Position, AsteroidFieldRadiusCells);
         _systemManager.Update(dt, _camera.Position, _starPager);
@@ -332,6 +349,10 @@ internal static class Program
     {
         _renderClock += dt; // real elapsed seconds, for time-animated effects (e.g. ocean swell)
         _imgui.Update((float)dt);
+
+        // The 3D galaxy map is its own full-screen mode: an orbit camera over the resident star cloud,
+        // reusing the catalog star pipeline + bloom. It replaces the normal scene entirely.
+        if (_galaxy3DVisible) { RenderGalaxyMap3DFrame(); return; }
 
         // Render the scene (stars + system + terrain) into an offscreen buffer so the atmosphere
         // can read its depth and clamp its ray march to the real surface.
@@ -1278,7 +1299,212 @@ internal static class Program
         {
             ImGui.TextDisabled("click a star to select it");
         }
+        ImGui.SameLine();
+        if (ImGui.Button("Open 3D view"))
+        {
+            _galaxy3DVisible = true;
+            _galaxyMapVisible = false;
+            _mapFocus = _camera.Position;
+            _mapYaw = 0f; _mapPitch = 0.5f; _mapDistLy = 80.0;
+            _mapFocusStarId = 0;
+            _mapChainValid = false;
+            SetMouseCaptured(false); // free the cursor to drag-orbit + use the panel
+        }
         ImGui.End();
+    }
+
+    /// <summary>Full-screen 3D galaxy map: an orbit camera over the resident star cloud, drawn with the
+    /// existing catalog-star pipeline (so far stars project correctly) and the normal bloom/composite.
+    /// Drag to rotate, wheel to zoom; markers (drawn over the top) flag you, the active system and the
+    /// search target. First look — picking/jump in 3D is the next step.</summary>
+    private static void RenderGalaxyMap3DFrame()
+    {
+        _mapCamera ??= new Camera { NearPlane = 1.0e9f, FarPlane = 1.0e20f };
+        var io = ImGui.GetIO();
+
+        // Orbit input on the background (an ImGui panel keeps its own mouse via WantCaptureMouse).
+        if (!io.WantCaptureMouse)
+        {
+            if (io.MouseDown[0]) { _mapYaw -= io.MouseDelta.X * 0.005f; _mapPitch -= io.MouseDelta.Y * 0.005f; }
+            if (io.MouseWheel != 0f) _mapDistLy = Math.Clamp(_mapDistLy * Math.Pow(1.1, -io.MouseWheel), 2.0, 5000.0);
+        }
+        _mapPitch = Math.Clamp(_mapPitch, -1.5f, 1.5f);
+
+        // Click vs drag: a left press that barely moves is a star pick; a moving press orbits the camera.
+        if (io.MouseClicked[0] && !io.WantCaptureMouse) { _mapPressed = true; _mapDragPx = 0f; }
+        if (_mapPressed && io.MouseDown[0]) _mapDragPx += MathF.Abs(io.MouseDelta.X) + MathF.Abs(io.MouseDelta.Y);
+        _mapClick = false;
+        if (_mapPressed && io.MouseReleased[0]) { _mapClick = _mapDragPx < 4f && !io.WantCaptureMouse; _mapPressed = false; }
+
+        _mapCamera.AspectRatio = io.DisplaySize.X / MathF.Max(1f, io.DisplaySize.Y);
+        _mapCamera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitY, _mapYaw)
+                               * Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, _mapPitch);
+        Vector3D<float> fwd = _mapCamera.Forward;
+        double distM = _mapDistLy * MathUtil.LightYear;
+        _mapCamera.Position = _mapFocus.Translated(new Vector3D<double>(-fwd.X * distM, -fwd.Y * distM, -fwd.Z * distM));
+
+        // No full star cloud — it was too noisy. Just clear to deep space; only the immediate neighbourhood
+        // (nearest stars + nav lines + markers) is drawn, as an ImGui overlay in DrawGalaxy3DPanel.
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
+        _gl.Viewport(0, 0, (uint)_sceneFbo.Width, (uint)_sceneFbo.Height);
+        _gl.ClearColor(0.01f, 0.012f, 0.02f, 1f);
+        _gl.Clear((uint)(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit));
+
+        if (_hudVisible) DrawGalaxy3DPanel(io);
+        _imgui.Render();
+    }
+
+    /// <summary>3D-map overlay: screen-projected markers (you / active system / search target) drawn over
+    /// the star cloud, plus a small control panel.</summary>
+    private static void DrawGalaxy3DPanel(ImGuiIOPtr io)
+    {
+        Matrix4X4<float> viewProj = _mapCamera.ViewMatrix * _mapCamera.ProjectionMatrix;
+        var fg = ImGui.GetForegroundDrawList();
+
+        bool Project(in UniversePosition pos, out System.Numerics.Vector2 screen)
+        {
+            Vector3D<float> rel = pos.ToCameraRelative(_mapCamera.Position);
+            Vector4D<float> clip = Vector4D.Transform(new Vector4D<float>(rel, 1f), viewProj);
+            screen = default;
+            if (clip.W <= 1e-4f) return false; // behind the camera
+            float nx = clip.X / clip.W, ny = clip.Y / clip.W;
+            if (nx is < -1.2f or > 1.2f || ny is < -1.2f or > 1.2f) return false;
+            screen = new System.Numerics.Vector2((nx * 0.5f + 0.5f) * io.DisplaySize.X, (0.5f - ny * 0.5f) * io.DisplaySize.Y);
+            return true;
+        }
+
+        EnsureMapChain();
+        bool focusVis = Project(_mapFocus, out var fp);
+
+        // A single navigation route: focus → its nearest star → that star's nearest, and so on through the
+        // local stars. Lines connect consecutive visible hops; each star is a colour dot + bright core + label.
+        bool lastVis = focusVis;
+        System.Numerics.Vector2 lastPt = fp;
+        Star pickHit = default;
+        bool pickHas = false;
+        float pickD = 12f;
+        for (int i = 0; i < _mapChain.Count; i++)
+        {
+            Star st = _mapChain[i];
+            bool vis = Project(st.Position, out var sp2);
+            if (vis && lastVis) fg.AddLine(lastPt, sp2, Col(0.5f, 0.7f, 1f, 0.5f), 1.5f);
+            if (vis)
+            {
+                Vector3D<float> sc = st.Color;
+                uint scol = Col(MathF.Max(sc.X, 0.45f), MathF.Max(sc.Y, 0.45f), MathF.Max(sc.Z, 0.45f));
+                float r = Math.Clamp(3.5f + st.SizeCue * 2.5f, 3.5f, 9f);
+                fg.AddCircleFilled(sp2, r, scol, 16);
+                fg.AddCircleFilled(sp2, r * 0.45f, Col(1f, 1f, 1f, 0.9f), 12); // bright core
+                if (i == 0) // label only the nearest neighbour (the centre itself is labelled separately)
+                {
+                    double ly = st.Position.DistanceTo(_mapFocus) / MathUtil.LightYear;
+                    fg.AddText(sp2 + new System.Numerics.Vector2(r + 3f, -5f), Col(0.8f, 0.9f, 1f), $"#{st.Id}  {ly:0.0} ly");
+                }
+                float dd = System.Numerics.Vector2.Distance(io.MousePos, sp2);
+                if (dd < pickD) { pickD = dd; pickHit = st; pickHas = true; }
+            }
+            lastVis = vis;
+            lastPt = sp2;
+        }
+
+        // Click a star → make it the new centre (rebuild the local view) AND set it as the fly-to navigation
+        // target, so the in-world arrow + Find/Go-to guide you to it back in fly view.
+        if (_mapClick && pickHas)
+        {
+            _mapFocus = pickHit.Position;
+            _mapFocusStarId = pickHit.Id;
+            _mapChainValid = false;
+
+            _searchTarget = pickHit;
+            _hasSearchTarget = true;
+            _starSearch = pickHit.Id.ToString();
+            double tly = pickHit.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
+            _searchStatus = $"#{pickHit.Id}: {pickHit.ClassLetter}-class, {tly:0.000} ly — Go to it";
+        }
+
+        if (focusVis)
+        {
+            uint fcol = _mapFocusStarId == 0 ? Col(0.4f, 1f, 0.6f) : Col(1f, 1f, 1f, 0.95f);
+            string flabel = _mapFocusStarId == 0 ? "you are here" : $"#{_mapFocusStarId} (centre)";
+            fg.AddCircle(fp, 8f, fcol, 18, 2f);
+            fg.AddText(fp + new System.Numerics.Vector2(10, -6), fcol, flabel);
+        }
+        // When centred on a picked star, still show where the ship actually is.
+        if (_mapFocusStarId != 0 && Project(_camera.Position, out var shipP))
+        {
+            fg.AddCircle(shipP, 6f, Col(0.4f, 1f, 0.6f), 14, 2f);
+            fg.AddText(shipP + new System.Numerics.Vector2(8, -6), Col(0.4f, 1f, 0.6f), "ship");
+        }
+        if (_systemManager.HasActive && Project(_systemManager.Active!.Sun.Position, out var sp))
+        {
+            fg.AddCircle(sp, 7f, Col(1f, 0.85f, 0.3f), 16, 2f);
+            fg.AddText(sp + new System.Numerics.Vector2(9, -6), Col(1f, 0.85f, 0.3f), $"#{_systemManager.Active!.Sun.Id}");
+        }
+        if (_hasSearchTarget && Project(_searchTarget.Position, out var tp))
+            fg.AddCircle(tp, 7f, Col(0.4f, 0.8f, 1f), 16, 2f);
+
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(330, 0), ImGuiCond.FirstUseEver);
+        ImGui.Begin("Galaxy map — 3D", ImGuiWindowFlags.NoNav | ImGuiWindowFlags.AlwaysAutoResize);
+        ImGui.TextDisabled($"orbit {_mapDistLy:0.#} ly  •  {_mapChain.Count} stars within {_mapRangeLy:0} ly");
+        ImGui.TextDisabled("drag = rotate  •  wheel = zoom");
+        if (ImGui.SliderFloat("range (ly)", ref _mapRangeLy, 10f, 50f, "%.0f")) _mapChainValid = false;
+        if (ImGui.Button("Recenter on me")) { _mapFocus = _camera.Position; _mapFocusStarId = 0; _mapChainValid = false; }
+        ImGui.SameLine();
+        if (ImGui.Button("Close")) _galaxy3DVisible = false;
+
+        if (_hasSearchTarget)
+        {
+            ImGui.Separator();
+            double ly = _searchTarget.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
+            ImGui.Text($"target #{_searchTarget.Id}  •  {_searchTarget.ClassLetter}-class  •  {ly:0.000} ly");
+            ImGui.TextDisabled("(an arrow points to it back in fly view)");
+            if (ImGui.Button("Fly to target")) { GoToStar(); _galaxy3DVisible = false; }
+        }
+        ImGui.End();
+    }
+
+    /// <summary>Build the navigation chain for the 3D map: every resident star within <see cref="MapRangeLy"/>
+    /// of the focus, ordered by a greedy nearest-neighbour walk from the focus (focus → its nearest star →
+    /// that star's nearest unvisited star → …). Recomputed only when the focus moves.</summary>
+    private static void EnsureMapChain()
+    {
+        if (_mapChainValid) return;
+        _mapChainValid = true;
+        _mapChain.Clear();
+
+        double maxM = _mapRangeLy * MathUtil.LightYear;
+        const int Cap = 600; // safety bound on a very dense neighbourhood
+        var inRange = new List<Star>();
+        foreach (StarCatalog block in _starPager.LoadedBlocks)
+        {
+            foreach (Star st in block.Stars)
+            {
+                double d = st.Position.DistanceTo(_mapFocus);
+                if (d < 1.0e6 || d > maxM) continue; // skip a star essentially at the focus, and out-of-range
+                inRange.Add(st);
+                if (inRange.Count >= Cap) break;
+            }
+            if (inRange.Count >= Cap) break;
+        }
+
+        // Greedy nearest-neighbour walk from the focus through all in-range stars.
+        var used = new bool[inRange.Count];
+        UniversePosition cur = _mapFocus;
+        for (int step = 0; step < inRange.Count; step++)
+        {
+            int best = -1;
+            double bestD = double.MaxValue;
+            for (int i = 0; i < inRange.Count; i++)
+            {
+                if (used[i]) continue;
+                double d = inRange[i].Position.DistanceTo(cur);
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            if (best < 0) break;
+            used[best] = true;
+            _mapChain.Add(inRange[best]);
+            cur = inRange[best].Position;
+        }
     }
 
     /// <summary>Surface-object scatter controls: a master toggle + spawn range, then a live-editable
