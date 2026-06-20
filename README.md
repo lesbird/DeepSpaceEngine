@@ -136,7 +136,7 @@ dotnet run --project Game.App      # launch the engine
 | `P` | Pause / resume orbital time |
 | `F` | Toggle the body scanner panel |
 | `M` | Toggle the system map (top-down schematic of the active system) |
-| `N` | Toggle the galaxy map (top-down chart of nearby catalog stars) |
+| `N` | Toggle the galaxy map (2D chart of nearby stars; "Open 3D view" for a navigable 3-D neighbourhood) |
 | `R` | Drive the rover (when low over a surface) / return to free-fly |
 | `H` | Toggle the entire HUD (reticles + all panels) on/off |
 | `Tab` | Toggle mouse capture (to interact with the HUD) |
@@ -194,8 +194,12 @@ centre, planets on log-radial orbit rings at their live angle, moons, the astero
 here" marker; click a planet or moon to read its scan data and *Travel here*. Press `N` for the **galaxy
 map** — a pannable, zoomable top-down chart of the nearby catalog stars projected onto the galactic plane,
 coloured by star colour and sized by luminosity, with markers for you, the active system and the search
-target; click a star to *Jump here* or set it as the navigation search target. (The galaxy map currently
-shows the resident star bubble; streaming new stars in as you pan past it is a follow-up.)
+target; click a star to *Jump here* or set it as the navigation search target. From the galaxy map,
+**Open 3D view** for a navigable 3-D view of your stellar neighbourhood: an orbit camera (drag to rotate,
+wheel to zoom) over every star within an adjustable radius (10–50 ly), threaded by a single nearest-neighbour
+route from your position; click a star to recentre on it and set it as the fly-to target (an arrow then
+points to it back in fly view). (The galaxy maps currently show the resident star bubble; streaming new
+stars in as you roam past it is a follow-up.)
 
 **Scanner.** Press `F` to toggle a scanner panel that reads out the nearest body once you're in
 range — class, radius, surface gravity, temperature, hydrosphere, surface pressure, and
@@ -249,7 +253,7 @@ Candidate features, roughly by area — the first group is what's being built ne
 - [x] **Banded gas giants** — procedural zonal cloud bands + a storm oval on gas/ice giants
 - [x] **Micro-relief + strata on the GPU path** — mesas and banded canyon walls (full CPU parity)
 - [x] **Multi-spawner surface-object scatter** — any number of layers, each with its own mesh/density/size/orientation, gated per world by environment traits + a spawn-chance roll (placeholder meshes today; real art next)
-- [x] **System & galaxy maps** — `M` for a top-down system schematic (click-to-travel), `N` for a pan/zoom galaxy chart of nearby stars (click-to-jump / set search target)
+- [x] **System & galaxy maps** — `M` for a top-down system schematic (click-to-travel), `N` for a 2D galaxy chart (click-to-jump) plus a navigable **3-D neighbourhood view** (orbit camera, 10–50 ly radius, nearest-neighbour route, click-to-target)
 - [~] **Eclipses** — built (a world dims when a sibling transits its sun) but **disabled**: the twilight drop was too abrupt; coverage math kept for a gradual-ramp redo
 - [✗] **Planet rotation + day/night cycle** — prototyped as a sun-direction sweep but **dropped**; needs true geometric spin (the sun must actually move across the sky)
 
@@ -280,7 +284,7 @@ Candidate features, roughly by area — the first group is what's being built ne
 **Gameplay & UX**
 - [ ] Player ship model + a lander / atmospheric flight mode
 - [ ] First-person on-foot mode
-- [x] Galaxy/system map view (2D top-down system + galaxy maps with click-to-travel/jump; galaxy streaming-while-panning still to come)
+- [x] Galaxy/system map view (2D system + galaxy maps with click-to-travel/jump, plus a navigable 3-D neighbourhood map with click-to-target; galaxy streaming-while-roaming still to come)
 - [ ] Location bookmarks (save/load) and photo mode
 - [ ] Ambient + surface + engine sound
 - [ ] net8 LTS migration
