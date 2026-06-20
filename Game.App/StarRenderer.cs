@@ -112,11 +112,11 @@ void main() {
     private readonly List<Vector3D<long>> _evictScratch = new();
     private const int CatUploadsPerFrame = 4; // cap block uploads so a burst (e.g. startup) can't stall a frame
 
-    /// <summary>Brightness mapping for the catalog draw (tunable). With CatGamma ≈ 0.25 a Sun-like
+    /// <summary>Brightness mapping for the catalog draw (tunable). With CatGamma ≈ 0.30 a Sun-like
     /// star stays visible out to tens of light-years and even M-dwarfs show within ~10 ly.</summary>
     public float CatBrightScale = 3.0f;
-    public float CatGamma = 0.25f;
-    public float CatSizeScale = 5f;
+    public float CatGamma = 0.30f;
+    public float CatSizeScale = 8f;
     public float CatMinSize = 1.5f;
     public float CatMaxSize = 160f;
 
