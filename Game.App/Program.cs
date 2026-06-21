@@ -26,6 +26,8 @@ internal static class Program
     private static StarCatalogPager _starPager = null!;
     private static StarRenderer _starRenderer = null!;
     private static GalaxyBackdrop _backdrop = null!;
+    private static NebulaField _nebulaField = null!;
+    private static NebulaRenderer _nebulaRenderer = null!;
     private static StarOverlay _overlay = null!;
     private static SolarSystemManager _systemManager = null!;
     private static SystemRenderer _systemRenderer = null!;
@@ -74,8 +76,11 @@ internal static class Program
     private static float _eclipse;          // this frame's solar-eclipse coverage on the focused body [0,1]
     private static bool _prevB, _prevJ;
     private static bool _prevM;                          // 'M' toggles the system map
-    private static bool _systemMapVisible;               // 2D top-down system map overlay
+    private static bool _systemMapVisible;               // 2D top-down system map overlay (nearby-stars map when not in a system)
     private static CelestialBody? _systemMapSel;         // selected body in the system map
+    private static float _nearbyRangeLy = 10f;           // nearby-stars map radius (slider, 10–50 ly)
+    private static Star _nearbySel;                      // selected star in the nearby-stars map
+    private static bool _nearbyHasSel;
     private static bool _prevN;                          // 'N' toggles the galaxy/sector map
     private static bool _galaxyMapVisible;               // 2D top-down galaxy map overlay
     private static double _galaxyMpp = 0.3 * MathUtil.LightYear; // galaxy-map scale (metres per pixel)
@@ -168,6 +173,8 @@ internal static class Program
         _starPager = new StarCatalogPager(new GalaxyModel(WorldSeed));
         _starRenderer = new StarRenderer(_gl);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
+        _nebulaField = new NebulaField(WorldSeed);
+        _nebulaRenderer = new NebulaRenderer(_gl);
         _overlay = new StarOverlay();
         _systemManager = new SolarSystemManager();
         _systemRenderer = new SystemRenderer(_gl);
@@ -370,6 +377,9 @@ internal static class Program
         // Distant galaxy first (writes no depth), so the streamed stars, system, and atmosphere all
         // composite over it and any opaque body occludes the sky behind it.
         _backdrop.Render(_camera);
+        // Nebulae over the backdrop but under the catalog stars — additive, so the stars that fall inside a
+        // nebula read as points embedded in its glow.
+        _nebulaRenderer.Render(_camera, _nebulaField);
         // Sync GPU buffers to the resident lattice blocks, then draw them all — skipping the active
         // sun (the system pass renders it precisely; its catalog dot would otherwise sit slightly off
         // when viewed up close).
@@ -516,6 +526,7 @@ internal static class Program
             DrawTuning();
             DrawScanner();
             DrawSystemMap();
+            DrawNearbyMap();
             DrawGalaxyMap();
         }
         _imgui.Render();
@@ -724,6 +735,10 @@ internal static class Program
                 b.Enabled = true; b.BandBrightness = 0.6f; b.StarBrightness = 1.0f;
                 b.NebulaBrightness = 0.7f;
             }
+            ImGui.Separator();
+            // Fly-to nebulae (the placed NebulaField clouds, distinct from the painted backdrop nebulosity).
+            ImGui.Checkbox("Render nebulae (fly-to)", ref _nebulaRenderer.Enabled);
+            ImGui.SliderFloat("Nebula glow", ref _nebulaRenderer.Intensity, 0f, 2f);
         }
 
         if (ImGui.CollapsingHeader("Star field", ImGuiTreeNodeFlags.DefaultOpen))
@@ -1234,6 +1249,132 @@ internal static class Program
         ImGui.End();
     }
 
+    /// <summary>Nearby-stars map — shown by <c>M</c> when you're NOT in a solar system (the system map takes
+    /// over once you arrive at one). Resident catalog stars within a slider-set radius (10–50 ly), plotted
+    /// top-down on the galactic plane (world XZ) and auto-centred on the ship. Click a star to select it, then
+    /// jump to it or set it as the navigation search target.</summary>
+    private static void DrawNearbyMap()
+    {
+        if (!_systemMapVisible || _systemManager.HasActive) return;
+
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(560, 660), ImGuiCond.FirstUseEver);
+        if (!ImGui.Begin("Nearby stars  [M]", ref _systemMapVisible, ImGuiWindowFlags.NoNav))
+        {
+            ImGui.End();
+            return;
+        }
+
+        ImGui.SetNextItemWidth(220f);
+        ImGui.SliderFloat("Range (ly)", ref _nearbyRangeLy, 10f, 50f, "%.0f");
+
+        var io = ImGui.GetIO();
+        System.Numerics.Vector2 canvasPos = ImGui.GetCursorScreenPos();
+        System.Numerics.Vector2 avail = ImGui.GetContentRegionAvail();
+        float side = MathF.Max(120f, MathF.Min(avail.X, avail.Y - 120f)); // reserve the bottom for info
+        var size = new System.Numerics.Vector2(avail.X, side);
+        ImGui.InvisibleButton("##nearbycanvas", size);
+        bool hovered = ImGui.IsItemHovered();
+        bool clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left);
+
+        var dl = ImGui.GetWindowDrawList();
+        var center = canvasPos + new System.Numerics.Vector2(avail.X * 0.5f, side * 0.5f);
+        float radiusPx = side * 0.5f - 18f;
+        dl.AddRectFilled(canvasPos, canvasPos + size, Col(0.02f, 0.03f, 0.05f));
+
+        double rangeM = _nearbyRangeLy * MathUtil.LightYear;
+        double mpp = rangeM / radiusPx; // metres per pixel so the slider radius fills the disc
+
+        // Heading-up: rotate the plot so the ship's forward heading points up. Screen-up = forward (horizontal
+        // projection), screen-right = the camera's right (horizontal). Falls back to a fixed frame and a
+        // perpendicular right when looking straight up/down.
+        Vector3D<float> fwd = _camera.Forward, rgt = _camera.Right;
+        double ux = fwd.X, uz = fwd.Z, ulen = Math.Sqrt(fwd.X * fwd.X + fwd.Z * fwd.Z);
+        if (ulen < 1e-6) { ux = 0; uz = -1; ulen = 1; }
+        ux /= ulen; uz /= ulen;
+        double rx = rgt.X, rz = rgt.Z, rlen = Math.Sqrt(rgt.X * rgt.X + rgt.Z * rgt.Z);
+        if (rlen < 1e-6) { rx = -uz; rz = ux; rlen = 1; }
+        rx /= rlen; rz /= rlen;
+
+        // World XZ delta → screen: camera-right component on +X, camera-forward component on -Y (screen up).
+        System.Numerics.Vector2 ToScreen(in Vector3D<double> d) =>
+            center + new System.Numerics.Vector2(
+                (float)((d.X * rx + d.Z * rz) / mpp), (float)(-(d.X * ux + d.Z * uz) / mpp));
+
+        // Range rings at 1/3, 2/3, full radius (faint reference circles).
+        for (int k = 1; k <= 3; k++)
+            dl.AddCircle(center, radiusPx * k / 3f, Col(0.25f, 0.32f, 0.45f, 0.5f), 64);
+
+        // Field-of-view wedge: two lines from the centre at ±half the horizontal FOV about straight up (forward),
+        // so you can read which nearby stars are actually on screen.
+        float halfHFov = MathF.Atan(MathF.Tan(_camera.FovRadians * 0.5f) * _camera.AspectRatio);
+        dl.AddLine(center, center + new System.Numerics.Vector2(-MathF.Sin(halfHFov), -MathF.Cos(halfHFov)) * radiusPx,
+            Col(0.5f, 0.7f, 1f, 0.55f));
+        dl.AddLine(center, center + new System.Numerics.Vector2(MathF.Sin(halfHFov), -MathF.Cos(halfHFov)) * radiusPx,
+            Col(0.5f, 0.7f, 1f, 0.55f));
+
+        // Resident stars within the (true 3D) range sphere, plotted on XZ. Block-culled against the sphere so
+        // only the camera's block (and any face-adjacent ones) are scanned — at ≤50 ly vs 350 ly blocks that's
+        // typically one block, so this stays cheap.
+        UniversePosition cam = _camera.Position;
+        Star hitStar = default; bool hasHit = false; float hitD = 7f;
+        int shown = 0;
+        foreach (StarCatalog block in _starPager.LoadedBlocks)
+        {
+            Vector3D<double> bc = block.Origin.DeltaMeters(cam); // block centre relative to the ship
+            double half = block.SideMeters * 0.5;
+            double nx = Math.Max(0.0, Math.Abs(bc.X) - half);
+            double ny = Math.Max(0.0, Math.Abs(bc.Y) - half);
+            double nz = Math.Max(0.0, Math.Abs(bc.Z) - half);
+            if (nx * nx + ny * ny + nz * nz > rangeM * rangeM) continue; // block's nearest corner is out of range
+
+            foreach (Star st in block.Stars)
+            {
+                Vector3D<double> d = st.Position.DeltaMeters(cam);
+                if (d.X * d.X + d.Y * d.Y + d.Z * d.Z > rangeM * rangeM) continue;
+                var p = ToScreen(d);
+                float r = Math.Clamp(1.4f + st.SizeCue * 1.4f, 1.4f, 4.5f);
+                uint col = Col(MathF.Max(st.Color.X, 0.2f), MathF.Max(st.Color.Y, 0.2f), MathF.Max(st.Color.Z, 0.2f));
+                dl.AddCircleFilled(p, r, col, 8);
+                shown++;
+                if (hovered)
+                {
+                    float dd = System.Numerics.Vector2.Distance(io.MousePos, p);
+                    if (dd < hitD + r) { hitD = dd; hitStar = st; hasHit = true; }
+                }
+            }
+        }
+
+        // Selection ring + the ship's "you are here" crosshair at the centre.
+        if (_nearbyHasSel) dl.AddCircle(ToScreen(_nearbySel.Position.DeltaMeters(cam)), 7f, Col(1f, 1f, 1f), 16, 2f);
+        dl.AddCircle(center, 5f, Col(0.4f, 1f, 0.6f), 14, 1.5f);
+        dl.AddLine(center - new System.Numerics.Vector2(8, 0), center + new System.Numerics.Vector2(8, 0), Col(0.4f, 1f, 0.6f));
+        dl.AddLine(center - new System.Numerics.Vector2(0, 8), center + new System.Numerics.Vector2(0, 8), Col(0.4f, 1f, 0.6f));
+
+        if (clicked) { _nearbyHasSel = hasHit; if (hasHit) _nearbySel = hitStar; }
+
+        ImGui.Spacing();
+        ImGui.TextDisabled($"{shown:n0} stars within {_nearbyRangeLy:0} ly  •  click a star to select");
+        ImGui.Separator();
+        if (_nearbyHasSel)
+        {
+            Star s2 = _nearbySel;
+            double ly = s2.Position.DistanceTo(cam) / MathUtil.LightYear;
+            ImGui.Text($"#{s2.Id}  •  {s2.ClassLetter}-class  •  {s2.Temperature:0} K  •  {ly:0.000} ly");
+            if (ImGui.Button("Jump here"))
+            {
+                _camera.Position = s2.Position.Translated(new Vector3D<double>(8.0 * MathUtil.AstronomicalUnit, 0, 0));
+                _jumpStatus = $"Jumped to star #{s2.Id} ({s2.ClassLetter}-class)";
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Set as search target")) { _starSearch = s2.Id.ToString(); FindStar(); }
+        }
+        else
+        {
+            ImGui.TextDisabled("no star selected");
+        }
+        ImGui.End();
+    }
+
     /// <summary>Pack a colour for an ImGui draw list.</summary>
     private static uint Col(float r, float g, float b, float a = 1f)
         => ImGui.ColorConvertFloat4ToU32(new System.Numerics.Vector4(r, g, b, a));
@@ -1296,30 +1437,54 @@ internal static class Program
         System.Numerics.Vector2 ToScreen(in Vector3D<double> relMeters) =>
             canvasCenter + new System.Numerics.Vector2((float)(relMeters.X / mpp), (float)(relMeters.Z / mpp));
 
-        // Collect in-view stars, block-culled (skip whole blocks whose XZ box misses the view).
+        // Nebulae as translucent coloured disks (drawn under the stars), sized to their true radius, so they
+        // read as glowing regions on the map you can aim for. Labelled on hover.
+        foreach (Nebula neb in _nebulaField.Nebulae)
+        {
+            Vector3D<double> d = neb.Position.DeltaMeters(mapCenter);
+            float rpx = (float)(neb.RadiusMeters / mpp);
+            if (d.X + neb.RadiusMeters < -halfW || d.X - neb.RadiusMeters > halfW ||
+                d.Z + neb.RadiusMeters < -halfH || d.Z - neb.RadiusMeters > halfH) continue;
+            var np = ToScreen(d);
+            uint fill = Col(neb.Color.X, neb.Color.Y, neb.Color.Z, 0.16f);
+            uint ring = Col(neb.Color.X, neb.Color.Y, neb.Color.Z, 0.7f);
+            dl.AddCircleFilled(np, MathF.Max(rpx, 2f), fill, 32);
+            dl.AddCircle(np, MathF.Max(rpx, 2f), ring, 32);
+            if (hovered && System.Numerics.Vector2.Distance(io.MousePos, np) < MathF.Max(rpx, 5f))
+                dl.AddText(np + new System.Numerics.Vector2(6, -14), ring, neb.Name);
+        }
+
+        // Collect in-view stars, block-culled (skip whole blocks whose XZ box misses the view). Each block is
+        // sub-sampled with a uniform stride so a zoomed-out view doesn't scan the millions of resident stars
+        // (~257k per 350 ly block × up to 27 blocks) every frame — that scan, plus drawing them, dropped the
+        // map to ~15 fps. The map now shows a representative thinned set rather than every star.
         _galaxyDots.Clear();
-        const int CollectCap = 60000;
-        int candidates = 0;
+        const int CollectCap = 6000;
+        const int PerBlockScanCap = 10000; // examine at most this many stars per block (uniform stride)
         foreach (StarCatalog block in _starPager.LoadedBlocks)
         {
             Vector3D<double> bo = block.Origin.DeltaMeters(mapCenter); // block min corner relative to centre
             double bs = block.SideMeters;
             if (bo.X + bs < -halfW || bo.X > halfW || bo.Z + bs < -halfH || bo.Z > halfH) continue;
-            foreach (Star st in block.Stars)
+            IReadOnlyList<Star> stars = block.Stars;
+            int n = stars.Count;
+            int bstride = Math.Max(1, n / PerBlockScanCap);
+            for (int i = 0; i < n; i += bstride)
             {
+                Star st = stars[i];
                 if (st.SizeCue < minCue) continue;
                 Vector3D<double> d = st.Position.DeltaMeters(mapCenter);
                 if (d.X < -halfW || d.X > halfW || d.Z < -halfH || d.Z > halfH) continue;
-                candidates++;
-                if (_galaxyDots.Count >= CollectCap) continue;
+                if (_galaxyDots.Count >= CollectCap) break;
                 float r = Math.Clamp(0.8f + st.SizeCue * 1.4f, 0.8f, 4.0f);
                 uint col = Col(MathF.Max(st.Color.X, 0.15f), MathF.Max(st.Color.Y, 0.15f), MathF.Max(st.Color.Z, 0.15f));
                 _galaxyDots.Add((ToScreen(d), r, col, st));
             }
+            if (_galaxyDots.Count >= CollectCap) break;
         }
 
         // Draw (uniformly thinned if over the cap) and hit-test against the mouse.
-        const int DrawCap = 8000;
+        const int DrawCap = 1500;
         int stride = Math.Max(1, (_galaxyDots.Count + DrawCap - 1) / DrawCap);
         Star hitStar = default;
         bool hasHit = false;
@@ -1352,7 +1517,7 @@ internal static class Program
 
         // Footer + selection info.
         double acrossLy = size.X * mpp / MathUtil.LightYear;
-        ImGui.TextDisabled($"view {acrossLy:0.0} ly across  •  {candidates:n0} in view / {_starPager.LoadedStarCount:n0} resident  •  drag = pan, wheel = zoom");
+        ImGui.TextDisabled($"view {acrossLy:0.0} ly across  •  {_galaxyDots.Count:n0} shown / {_starPager.LoadedStarCount:n0} resident  •  drag = pan, wheel = zoom");
         if (ImGui.Button("Center on me")) _galaxyPan = default;
         ImGui.SameLine();
         if (ImGui.Button("Reset zoom")) _galaxyMpp = 0.3 * MathUtil.LightYear;
