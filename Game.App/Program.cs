@@ -202,7 +202,10 @@ internal static class Program
 
         // Restore previously-saved tuning so the sliders persist across launches.
         if (TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, TuningPath))
+        {
             _tuningStatus = $"Loaded {TuningPath}";
+            _nebulaField = new NebulaField(WorldSeed); // load may have changed count/radius — rebuild from the new tuning
+        }
 
         SetMouseCaptured(true);
     }
@@ -739,6 +742,15 @@ internal static class Program
             // Fly-to nebulae (the placed NebulaField clouds, distinct from the painted backdrop nebulosity).
             ImGui.Checkbox("Render nebulae (fly-to)", ref _nebulaRenderer.Enabled);
             ImGui.SliderFloat("Nebula glow", ref _nebulaRenderer.Intensity, 0f, 2f);
+            // Count / size are generation inputs: regenerate the field when a slider is released.
+            bool nebDirty = false;
+            ImGui.SliderInt("Nebula count", ref NebulaTuning.Count, 1, 300);
+            nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
+            ImGui.SliderFloat("Nebula radius min (ly)", ref NebulaTuning.MinRadiusLy, 10f, 800f);
+            nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
+            ImGui.SliderFloat("Nebula radius max (ly)", ref NebulaTuning.MaxRadiusLy, 10f, 800f);
+            nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
+            if (nebDirty) _nebulaField = new NebulaField(WorldSeed);
         }
 
         if (ImGui.CollapsingHeader("Star field", ImGuiTreeNodeFlags.DefaultOpen))
@@ -926,6 +938,7 @@ internal static class Program
             _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, TuningPath)
                 ? $"Loaded {TuningPath}" : "No saved file";
             _terrainRenderer.Rebuild();
+            _nebulaField = new NebulaField(WorldSeed); // pick up any loaded count/radius change
         }
         if (_tuningStatus.Length > 0)
             ImGui.TextDisabled(_tuningStatus);

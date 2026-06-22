@@ -51,8 +51,12 @@ public sealed class NebulaField
     private readonly Nebula[] _nebulae;
     public IReadOnlyList<Nebula> Nebulae => _nebulae;
 
-    public NebulaField(ulong worldSeed, int count = 140)
+    public NebulaField(ulong worldSeed, int count = -1)
     {
+        if (count < 0) count = Math.Max(0, NebulaTuning.Count);
+        // Tolerate sliders set in either order; never let the RNG range invert.
+        double minR = Math.Max(1.0, Math.Min(NebulaTuning.MinRadiusLy, NebulaTuning.MaxRadiusLy));
+        double maxR = Math.Max(minR, Math.Max(NebulaTuning.MinRadiusLy, NebulaTuning.MaxRadiusLy));
         var rng = new DeterministicRng(Hashing.Combine(worldSeed, 0xEB01AUL));
         double ly = MathUtil.LightYear;
         _nebulae = new Nebula[count];
@@ -67,7 +71,7 @@ public sealed class NebulaField
             var pos = UniversePosition.FromMeters(
                 Math.Cos(ang) * rad * ly, height * ly, Math.Sin(ang) * rad * ly);
 
-            double radius = rng.Range(30.0, 140.0) * ly;
+            double radius = rng.Range(minR, maxR) * ly;
 
             Vector3D<float> baseCol = Palette[rng.RangeInt(0, Palette.Length)];
             float jitter = (float)rng.Range(0.85, 1.15);

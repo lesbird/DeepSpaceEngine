@@ -18,6 +18,9 @@ public sealed class TuningConfig
     public float BandBrightness { get; set; } = 0.6f;
     public float BackdropStarBrightness { get; set; } = 1.0f;
     public float NebulaBrightness { get; set; } = 0.7f;
+    public int NebulaCount { get; set; } = 40;
+    public float NebulaMinRadiusLy { get; set; } = 120f;
+    public float NebulaMaxRadiusLy { get; set; } = 400f;
 
     // Atmosphere.
     public bool RenderAtmosphere { get; set; } = true;
@@ -101,6 +104,9 @@ public sealed class TuningConfig
         BandBrightness = b.BandBrightness,
         BackdropStarBrightness = b.StarBrightness,
         NebulaBrightness = b.NebulaBrightness,
+        NebulaCount = NebulaTuning.Count,
+        NebulaMinRadiusLy = NebulaTuning.MinRadiusLy,
+        NebulaMaxRadiusLy = NebulaTuning.MaxRadiusLy,
         RenderAtmosphere = a.Enabled,
         SunIntensity = a.SunIntensity,
         Exposure = a.Exposure,
@@ -181,6 +187,9 @@ public sealed class TuningConfig
         b.BandBrightness = BandBrightness;
         b.StarBrightness = BackdropStarBrightness;
         b.NebulaBrightness = NebulaBrightness;
+        NebulaTuning.Count = NebulaCount;
+        NebulaTuning.MinRadiusLy = NebulaMinRadiusLy;
+        NebulaTuning.MaxRadiusLy = NebulaMaxRadiusLy;
         a.Enabled = RenderAtmosphere;
         a.SunIntensity = SunIntensity;
         a.Exposure = Exposure;
