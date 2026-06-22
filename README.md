@@ -43,7 +43,11 @@ interstellar flight down to standing on a planet. See the full design in
 > wheel travel independently — driven with throttle/steer under a third-person chase camera; press **R**
 > again to lift back into free-fly. Deep space is no longer black — a **distant-galaxy backdrop** (a far-field star
 > dome plus a glowing Milky-Way band with dust lanes and a central bulge) sits behind the streamed
-> stars, and a **proximity speed limiter** keeps interstellar cruising unlimited yet smoothly reels
+> stars, and **procedurally-placed fly-to nebulae** — a handful of enormous, soft, emissive gas
+> clouds scattered through the disk — read as colourful glowing landmarks you can spot from across
+> the galaxy, pick out on the galaxy map, and drift right through (the billboard fades as you enter,
+> so you pass into a haze of coloured light and embedded stars rather than hitting a flat sheet);
+> their count and size are live-tunable and saved to `tuning.json`. A **proximity speed limiter** keeps interstellar cruising unlimited yet smoothly reels
 > your speed in well before you reach a star — gently, on a dedicated star approach rate, so you ease in
 > instead of zipping past — and tighter still as you approach its planets and moons (far from everything
 > there's no limit at all). Terrain
@@ -196,7 +200,8 @@ centre, planets on log-radial orbit rings at their live angle, moons, the astero
 here" marker; click a planet or moon to read its scan data and *Travel here*. Press `N` for the **galaxy
 map** — a pannable, zoomable top-down chart of the nearby catalog stars projected onto the galactic plane,
 coloured by star colour and sized by luminosity, with markers for you, the active system and the search
-target; click a star to *Jump here* or set it as the navigation search target. From the galaxy map,
+target, and the **fly-to nebulae** drawn as translucent coloured disks (hover for the name) so you can
+aim for one; click a star to *Jump here* or set it as the navigation search target. From the galaxy map,
 **Open 3D view** for a navigable 3-D view of your stellar neighbourhood: an orbit camera (drag to rotate,
 wheel to zoom) over every star within an adjustable radius (10–50 ly), threaded by a single nearest-neighbour
 route from your position; click a star to recentre on it and set it as the fly-to target (an arrow then
@@ -220,7 +225,9 @@ your altitude and live terrain patch counts. Fly to extreme distances to confirm
 
 **Tuning panel.** A second HUD window with live controls for the **star field** (catalog
 brightness, perceptual falloff/gamma, and point size), the **galaxy backdrop** (an on/off
-toggle plus band-glow and distant-star brightness), the **atmosphere** (an on/off
+toggle plus band-glow and distant-star brightness), the **fly-to nebulae** (an on/off toggle, glow
+intensity, and the generation knobs — how many and their min/max radius in light-years, which
+regenerate the field on release), the **atmosphere** (an on/off
 toggle, plus sun intensity, exposure, Rayleigh/Mie strength, haze anisotropy, shell height —
 and a *Debug: transmittance* toggle that shows the ray-march geometry), **terrain relief**
 (relief scale, mountain bias, feature frequency), **surface detail** (LOD distance — how aggressively
@@ -256,6 +263,7 @@ Defaults are neutral, so generation stays deterministic until you turn a knob.
 Candidate features, roughly by area — the first group is what's being built next.
 
 **Recently shipped**
+- [x] **Fly-to nebulae** — a few enormous procedurally-placed emissive gas clouds you can spot from afar, see on the galaxy map and drift through; count/size live-tunable and saved to `tuning.json`
 - [x] **City lights on inhabited worlds** — clustered emissive glow on the night side of life-bearing worlds
 - [x] **Banded gas giants** — procedural zonal cloud bands + a storm oval on gas/ice giants
 - [x] **Micro-relief + strata on the GPU path** — mesas and banded canyon walls (full CPU parity)
