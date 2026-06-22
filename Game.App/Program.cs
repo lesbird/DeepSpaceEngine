@@ -668,6 +668,7 @@ internal static class Program
         if (_hudVisible)
         {
             _overlay.Draw(_camera, _starPager, _systemManager, _discovery, _hasSearchTarget ? _searchTarget : null);
+            DrawSpeedOverlay();
             DrawHud();
             DrawTuning();
             DrawScanner();
@@ -685,9 +686,34 @@ internal static class Program
         }
     }
 
+    // Heads-up readout at the top-center of the screen, drawn on the foreground draw list so it
+    // sits outside (and on top of) any panel: current speed, target (set) speed, and FPS.
+    private static void DrawSpeedOverlay()
+    {
+        var io = ImGui.GetIO();
+        System.Numerics.Vector2 vp = io.DisplaySize;
+        if (vp.X < 2 || vp.Y < 2) return;
+
+        string speed = $"Speed {FormatSpeed(_controller.ActualSpeed)}";
+        string target = $"Target {FormatSpeed(_controller.DesiredSpeed)}";
+        string fps = $"FPS {_fps:0}";
+        string line = $"{speed}     {target}     {fps}";
+
+        var dl = ImGui.GetForegroundDrawList();
+        System.Numerics.Vector2 size = ImGui.CalcTextSize(line);
+        var pos = new System.Numerics.Vector2((vp.X - size.X) * 0.5f, 8f);
+
+        // Soft shadow for legibility over bright starfields, then the text.
+        dl.AddText(pos + new System.Numerics.Vector2(1, 1), Col(0f, 0f, 0f, 0.78f), line);
+        uint color = _controller.SpeedCapped ? Col(1f, 0.8f, 0.4f) : Col(0.92f, 0.94f, 1f);
+        dl.AddText(pos, color, line);
+    }
+
     private static void DrawHud()
     {
         ImGui.SetNextWindowPos(new System.Numerics.Vector2(10, 10), ImGuiCond.Always);
+        // Start collapsed (the key flight readouts live in the top-screen overlay); expandable any time.
+        ImGui.SetNextWindowCollapsed(true, ImGuiCond.FirstUseEver);
         ImGui.Begin("Navigation",
             ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoNav);
 

@@ -24,6 +24,11 @@ public sealed class StarOverlay
     /// of the planet's outermost moon orbit (keeps far-away planets uncluttered).</summary>
     public double MoonRevealFactor = 40.0;
 
+    /// <summary>Hold off the per-planet reticles until the nearest planet is within this distance (AU).
+    /// Far out, every planet projects onto the same spot by the sun, so their reticles pile up; this
+    /// keeps just the sun + the directional nearest-planet marker until you've closed in.</summary>
+    public double PlanetRevealAu = 10.0;
+
     private readonly List<(double DistSq, Star Star)> _scratch = new();
 
     // Set for the duration of one Draw call so the label helpers can credit discovered objects.
@@ -113,6 +118,15 @@ public sealed class StarOverlay
             dl.AddCircle(sunScreen, 13f, col, 22, 2f);
             dl.AddText(sunScreen + new Vector2(16, -8), col, $"SUN  {sys.Sun.ClassLetter}-class{StarCredit(sys.Sun)}");
         }
+
+        // Until the nearest planet is reasonably close, skip the planet/moon reticles entirely: from far
+        // out they all crowd the sun's screen position into an unreadable pile. The sun reticle above and
+        // the directional nearest-planet marker still guide you in.
+        double nearestSq = double.MaxValue;
+        foreach (Planet p in sys.Planets)
+            nearestSq = Math.Min(nearestSq, p.CurrentPosition.DistanceSquaredTo(cam));
+        double revealM = PlanetRevealAu * MathUtil.AstronomicalUnit;
+        if (nearestSq > revealM * revealM) return;
 
         // Every on-screen planet gets a reticle: designation + type/distance.
         foreach (Planet p in sys.Planets)
