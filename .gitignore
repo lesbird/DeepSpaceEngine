@@ -477,3 +477,9 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# Discovery API server secrets (never commit real credentials)
+server/config.php
+
+# Player discovery settings (carries the API key)
+discovery.json

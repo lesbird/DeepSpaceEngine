@@ -3,6 +3,7 @@ using Engine.Core;
 using Engine.Platform;
 using Engine.Rendering;
 using Game.Systems;
+using Game.Systems.Discovery;
 using Game.Universe;
 using ImGuiNET;
 using Silk.NET.Input;
@@ -59,6 +60,12 @@ internal static class Program
     private static Sound _uiBlip = null!;
     private static bool _musicEnabled = true;
     private const string AudioDir = "Assets/Audio";
+
+    // Discovery: player-side settings + REST transport (the service that reports/credits comes next phase).
+    private static DiscoveryConfig _discoveryConfig = null!;
+    private static DiscoveryClient _discoveryClient = null!;
+    private static volatile string _discoveryStatus = "";
+    private const string DiscoveryPath = "discovery.json";
 
     private const double TerrainActivateRadii = 40.0; // switch to terrain LOD within N planet radii (~50,000 km for a small world)
     private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
@@ -146,6 +153,7 @@ internal static class Program
         };
         _window.Run();
         _audio?.Dispose();
+        _discoveryClient?.Dispose();
         _window.Dispose();
     }
 
@@ -217,6 +225,10 @@ internal static class Program
 
         InitAudio();
 
+        // Discovery: load settings + build the REST client (reporting/credit wiring is the next phase).
+        _discoveryConfig = DiscoveryConfig.Load(DiscoveryPath);
+        _discoveryClient = new DiscoveryClient(_discoveryConfig.ServerUrl, _discoveryConfig.ApiKey);
+
         SetMouseCaptured(true);
     }
 
@@ -247,6 +259,22 @@ internal static class Program
 
     /// <summary>Click the UI sound (no-op when audio is unavailable).</summary>
     private static void Blip(float pitch = 1f) => _audio.PlaySound(_uiBlip, volume: 0.6f, pitch: pitch);
+
+    /// <summary>Async ping of the discovery server (GET all) to confirm the URL works; updates the
+    /// status line shown in the Discovery panel. Runs off-thread so the frame never blocks.</summary>
+    private static void TestDiscoveryConnection()
+    {
+        _discoveryClient.ServerUrl = _discoveryConfig.ServerUrl;
+        _discoveryClient.ApiKey = _discoveryConfig.ApiKey;
+        _discoveryStatus = "Testing…";
+        _ = Task.Run(async () =>
+        {
+            IReadOnlyList<DiscoveryRecord>? list = await _discoveryClient.GetAllAsync();
+            _discoveryStatus = list != null
+                ? $"OK — {list.Count} discoveries on server"
+                : "Failed — check the URL / server";
+        });
+    }
 
     private static void OnUpdate(double dt)
     {
@@ -777,6 +805,39 @@ internal static class Program
                 if (ImGui.Button("Test SFX")) Blip();
                 ImGui.TextDisabled("(drop blip.wav / music.wav in Assets/Audio to replace synth)");
             }
+        }
+
+        if (ImGui.CollapsingHeader("Discovery", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            DiscoveryConfig dc = _discoveryConfig;
+
+            bool enabled = dc.Enabled;
+            if (ImGui.Checkbox("Enable discovery reporting", ref enabled)) dc.Enabled = enabled;
+            ImGui.TextDisabled(dc.Enabled
+                ? "(stars/planets you reach will be reported)"
+                : "(disabled — nothing is sent to the server)");
+
+            string name = dc.PlayerName;
+            ImGui.SetNextItemWidth(190);
+            if (ImGui.InputText("Player name", ref name, 64)) dc.PlayerName = name;
+
+            string url = dc.ServerUrl;
+            ImGui.SetNextItemWidth(220);
+            if (ImGui.InputText("Server URL", ref url, 200)) dc.ServerUrl = url;
+
+            string key = dc.ApiKey;
+            ImGui.SetNextItemWidth(220);
+            if (ImGui.InputText("API key", ref key, 128, ImGuiInputTextFlags.Password)) dc.ApiKey = key;
+
+            if (ImGui.Button("Save"))
+            {
+                _discoveryClient.ServerUrl = dc.ServerUrl;
+                _discoveryClient.ApiKey = dc.ApiKey;
+                _discoveryStatus = dc.Save(DiscoveryPath) ? $"Saved {DiscoveryPath}" : "Save failed";
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Test connection")) TestDiscoveryConnection();
+            if (_discoveryStatus.Length > 0) ImGui.TextDisabled(_discoveryStatus);
         }
 
         if (ImGui.CollapsingHeader("Atmosphere", ImGuiTreeNodeFlags.DefaultOpen))
