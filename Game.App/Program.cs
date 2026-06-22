@@ -1,3 +1,4 @@
+using Engine.Audio;
 using Engine.Core;
 using Engine.Platform;
 using Engine.Rendering;
@@ -52,6 +53,12 @@ internal static class Program
     private static bool _driving;
     private static bool _prevR;
     private static ImGuiController _imgui = null!;
+
+    // Audio: OpenAL subsystem + the resident UI click. Music streams from _audio. Silent if no device.
+    private static AudioEngine _audio = null!;
+    private static Sound _uiBlip = null!;
+    private static bool _musicEnabled = true;
+    private const string AudioDir = "Assets/Audio";
 
     private const double TerrainActivateRadii = 40.0; // switch to terrain LOD within N planet radii (~50,000 km for a small world)
     private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
@@ -138,6 +145,7 @@ internal static class Program
             _cloudRenderer.Resize(size.X, size.Y);
         };
         _window.Run();
+        _audio?.Dispose();
         _window.Dispose();
     }
 
@@ -207,8 +215,32 @@ internal static class Program
             _nebulaField = new NebulaField(WorldSeed); // load may have changed count/radius — rebuild from the new tuning
         }
 
+        InitAudio();
+
         SetMouseCaptured(true);
     }
+
+    /// <summary>Bring up the audio engine and prime its assets. The UI click falls back to a
+    /// synthesised blip, but music only auto-plays when a real Assets/Audio/music.wav is present —
+    /// the synth pad is a deep drone that reads as a constant hum, so it's opt-in (Tuning ▸ Audio),
+    /// not the default. Music never plays in headless smoke runs.</summary>
+    private static void InitAudio()
+    {
+        _audio = new AudioEngine();
+
+        // UI click: blip.wav if shipped, otherwise a synthesised one.
+        string blipPath = Path.Combine(AudioDir, "blip.wav");
+        _uiBlip = _audio.CreateSound(File.Exists(blipPath) ? WavLoader.Load(blipPath) : Synth.Blip());
+
+        // Only start a soundtrack when there's a real music file to play; otherwise stay silent.
+        string musicPath = Path.Combine(AudioDir, "music.wav");
+        _musicEnabled = !_smoke && File.Exists(musicPath);
+        if (_musicEnabled)
+            _audio.PlayMusic(WavLoader.Load(musicPath), loop: true);
+    }
+
+    /// <summary>Click the UI sound (no-op when audio is unavailable).</summary>
+    private static void Blip(float pitch = 1f) => _audio.PlaySound(_uiBlip, volume: 0.6f, pitch: pitch);
 
     private static void OnUpdate(double dt)
     {
@@ -258,12 +290,13 @@ internal static class Program
 
         // 'P' toggles the galactic-plane grid: a faint reference plane through the galaxy centre.
         if (Edge(Key.P, ref _prevP)) _galacticGridVisible = !_galacticGridVisible;
-        if (Edge(Key.M, ref _prevM)) _systemMapVisible = !_systemMapVisible;
+        if (Edge(Key.M, ref _prevM)) { _systemMapVisible = !_systemMapVisible; Blip(); }
         // 'N' opens the 2D galaxy map; if the 3D map is already up, 'N' closes it instead.
         if (Edge(Key.N, ref _prevN))
         {
             if (_galaxy3DVisible) _galaxy3DVisible = false;
             else _galaxyMapVisible = !_galaxyMapVisible;
+            Blip();
         }
 
         // 'H' hides/shows the whole HUD (reticles + all panels) for a clean view / screenshots.
@@ -271,8 +304,8 @@ internal static class Program
 
         // Navigator shortcuts to actually find the asteroids: 'B' frames the nearest belted system,
         // 'J' jumps into the nearest deep-space asteroid field.
-        if (!_driving && Edge(Key.B, ref _prevB)) JumpToBelt();
-        if (!_driving && Edge(Key.J, ref _prevJ)) JumpToCluster();
+        if (!_driving && Edge(Key.B, ref _prevB)) { JumpToBelt(); Blip(0.8f); }
+        if (!_driving && Edge(Key.J, ref _prevJ)) { JumpToCluster(); Blip(0.8f); }
 
         // Orbit time controls: ',' slower, '.' faster, Space pause. (Edge is read every frame so the
         // toggle stays in sync; the pause only fires in free-flight, since Space is the rover brake.)
@@ -337,6 +370,15 @@ internal static class Program
             if (_frameTimeCount < FpsWindow) _frameTimeCount++;
             _fps = _frameTimeSum > 0 ? _frameTimeCount / _frameTimeSum : 0;
         }
+
+        // Audio: orient the listener to the camera (positional sounds are passed camera-relative, so
+        // the listener stays at the origin of that frame), then pump the music stream and apply volumes.
+        Vector3D<float> f = _camera.Forward, u = _camera.Up;
+        _audio.SetListener(
+            System.Numerics.Vector3.Zero,
+            new System.Numerics.Vector3(f.X, f.Y, f.Z),
+            new System.Numerics.Vector3(u.X, u.Y, u.Z));
+        _audio.Update(dt);
 
         if (_smoke && _smokeFrames == 0 && _systemManager.HasActive)
         {
@@ -707,6 +749,33 @@ internal static class Program
         // Terrain/biome colours are baked into the patch meshes, so any change to them needs a
         // rebuild; atmosphere is read live by the shader and needs none.
         bool terrainDirty = false;
+
+        if (ImGui.CollapsingHeader("Audio", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            if (!_audio.Available)
+            {
+                ImGui.TextColored(new System.Numerics.Vector4(1f, 0.6f, 0.5f, 1f), "No audio device — silent.");
+            }
+            else
+            {
+                float master = _audio.MasterVolume, music = _audio.MusicVolume, sfx = _audio.SfxVolume;
+                if (ImGui.SliderFloat("Master", ref master, 0f, 1f)) _audio.MasterVolume = master;
+                if (ImGui.SliderFloat("Music", ref music, 0f, 1f)) _audio.MusicVolume = music;
+                if (ImGui.SliderFloat("SFX", ref sfx, 0f, 1f)) _audio.SfxVolume = sfx;
+                if (ImGui.Checkbox("Music on", ref _musicEnabled))
+                {
+                    if (_musicEnabled)
+                    {
+                        string musicPath = Path.Combine(AudioDir, "music.wav");
+                        _audio.PlayMusic(File.Exists(musicPath) ? WavLoader.Load(musicPath) : Synth.AmbientPad());
+                    }
+                    else _audio.StopMusic();
+                }
+                ImGui.SameLine();
+                if (ImGui.Button("Test SFX")) Blip();
+                ImGui.TextDisabled("(drop blip.wav / music.wav in Assets/Audio to replace synth)");
+            }
+        }
 
         if (ImGui.CollapsingHeader("Atmosphere", ImGuiTreeNodeFlags.DefaultOpen))
         {

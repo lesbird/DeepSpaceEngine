@@ -4,8 +4,15 @@
     <ProjectReference Include="..\Engine.Core\Engine.Core.csproj" />
     <ProjectReference Include="..\Engine.Rendering\Engine.Rendering.csproj" />
     <ProjectReference Include="..\Engine.Platform\Engine.Platform.csproj" />
+    <ProjectReference Include="..\Engine.Audio\Engine.Audio.csproj" />
     <ProjectReference Include="..\Game.Universe\Game.Universe.csproj" />
     <ProjectReference Include="..\Game.Systems\Game.Systems.csproj" />
+  </ItemGroup>
+
+  <!-- Drop WAVs in Assets/Audio and they're copied next to the exe (loaded by name at runtime).
+       The glob matching nothing is fine — the build just copies whatever is present. -->
+  <ItemGroup>
+    <None Include="Assets\Audio\**\*.wav" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

@@ -56,6 +56,7 @@ seeded values, preserving per-world variety while letting you nudge the look.
 Engine.Core        coords, hashing/RNG, math constants        (no deps)
 Engine.Rendering   GL wrappers: Shader, Mesh, Camera, …        → Engine.Core
 Engine.Platform    GameWindow: Silk.NET window + GL + input    → Core, Rendering
+Engine.Audio       AudioEngine: OpenAL sound + music + synth    → Engine.Core
 Game.Universe      procedural generation (stars→terrain)       → Engine.Core
 Game.Systems       runtime lifecycle: systems, speed, fields   → Universe, Core
 Game.App           entry point, main loop, all renderers, HUD  → everything
@@ -204,7 +205,73 @@ the main thread — GL and input are main-thread only.
 
 ---
 
-## 6. Game.Universe — procedural generation
+## 6. Engine.Audio — sound & music
+
+A self-contained audio layer over **OpenAL** (Silk.NET.OpenAL + the OpenAL Soft
+native binaries, which ship in-package for macOS/Windows/Linux — no system OpenAL
+required). Depends only on `Engine.Core`; the game talks to it through one façade,
+`AudioEngine`.
+
+**Design rules**
+
+- **Never crashes the game.** If no output device opens (headless CI, no audio
+  hardware) the whole engine becomes a silent no-op — every method returns
+  harmlessly and `Available` is `false`.
+- **Three volume buses.** `MasterVolume` is the OpenAL *listener* gain, so it scales
+  everything live (including already-playing voices); `SfxVolume` is multiplied into
+  each one-shot at trigger time; `MusicVolume` is applied to the stream each frame.
+- **Camera-relative positional audio.** The universe is double-precision, OpenAL is
+  float. Positional sounds take a *camera-relative* offset in metres (world − camera,
+  the same hand-off as `UniversePosition.ToCameraRelative`); the listener sits at the
+  origin of that frame and is oriented from the camera basis (§9.2).
+- **Not thread-safe.** Construct and call everything from the main/render thread,
+  alongside GL.
+
+### 6.1 AudioEngine (sealed, IDisposable)
+
+```csharp
+AudioEngine();                                   // opens device/context, or degrades to silent
+bool Available { get; }                           // false ⇒ every call is a no-op
+float MasterVolume / SfxVolume / MusicVolume { get; set; }   // [0,1] buses
+
+Sound CreateSound(AudioClip clip);                // upload PCM into a reusable buffer
+Sound LoadSound(string path);                     // = CreateSound(WavLoader.Load(path))
+void  PlaySound(Sound s, float volume=1, float pitch=1);            // head-relative (UI cues)
+void  PlaySoundAt(Sound s, Vector3 camRel, float volume=1, float pitch=1);  // positional, attenuated
+
+void  PlayMusic(AudioClip clip, bool loop=true);  // replaces the current track
+void  StopMusic();   bool MusicPlaying { get; }
+
+void  SetListener(Vector3 position, Vector3 forward, Vector3 up);  // orient the listener
+void  Update(double dt);                          // pump the music stream + apply live volumes
+```
+
+Internals: a fixed pool of **24 SFX voices** (sources). A play grabs the first idle
+voice, or steals the next one round-robin when all are busy, so a fresh sound always
+plays. `Update` is the only per-frame requirement — it drives the music stream.
+
+### 6.2 Music streaming (`MusicStream`, internal)
+
+Music plays through a 4-buffer ring fed from the clip's in-memory PCM, rather than one
+giant static buffer. Benefits: small uploads, **gapless looping** (the read cursor just
+wraps mid-chunk), and underrun recovery — if the source drains because a frame ran long,
+`Pump` (called from `Update`) re-queues and restarts it. ~0.3 s chunks, snapped to a
+whole audio frame.
+
+### 6.3 WAV loading & the procedural synth
+
+`WavLoader` is a dependency-free RIFF/WAVE reader for uncompressed PCM (8/16-bit,
+mono/stereo) that walks the chunk list, so it tolerates LIST/INFO/fact chunks. It
+produces an `AudioClip` (the engine-neutral payload: `byte[] Pcm`, sample rate,
+channels, bits, plus the matching OpenAL `BufferFormat`).
+
+The repo ships **no audio assets**, so `Synth` generates clips procedurally: `Blip()`
+(a short decaying sine for UI clicks) and `AmbientPad()` (a loop-aligned drone). These
+are the fallback when no WAV is present — see the policy in §9.1.
+
+---
+
+## 7. Game.Universe — procedural generation
 
 The data flow, top to bottom:
 
@@ -221,7 +288,7 @@ WorldSeed
 Tuning globals: TerrainTuning · BiomeTuning · PlanetTuning · NebulaTuning · EnvTrait/Spawner
 ```
 
-### 6.1 Stars & the lattice
+### 7.1 Stars & the lattice
 
 **GalaxyModel** (sealed) — the large-scale density function.
 `GalaxyModel(ulong worldSeed)`; `double DensityAt(Vector3D<double> meters)`
@@ -260,7 +327,7 @@ direction-only distant stars concentrated on the galactic plane.
 **StarField** (legacy infinite cell-streamer, also `INearestStar`) — superseded by
 the pager; retained as a fallback.
 
-### 6.2 Systems & bodies
+### 7.2 Systems & bodies
 
 **SystemGenerator** (static): `SolarSystem Generate(Star star)` — seeded from
 `star.Id`: snow line `2.7·√L` AU, Poisson planet count (~3.2, clamped 1–9),
@@ -290,7 +357,7 @@ visible limb), Rayleigh strength ∝ pressure·refractivity², absorption tint f
 coloured gases (methane→cyan), Mie haze from sulphur + lofted surface dust. This
 is why the scanner readout and the rendered sky always agree.
 
-### 6.3 Terrain
+### 7.3 Terrain
 
 **PlanetTerrain** (sealed) — the height + colour field for one body.
 `PlanetTerrain(CelestialBody body)`. Key calls:
@@ -318,7 +385,7 @@ damping → carved valleys), `ValueD` (value+gradient), `CellFeature` (jittered
 crater centres). Fractional-octave variants are *continuous* in octave count,
 which is what makes terrain LOD pop-free.
 
-### 6.4 Nebulae
+### 7.4 Nebulae
 
 **NebulaField** (sealed): `NebulaField(ulong worldSeed, int count = -1)` — `-1`
 reads `NebulaTuning.Count`. Scatters clouds over ±6000 ly radially / ±1800 ly
@@ -333,7 +400,7 @@ Because count/radius are *generation* inputs, changing them requires rebuilding
 the field (`new NebulaField(WorldSeed)`); both consumers (`NebulaRenderer` and the
 galaxy map) read `Nebulae` fresh each frame, so a reassignment is all it takes.
 
-### 6.5 Asteroids
+### 7.5 Asteroids
 
 **AsteroidBelt** (sealed): `static bool Rolls(Star)` (cheap pre-check),
 `static AsteroidBelt? Generate(star, snowLineAu, starMassKg)`,
@@ -343,7 +410,7 @@ galaxy map) read `Nebulae` fresh each frame, so a reassignment is all it takes.
 `Collect(...)`. **AsteroidInstance** (struct) carries camera-relative pos, radius,
 colour, shape seed, spin axis/angle for the renderer.
 
-### 6.6 Tuning globals
+### 7.6 Tuning globals
 
 - **TerrainTuning** (static) — live *multipliers* on seeded terrain + render knobs:
   `GpuTerrain` (bool, default on), `ReliefScale`, `MountainScale`, `FrequencyScale`,
@@ -362,7 +429,7 @@ colour, shape seed, spin axis/angle for the renderer.
 
 ---
 
-## 7. Game.Systems — runtime lifecycle
+## 8. Game.Systems — runtime lifecycle
 
 **SolarSystemManager** (sealed) — owns the single active system.
 `void Update(double dt, in UniversePosition camera, INearestStar field)`:
@@ -398,12 +465,12 @@ jump-to-cluster key.
 
 ---
 
-## 8. Game.App — the application & main loop
+## 9. Game.App — the application & main loop
 
 `Program` is a static class holding every subsystem. `GameWindow` events drive
 three phases.
 
-### 8.1 OnLoad — construction order
+### 9.1 OnLoad — construction order
 
 Camera + `FreeFlyController` → `StarCatalogPager`/`StarRenderer` → `GalaxyBackdrop`
 → `NebulaField`/`NebulaRenderer` → `SolarSystemManager`/`SystemRenderer` →
@@ -411,18 +478,27 @@ terrain (`PlanetTerrainRenderer`, tile cache, `ScatterRenderer`, `PlanetSurfaceM
 → rover, asteroid/glow/grid/black-hole renderers → atmosphere/cloud →
 framebuffers (`SceneFramebuffer`, `ColorTarget`, `BloomRenderer`) → `ImGuiController`,
 `StarOverlay` → `TuningConfig.Load("tuning.json")` (and, because it may change
-nebula count/radius, the field is rebuilt right after a successful load).
+nebula count/radius, the field is rebuilt right after a successful load) →
+`InitAudio()`.
 
-### 8.2 OnUpdate(dt) — simulation
+`InitAudio()` brings up the `AudioEngine` and primes the UI click (`Assets/Audio/blip.wav`
+if shipped, else `Synth.Blip()`). **Music auto-plays only when a real
+`Assets/Audio/music.wav` exists** (looped); otherwise the game stays silent — the
+`Synth.AmbientPad()` drone is a deep tone that reads as a constant hum, so it is opt-in
+via the Tuning ▸ Audio panel, never the default. Music is also skipped in `--smoke` runs.
+
+### 9.2 OnUpdate(dt) — simulation
 
 Edge-detected key toggles (Tab capture, F scanner, R rover, H HUD, P grid, M/N
 maps, B/J jumps, Space pause, `,`/`.` time-lapse) → if not driving/orbiting,
 `_controller.Update(dt)` → `_starPager.Update` → `_asteroidFields.Update` →
 `_systemManager.Update(dt, camera, _starPager)` → rover step *or* carry the camera
 along a moving body's frame → `PickTerrainTarget()` sets the terrain body and
-focus → `UpdateSpeedLimit()` (the `SpeedPolicy` reduction above) → FPS bookkeeping.
+focus → `UpdateSpeedLimit()` (the `SpeedPolicy` reduction above) → FPS bookkeeping
+→ audio: `SetListener(0, camera.Forward, camera.Up)` then `_audio.Update(dt)` (pumps
+the music stream). Map toggles and belt/cluster jumps fire a UI `Blip()`.
 
-### 8.3 OnRender(dt) — the frame, in order
+### 9.3 OnRender(dt) — the frame, in order
 
 The scene is drawn into an offscreen `SceneFramebuffer` (colour + sampleable
 depth), then depth-aware effects composite in a `ColorTarget`, then bloom and the
@@ -451,7 +527,7 @@ bloom.Render(postFbo.ColorTexture); bloom.Composite(scene, bloom)   // to screen
 HUD: overlay.Draw + DrawHud/DrawTuning/DrawScanner/DrawSystemMap/DrawGalaxyMap; imgui.Render()
 ```
 
-### 8.4 Renderers (key entry points)
+### 9.4 Renderers (key entry points)
 
 All take `Camera` and compute camera-relative geometry; most fit their own near/far.
 
@@ -473,7 +549,7 @@ All take `Camera` and compute camera-relative geometry; most fit their own near/
 | **RoverRenderer** | `Render(camera, bodyPos, forward, up, wheelTravel, sunDir, near, far)` | chassis + 4 independently-sprung wheels |
 | **GalacticGridRenderer** | `Render(camera)` | faint galactic-plane reference grid |
 
-### 8.5 Controllers
+### 9.5 Controllers
 
 **FreeFlyController** `(Camera, IKeyboard, IMouse)` — true 6-DOF: mouse yaw/pitch +
 Q/E roll compose as incremental *local* quaternion rotations (no world-up, no
@@ -495,7 +571,7 @@ at four wheel corners, fits a footprint normal, and settles a critically-damped
 per-wheel suspension (absorbs bumps, never bounces) — pure kinematics, fully
 testable.
 
-### 8.6 TuningConfig — persistence
+### 9.6 TuningConfig — persistence
 
 A serializable snapshot of every live knob (backdrop incl. `NebulaCount`/
 `NebulaMinRadiusLy`/`NebulaMaxRadiusLy`, atmosphere, terrain globals, biome,
@@ -514,30 +590,35 @@ older file doesn't wipe defaults). Startup loads `tuning.json`; "Save settings"
 captures and writes it. Because nebula count/radius are generation inputs,
 `Program` rebuilds the `NebulaField` after any load that may have changed them.
 
-### 8.7 HUD / overlays
+### 9.7 HUD / overlays
 
 `StarOverlay.Draw(camera, pager, systems, searchTarget?)` paints reticles, labels
 and the nearest-star arrow. ImGui panels: `DrawHud` (position/speed/FPS/system,
-find-star box), `DrawTuning` (all sliders + save/load), `DrawScanner` (body / star
+find-star box), `DrawTuning` (all sliders + save/load, including the **Audio** panel:
+master/music/sfx volume, music on/off, Test-SFX — see §6), `DrawScanner` (body / star
 / sector readout, F), `DrawSystemMap` (top-down system, M, with nebula disks and
 click-to-travel), `DrawGalaxyMap`/3D neighbourhood (N).
 
 ---
 
-## 9. Extending the engine — quick recipes
+## 10. Extending the engine — quick recipes
 
 - **Add a procedural feature:** generate it as a pure function of `WorldSeed`
   (+ coords/id) using its own `DeterministicRng` stream; never store it, never
   perturb another subsystem's stream.
 - **Add a renderer:** take `Camera`, convert positions with `ToCameraRelative`,
   fit your own near/far, and slot a `Render(...)` call into the OnRender order in
-  §8.3 at the right depth-clear boundary. Use additive + no-depth for glows.
+  §9.3 at the right depth-clear boundary. Use additive + no-depth for glows.
 - **Add a tunable:** put the field on the relevant static tuning class (or
   renderer), add a slider in `DrawTuning`, and add it to `TuningConfig`'s
   `Capture`/`Apply` (+ a DTO field) so it persists. If it's a *generation* input,
-  rebuild the affected object after `Load` — see the nebula precedent in §8.6.
+  rebuild the affected object after `Load` — see the nebula precedent in §9.6.
 - **Query the nearest star/body:** depend on `INearestStar` (the pager), not a
   concrete field, so legacy/streamed sources are interchangeable.
+- **Play a sound or music:** load a WAV (`_audio.LoadSound`/`WavLoader`) or synth a
+  clip, then `PlaySound` (UI, head-relative) / `PlaySoundAt(sound, camRel)` (in-world,
+  pass `body.CurrentPosition.ToCameraRelative(camera.Position)`) / `PlayMusic`. Guard
+  nothing — the engine no-ops when `Available` is false. See §6.
 
 ---
 
