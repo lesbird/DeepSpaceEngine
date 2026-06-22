@@ -58,9 +58,11 @@ Engine.Rendering   GL wrappers: Shader, Mesh, Camera, …        → Engine.Core
 Engine.Platform    GameWindow: Silk.NET window + GL + input    → Core, Rendering
 Engine.Audio       AudioEngine: OpenAL sound + music + synth    → Engine.Core
 Game.Universe      procedural generation (stars→terrain)       → Engine.Core
-Game.Systems       runtime lifecycle: systems, speed, fields   → Universe, Core
+Game.Systems       runtime lifecycle: systems, speed, fields,  → Universe, Core
+                   Discovery/ (networked discovery client)
 Game.App           entry point, main loop, all renderers, HUD  → everything
 Engine.Core.Tests  xUnit: precision, determinism, sim          → Core, Universe…
+server/            PHP + MySQL discovery API + HTML log         (standalone)
 ```
 
 Dependency arrows point downward only — generation never references rendering.
@@ -474,6 +476,11 @@ anti-tunnelling, and feeds both to the controller via `SetSpeedContext`.
 `bool TryFindNearest(in from, int searchCells, out AsteroidField)` backs the
 jump-to-cluster key.
 
+**Discovery** (`Game.Systems/Discovery/`) — the client half of the networked
+discovery system (full design in §10): `ObjectId` (the shared string-id scheme),
+`DiscoveryRecord`/`ReportRequest`/`DiscoveryResult`, the async `DiscoveryClient`
+(REST transport), and `DiscoveryService` (thread-safe cache + report policy).
+
 ---
 
 ## 9. Game.App — the application & main loop
@@ -612,7 +619,61 @@ click-to-travel), `DrawGalaxyMap`/3D neighbourhood (N).
 
 ---
 
-## 10. Extending the engine — quick recipes
+## 10. Discovery reporting — the networked layer
+
+An optional "who discovered it first" layer over the deterministic universe (full plan in
+[docs/DISCOVERY_PLAN.md](DISCOVERY_PLAN.md)). Because every player generates the **same**
+universe, an object's identity is just a string id — the server stores ids and names, never
+geometry. **Opt-in** (off by default; enable + name + server URL in Tuning ▸ Discovery).
+
+### 10.1 Identity (`ObjectId`)
+
+Strings, decimal, matching what the HUD shows:
+
+```
+star   = Star.Id                         "12407198355"
+planet = "{starId}-{PP}"  (0-based idx)  "12407198355-02"
+moon   = "{starId}-{PP}-{MM}"            "12407198355-02-03"
+```
+
+`ObjectId.TryFor(sys, body)` resolves a `CelestialBody` to its `(id, kind)` by locating it in
+the active system's `Planets`/`Moons`.
+
+### 10.2 Client (`Game.Systems/Discovery/`)
+
+- **DiscoveryClient** — async `HttpClient` transport (`GetAllAsync`, `ReportAsync`); camelCase
+  JSON; `X-Api-Key` on writes. Every call is try/caught and returns null on any failure, so
+  the game degrades to "offline" and never throws.
+- **DiscoveryService** — a thread-safe `ConcurrentDictionary` cache plus the report policy:
+  first-finder-wins with **optimistic local credit** (reaching an unknown object credits you
+  immediately, then POSTs; the server's authoritative reply overwrites it, so if someone beat
+  you, *their* name shows). A `TryAdd` de-dupe guard ensures one send per object; failed sends
+  go to a retry queue drained from `Update(dt)`. `InitializeAsync()` pulls the full list at
+  launch. The render thread only reads the cache and fires async sends — the frame never blocks.
+
+### 10.3 Game wiring (`Game.App`)
+
+- **DiscoveryConfig** → `discovery.json` (gitignored; Enabled / PlayerName / ServerUrl / ApiKey),
+  edited in the Tuning ▸ Discovery panel (toggle, fields, Save, Test connection, Re-sync, sync
+  status).
+- **Edge detection** (`Program.ReportDiscoveries`, each frame when enabled): **system entry** →
+  `ReportStar` when `ActiveStarId` changes; **environment entry** → `ReportBody` once the nearest
+  surfaced body's altitude drops below its shell `radius × (HasAtmosphere ? AtmosphereHeight :
+  AirlessEnvShell=0.05)` — so airless worlds discover on entry too — with `> 1.2×` hysteresis.
+  Both attach display `meta` (class/type/temp).
+- **HUD credit** — `StarOverlay` reticles append `by {name}`; `DrawScanner` and the `DrawHud`
+  system header show `Discovered by {name} on {date}` / `Undiscovered`.
+
+### 10.4 Server (`server/`, PHP + MySQL)
+
+One `discoveries` table; `UNIQUE(object_id)` *is* the first-finder-wins rule. `discover.php`
+(POST, key-gated) upserts and returns the authoritative record + `isNew`; `discoveries.php`
+(GET, open) lists all; `index.php` is a server-rendered log + leaderboard (no client JS, so the
+decimal ids render exactly). See [server/README.md](../server/README.md) for deploy + `curl` tests.
+
+---
+
+## 11. Extending the engine — quick recipes
 
 - **Add a procedural feature:** generate it as a pure function of `WorldSeed`
   (+ coords/id) using its own `DeterministicRng` stream; never store it, never

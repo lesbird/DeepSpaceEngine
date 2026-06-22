@@ -91,6 +91,8 @@ interstellar flight down to standing on a planet. See the full design in
 - **OpenAL** (Silk.NET.OpenAL + OpenAL Soft, native binaries bundled for macOS/Windows/Linux) — sound
   effects and streaming music; degrades to silent when no audio device is present
 - **ImGui.NET** — debug HUD
+- **REST discovery backend** (optional) — `HttpClient` + `System.Text.Json` client talking to a
+  standalone **PHP + MySQL** service; off by default, degrades to offline when unreachable
 - All NuGet versions are pinned exactly (no floating versions).
 
 ## Project layout
@@ -102,9 +104,10 @@ interstellar flight down to standing on a planet. See the full design in
 | `Engine.Platform` | `GameWindow` — Silk.NET window + GL context + input bootstrap |
 | `Engine.Audio` | `AudioEngine` — OpenAL device/context, a pooled one-shot SFX player, a gapless looping music streamer, master/music/sfx volume buses, and a `WavLoader` + procedural `Synth` fallback |
 | `Game.Universe` | procedural generation: galaxy, the **tiled star lattice** — `StarCatalog` (one indexed block), `StarCatalogPager` (loads/evicts blocks around the camera, the `INearestStar` source) and `StarId` (packs the global, invertible catalog id); `StarField` is the legacy infinite cell-streamer; the `BackdropStars` far-field dome, `SystemGenerator` (planets + moons), `Noise` (fBm + ridged), `PlanetTerrain`, atmospheres, the `Rover` surface-physics sim, and the live knobs (`TerrainTuning`/`BiomeTuning` globals + `PlanetTuning` per-type overrides) |
-| `Game.Systems` | runtime systems: `SolarSystemManager` (spawn/despawn lifecycle, sim time) and `SpeedPolicy` (the free-fly proximity speed limiter) |
+| `Game.Systems` | runtime systems: `SolarSystemManager` (spawn/despawn lifecycle, sim time), `SpeedPolicy` (the free-fly proximity speed limiter), and `Discovery/` (the networked discovery client — `ObjectId` id scheme, async `DiscoveryClient`, thread-safe `DiscoveryService`) |
 | `Game.App` | entry point, main loop, `FreeFlyController` + `RoverController` (chase-cam driving), renderers (`StarRenderer`, `GalaxyBackdrop`, `SystemRenderer`, `PlanetTerrainRenderer` — either GPU-generated tiles (`TerrainTileGenerator` + `TerrainTileCache`, the default) or CPU patches baked on a background worker pool and uploaded on the render thread, `RoverRenderer`, depth-aware `AtmosphereRenderer` over a `SceneFramebuffer`), `StarOverlay`, HUD + tuning panel (`TuningConfig` save/load) |
 | `Engine.Core.Tests` | xUnit tests: coordinate precision, generation determinism, terrain, rover, backdrop & speed policy |
+| `server/` | standalone **PHP + MySQL** discovery API + server-rendered HTML log (not part of the .NET solution) |
 
 ## The core idea: precision at any distance
 
@@ -273,6 +276,30 @@ and a sparse bell melody wandering a major-pentatonic scale with stereo echo —
 seed and built to loop without a click. (Want silence? Toggle it off in the Audio panel.) To use your
 own audio instead, drop `blip.wav` and/or `music.wav` into `Game.App/Assets/Audio/`; they're picked up
 automatically (uncompressed PCM, 8/16-bit mono/stereo) and the music loops.
+
+## Discovery (multiplayer "first finder")
+
+An optional networked layer that records **who discovered each star, planet and moon first**, shared
+across everyone exploring the same (deterministic) universe. Because every client generates an
+identical universe, an object's identity is just a string id — so the server only ever stores ids and
+names, never geometry.
+
+- **What triggers a discovery** — entering a **star system** reports its sun; entering a body's
+  **near-surface environment** reports that planet or moon (its atmosphere, or a notional shell for
+  airless worlds, so every world is discoverable). First finder wins; the server rejects duplicates.
+- **On the HUD** — discovered objects show **who** found them and **when**: a `by {name}` tag on the
+  star/planet/moon reticles, and a full `Discovered by {name} on {date}` line in the scanner and the
+  system header.
+- **Identity** — `star = {id}` (the decimal id already on the HUD), `planet = {id}-{PP}`,
+  `moon = {id}-{PP}-{MM}` (zero-padded generation indices).
+- **Setup** — **off by default.** In the tuning HUD's **Discovery** panel, set your player name, the
+  server URL and API key, and tick *Enable discovery reporting*. The client pulls the full discovery
+  list at launch and reports as you fly; everything is async and degrades to offline if the server is
+  unreachable (settings persist to a gitignored `discovery.json`).
+- **Server** — a small **PHP + MySQL** backend in [`server/`](server/) provides the REST API and a
+  read-only HTML **discovery log + leaderboard**. See [`server/README.md`](server/README.md) for the
+  schema, deploy steps and `curl` tests, and [`docs/DISCOVERY_PLAN.md`](docs/DISCOVERY_PLAN.md) for the
+  full design.
 
 ## Roadmap
 

@@ -1,6 +1,7 @@
 using Engine.Core;
 using Engine.Rendering;
 using Game.Systems;
+using Game.Systems.Discovery;
 using Game.Universe;
 using ImGuiNET;
 using Silk.NET.Maths;
@@ -25,8 +26,21 @@ public sealed class StarOverlay
 
     private readonly List<(double DistSq, Star Star)> _scratch = new();
 
-    public void Draw(Camera camera, StarCatalogPager field, SolarSystemManager manager, Star? searchTarget = null)
+    // Set for the duration of one Draw call so the label helpers can credit discovered objects.
+    private DiscoveryService? _discovery;
+
+    /// <summary>Reticle suffix crediting a discovered star/body (name only — the full date is in the
+    /// scanner). Empty when undiscovered or discovery is off.</summary>
+    private string StarCredit(in Star s) =>
+        _discovery != null && _discovery.TryGetStar(s, out DiscoveryRecord r) ? $"  by {r.Discoverer}" : "";
+
+    private string BodyCredit(SolarSystem sys, CelestialBody b) =>
+        _discovery != null && _discovery.TryGetBody(sys, b, out DiscoveryRecord r) ? $"  by {r.Discoverer}" : "";
+
+    public void Draw(Camera camera, StarCatalogPager field, SolarSystemManager manager,
+        DiscoveryService? discovery = null, Star? searchTarget = null)
     {
+        _discovery = discovery;
         var io = ImGui.GetIO();
         Vector2 vp = io.DisplaySize;
         if (vp.X < 2 || vp.Y < 2) return;
@@ -97,7 +111,7 @@ public sealed class StarOverlay
         {
             uint col = StarColor(sys.Sun, 0xE0);
             dl.AddCircle(sunScreen, 13f, col, 22, 2f);
-            dl.AddText(sunScreen + new Vector2(16, -8), col, $"SUN  {sys.Sun.ClassLetter}-class");
+            dl.AddText(sunScreen + new Vector2(16, -8), col, $"SUN  {sys.Sun.ClassLetter}-class{StarCredit(sys.Sun)}");
         }
 
         // Every on-screen planet gets a reticle: designation + type/distance.
@@ -109,7 +123,7 @@ public sealed class StarOverlay
             {
                 uint col = PlanetColor(p.Color, 0xD0);
                 dl.AddCircle(s, 8f, col, 16, 1.6f);
-                dl.AddText(s + new Vector2(11, -8), col, p.Designation);
+                dl.AddText(s + new Vector2(11, -8), col, $"{p.Designation}{BodyCredit(sys, p)}");
                 dl.AddText(s + new Vector2(11, 6), Col(180, 195, 215, 205), $"{p.Type}  {Dist(planetDist)}");
             }
 
@@ -125,7 +139,7 @@ public sealed class StarOverlay
                 if (!Project(mrel, m, vp, out Vector2 ms) || !OnScreen(ms, vp)) continue;
                 uint mcol = PlanetColor(mn.Color, 0xB0);
                 dl.AddCircle(ms, 5f, mcol, 12, 1.3f);
-                dl.AddText(ms + new Vector2(8, -6), mcol, mn.Designation);
+                dl.AddText(ms + new Vector2(8, -6), mcol, $"{mn.Designation}{BodyCredit(sys, mn)}");
             }
         }
     }
@@ -189,7 +203,7 @@ public sealed class StarOverlay
             double distLy = Math.Sqrt(_scratch[i].DistSq) / MathUtil.LightYear;
             uint col = StarColor(s, 0xC0);
             dl.AddCircle(screen, 9f, col, 16, 1.5f);
-            dl.AddText(screen + new Vector2(12, -8), col, $"#{s.Id}");
+            dl.AddText(screen + new Vector2(12, -8), col, $"#{s.Id}{StarCredit(s)}");
             dl.AddText(screen + new Vector2(12, 6), Col(170, 190, 220, 200), $"{s.ClassLetter}  {distLy:0.00} ly");
         }
     }

@@ -61,11 +61,16 @@ internal static class Program
     private static bool _musicEnabled = true;
     private const string AudioDir = "Assets/Audio";
 
-    // Discovery: player-side settings + REST transport (the service that reports/credits comes next phase).
+    // Discovery: player-side settings, REST transport, and the cache/report service.
     private static DiscoveryConfig _discoveryConfig = null!;
     private static DiscoveryClient _discoveryClient = null!;
+    private static DiscoveryService _discovery = null!;
     private static volatile string _discoveryStatus = "";
+    private static bool _prevDiscoveryEnabled;
     private const string DiscoveryPath = "discovery.json";
+    private static ulong _prevReportedStarId;   // edge-track: last system whose sun we reported
+    private static ulong _prevEnvBodySeed;       // edge-track: body whose environment we're inside
+    private const double AirlessEnvShell = 0.05; // notional environment shell (× radius) for airless worlds
 
     private const double TerrainActivateRadii = 40.0; // switch to terrain LOD within N planet radii (~50,000 km for a small world)
     private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
@@ -225,9 +230,15 @@ internal static class Program
 
         InitAudio();
 
-        // Discovery: load settings + build the REST client (reporting/credit wiring is the next phase).
+        // Discovery: load settings, build the REST client + cache/report service. The launch sync
+        // fires from OnUpdate when reporting is enabled (so enabling at runtime syncs too).
         _discoveryConfig = DiscoveryConfig.Load(DiscoveryPath);
         _discoveryClient = new DiscoveryClient(_discoveryConfig.ServerUrl, _discoveryConfig.ApiKey);
+        _discovery = new DiscoveryService(_discoveryClient)
+        {
+            Enabled = _discoveryConfig.Enabled,
+            PlayerName = _discoveryConfig.PlayerName,
+        };
 
         SetMouseCaptured(true);
     }
@@ -260,6 +271,51 @@ internal static class Program
     /// <summary>Click the UI sound (no-op when audio is unavailable).</summary>
     private static void Blip(float pitch = 1f) => _audio.PlaySound(_uiBlip, volume: 0.6f, pitch: pitch);
 
+    /// <summary>Edge-detect the two discovery events each frame: entering a star system (report its
+    /// sun) and entering a body's near-surface environment — its atmosphere, or a notional shell for
+    /// airless worlds — (report that planet/moon). The service de-dupes, so re-entries are free.</summary>
+    private static void ReportDiscoveries()
+    {
+        if (!_discovery.Enabled) return;
+
+        if (_systemManager.Active is not SolarSystem sys)
+        {
+            _prevReportedStarId = 0; // left the system → allow the next entry to re-fire
+            return;
+        }
+
+        // System entry: the active sun.
+        if (sys.Sun.Id != _prevReportedStarId)
+        {
+            _discovery.ReportStar(sys.Sun, new Dictionary<string, object?>
+            {
+                ["class"] = sys.Sun.ClassLetter.ToString(),
+                ["tempK"] = (int)sys.Sun.Temperature,
+            });
+            _prevReportedStarId = sys.Sun.Id;
+        }
+
+        // Environment entry: nearest surfaced body, once inside its (real or notional) shell.
+        CelestialBody? b = NearestSurfacedBody();
+        if (b == null) return;
+        double alt = b.CurrentPosition.DistanceTo(_camera.Position) - b.RadiusMeters;
+        double shell = b.RadiusMeters * (b.HasAtmosphere ? b.AtmosphereHeight : AirlessEnvShell);
+        if (alt < shell && _prevEnvBodySeed != b.Seed)
+        {
+            _discovery.ReportBody(sys, b, new Dictionary<string, object?>
+            {
+                ["type"] = b.Type.ToString(),
+                ["hasAtmosphere"] = b.HasAtmosphere,
+                ["tempK"] = (int)b.SurfaceTempK,
+            });
+            _prevEnvBodySeed = b.Seed;
+        }
+        else if (alt > shell * 1.2 && _prevEnvBodySeed == b.Seed)
+        {
+            _prevEnvBodySeed = 0; // climbed back out (hysteresis avoids edge flicker)
+        }
+    }
+
     /// <summary>Async ping of the discovery server (GET all) to confirm the URL works; updates the
     /// status line shown in the Discovery panel. Runs off-thread so the frame never blocks.</summary>
     private static void TestDiscoveryConnection()
@@ -280,11 +336,13 @@ internal static class Program
     {
         if (_smoke && _smokeFrames == 0)
         {
-            // Headless: jump next to the nearest star so the spawn/generate/render path runs.
+            // Headless: jump next to the nearest star so the spawn/generate/render path runs. The
+            // offset must be inside SolarSystemManager.SpawnLightYears (0.01 ly) or no system spawns —
+            // 0.005 ly lands us in-system so terrain (and discovery reporting) actually exercise.
             _starPager.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
             if (_starPager.HasNearest)
                 _camera.Position = _starPager.Nearest.Position
-                    .Translated(new Vector3D<double>(0.3 * MathUtil.LightYear, 0, 0));
+                    .Translated(new Vector3D<double>(0.005 * MathUtil.LightYear, 0, 0));
         }
         if (_smoke && _smokeFrames == 1 && _systemManager.HasActive)
         {
@@ -413,6 +471,15 @@ internal static class Program
             new System.Numerics.Vector3(f.X, f.Y, f.Z),
             new System.Numerics.Vector3(u.X, u.Y, u.Z));
         _audio.Update(dt);
+
+        // Discovery: keep the service in sync with the config, sync the catalog when reporting is first
+        // enabled (covers launch and runtime toggling), then drive its retry queue.
+        _discovery.Enabled = _discoveryConfig.Enabled;
+        _discovery.PlayerName = _discoveryConfig.PlayerName;
+        if (_discoveryConfig.Enabled && !_prevDiscoveryEnabled) _ = _discovery.InitializeAsync();
+        _prevDiscoveryEnabled = _discoveryConfig.Enabled;
+        ReportDiscoveries();
+        _discovery.Update(dt);
 
         if (_smoke && _smokeFrames == 0 && _systemManager.HasActive)
         {
@@ -600,7 +667,7 @@ internal static class Program
         // renders (an empty frame) so its begin/end frame stays balanced.
         if (_hudVisible)
         {
-            _overlay.Draw(_camera, _starPager, _systemManager, _hasSearchTarget ? _searchTarget : null);
+            _overlay.Draw(_camera, _starPager, _systemManager, _discovery, _hasSearchTarget ? _searchTarget : null);
             DrawHud();
             DrawTuning();
             DrawScanner();
@@ -687,6 +754,9 @@ internal static class Program
             SolarSystem sys = _systemManager.Active!;
             ImGui.TextColored(new System.Numerics.Vector4(0.5f, 1f, 0.7f, 1f),
                 $"SYSTEM ACTIVE — {sys.Sun.ClassLetter}-class, {sys.Planets.Length} planet(s)");
+            if (_discovery.TryGetStar(sys.Sun, out DiscoveryRecord hudSun))
+                ImGui.TextColored(new System.Numerics.Vector4(0.6f, 1f, 0.7f, 1f),
+                    $"  discovered by {hudSun.Discoverer} ({hudSun.DiscoveredAtUtc:yyyy-MM-dd})");
             double appScale = _paused ? _savedTimeScale : _systemManager.TimeScale;
             double fastestC = sys.MaxOrbitalSpeedMps * _systemManager.TimeScale / MathUtil.SpeedOfLight;
             ImGui.Text($"Time x{appScale:0} {(_paused ? "(PAUSED)" : "")} — fastest orbit {fastestC:0.000} c  [',' '.' Space]");
@@ -837,7 +907,15 @@ internal static class Program
             }
             ImGui.SameLine();
             if (ImGui.Button("Test connection")) TestDiscoveryConnection();
+            ImGui.SameLine();
+            if (ImGui.Button("Re-sync"))
+            {
+                _discoveryClient.ServerUrl = dc.ServerUrl;
+                _discoveryClient.ApiKey = dc.ApiKey;
+                _ = _discovery.InitializeAsync();
+            }
             if (_discoveryStatus.Length > 0) ImGui.TextDisabled(_discoveryStatus);
+            ImGui.TextDisabled($"Sync: {_discovery.State} — {_discovery.Count} known");
         }
 
         if (ImGui.CollapsingHeader("Atmosphere", ImGuiTreeNodeFlags.DefaultOpen))
@@ -1085,6 +1163,17 @@ internal static class Program
     /// When no body is within scan range it falls back to a wider readout: the star + system if a
     /// system is active, otherwise the sector (position + nearest star).
     /// </summary>
+    /// <summary>Render a discovery-credit line: who found this object and when, or "Undiscovered"
+    /// while reporting is enabled (nothing at all when discovery is off, to avoid clutter).</summary>
+    private static void DiscoveryLine(bool discovered, DiscoveryRecord? rec)
+    {
+        if (discovered && rec != null)
+            ImGui.TextColored(new System.Numerics.Vector4(0.6f, 1f, 0.7f, 1f),
+                $"Discovered by {rec.Discoverer} on {rec.DiscoveredAtUtc:yyyy-MM-dd} UTC");
+        else if (_discoveryConfig.Enabled)
+            ImGui.TextDisabled("Undiscovered");
+    }
+
     private static void DrawScanner()
     {
         if (!_scannerOpen) return;
@@ -1111,6 +1200,8 @@ internal static class Program
         }
 
         ImGui.Text($"Nearest: {target.Designation}");
+        bool bodyFound = _discovery.TryGetBody(_systemManager.Active!, target, out DiscoveryRecord bodyRec);
+        DiscoveryLine(bodyFound, bodyFound ? bodyRec : null);
         ImGui.Separator();
         ImGui.Text($"Class: {target.Type}");
         if (target.Habitable)
@@ -1166,6 +1257,8 @@ internal static class Program
     {
         Star sun = sys.Sun;
         ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"STAR SCAN — {sun.Designation}");
+        bool sunFound = _discovery.TryGetStar(sun, out DiscoveryRecord sunRec);
+        DiscoveryLine(sunFound, sunFound ? sunRec : null);
         ImGui.Separator();
         ImGui.Text($"Class: {sun.ClassLetter}  ({sun.Class}-type)");
         ImGui.Text($"Temperature: {sun.Temperature:0} K");
