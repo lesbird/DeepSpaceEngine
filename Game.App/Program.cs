@@ -220,10 +220,10 @@ internal static class Program
         SetMouseCaptured(true);
     }
 
-    /// <summary>Bring up the audio engine and prime its assets. The UI click falls back to a
-    /// synthesised blip, but music only auto-plays when a real Assets/Audio/music.wav is present —
-    /// the synth pad is a deep drone that reads as a constant hum, so it's opt-in (Tuning ▸ Audio),
-    /// not the default. Music never plays in headless smoke runs.</summary>
+    /// <summary>Bring up the audio engine and prime its assets, then start the soundtrack. Both the UI
+    /// click and the music fall back to the procedural synth when no WAV is shipped — music uses
+    /// <see cref="Synth.CasualSpace"/>, a calm looping ambient track, so it's pleasant to leave on (and
+    /// easily silenced in Tuning ▸ Audio). Music is skipped in headless smoke runs.</summary>
     private static void InitAudio()
     {
         _audio = new AudioEngine();
@@ -232,11 +232,17 @@ internal static class Program
         string blipPath = Path.Combine(AudioDir, "blip.wav");
         _uiBlip = _audio.CreateSound(File.Exists(blipPath) ? WavLoader.Load(blipPath) : Synth.Blip());
 
-        // Only start a soundtrack when there's a real music file to play; otherwise stay silent.
-        string musicPath = Path.Combine(AudioDir, "music.wav");
-        _musicEnabled = !_smoke && File.Exists(musicPath);
+        _musicEnabled = !_smoke;
         if (_musicEnabled)
-            _audio.PlayMusic(WavLoader.Load(musicPath), loop: true);
+            _audio.PlayMusic(LoadMusic(), loop: true);
+    }
+
+    /// <summary>The soundtrack clip: Assets/Audio/music.wav if shipped, else the procedural
+    /// <see cref="Synth.CasualSpace"/> ambient track.</summary>
+    private static AudioClip LoadMusic()
+    {
+        string musicPath = Path.Combine(AudioDir, "music.wav");
+        return File.Exists(musicPath) ? WavLoader.Load(musicPath) : Synth.CasualSpace();
     }
 
     /// <summary>Click the UI sound (no-op when audio is unavailable).</summary>
@@ -764,11 +770,7 @@ internal static class Program
                 if (ImGui.SliderFloat("SFX", ref sfx, 0f, 1f)) _audio.SfxVolume = sfx;
                 if (ImGui.Checkbox("Music on", ref _musicEnabled))
                 {
-                    if (_musicEnabled)
-                    {
-                        string musicPath = Path.Combine(AudioDir, "music.wav");
-                        _audio.PlayMusic(File.Exists(musicPath) ? WavLoader.Load(musicPath) : Synth.AmbientPad());
-                    }
+                    if (_musicEnabled) _audio.PlayMusic(LoadMusic(), loop: true);
                     else _audio.StopMusic();
                 }
                 ImGui.SameLine();

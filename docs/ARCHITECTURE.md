@@ -265,9 +265,20 @@ mono/stereo) that walks the chunk list, so it tolerates LIST/INFO/fact chunks. I
 produces an `AudioClip` (the engine-neutral payload: `byte[] Pcm`, sample rate,
 channels, bits, plus the matching OpenAL `BufferFormat`).
 
-The repo ships **no audio assets**, so `Synth` generates clips procedurally: `Blip()`
-(a short decaying sine for UI clicks) and `AmbientPad()` (a loop-aligned drone). These
-are the fallback when no WAV is present — see the policy in §9.1.
+The repo ships **no audio assets**, so `Synth` generates clips procedurally and these are
+the fallback whenever a WAV is absent (see §9.1):
+
+- `Blip()` — a short decaying sine for UI clicks.
+- `CasualSpace(seconds, seed)` — a full **calm, looping ambient music track**, stereo,
+  deterministic from a seed (reusing `DeterministicRng`). Three layers: a soft continuous
+  **drone** (root+fifth+octave, snapped to whole cycles so it crosses the loop seam without
+  a click); slow **7th-chord pads** that swell in and fade to silence within each slot (so
+  the chord level is zero at the seam); and a sparse **bell melody** wandering a major-
+  pentatonic scale, each note panned with two stereo echo taps. Seamlessness is by
+  construction — the drone is phase-continuous and pads/melody are arranged to be silent at
+  the seam (no note or echo is scheduled close enough to the end to ring across it). ~0.3 s
+  to bake a 48 s track.
+- `AmbientPad()` — the original simple loop-aligned drone, kept as a minimal alternative.
 
 ---
 
@@ -481,11 +492,11 @@ framebuffers (`SceneFramebuffer`, `ColorTarget`, `BloomRenderer`) → `ImGuiCont
 nebula count/radius, the field is rebuilt right after a successful load) →
 `InitAudio()`.
 
-`InitAudio()` brings up the `AudioEngine` and primes the UI click (`Assets/Audio/blip.wav`
-if shipped, else `Synth.Blip()`). **Music auto-plays only when a real
-`Assets/Audio/music.wav` exists** (looped); otherwise the game stays silent — the
-`Synth.AmbientPad()` drone is a deep tone that reads as a constant hum, so it is opt-in
-via the Tuning ▸ Audio panel, never the default. Music is also skipped in `--smoke` runs.
+`InitAudio()` brings up the `AudioEngine`, primes the UI click (`Assets/Audio/blip.wav`
+if shipped, else `Synth.Blip()`), and **starts the soundtrack, looped** — `music.wav` if
+shipped, otherwise the procedural `Synth.CasualSpace()` ambient track (`LoadMusic()` picks
+between them). It's pleasant to leave on and is easily silenced or balanced in the
+Tuning ▸ Audio panel. Music is skipped in `--smoke` runs.
 
 ### 9.2 OnUpdate(dt) — simulation
 
