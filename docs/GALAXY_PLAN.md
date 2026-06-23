@@ -157,8 +157,16 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
   near home is unchanged (now with subtle arm structure); fly out past ~50 kly and the star field
   fades to empty intergalactic space. NOTE: star ids change vs the old uniform field (acceptance
   sampling + galaxy-seeded blocks) — old discovery records won't match new ids (universe regen).
-- **Phase 2** — `GalaxyRenderer` **point-sprite tier**. *First "wow": fly out, see other galaxies
-  as bright stars.*
+- **Phase 2 — DONE 2026-06-23** (build green; pending on-device verify). `GalaxyRenderer`
+  (`Game.App/GalaxyRenderer.cs`): per-frame instance buffer of the resident galaxies drawn as
+  additive, **direction-only** point sprites on a dome radius inside the frustum (galaxies sit far
+  beyond the camera far plane, like the backdrop dome). Per-galaxy size/brightness from apparent
+  flux (`StarCount·1e-11 / distLy²`, sqrt cue, clamped 2–16 px), so a galaxy reads as a faint dot
+  tens of Mly out and swells into a bright point on approach. Excludes the galaxy the camera is
+  inside (its stars stream via the catalog). Drawn right after `_backdrop.Render`, before nebulae.
+  HUD line extended with "Galaxies: N resident, M drawn". Public `Brightness`/`SizeScale`/Min/Max
+  fields for tuning (not yet in TuningConfig). No new unit tests (GPU path). **First visual payoff:
+  fly out of the Milky Way and the other galaxies appear as bright stars.**
 - **Phase 3** — Galaxy **impostor / billboard** LOD (shape resolves on approach).
 - **Phase 4** — **Volumetric star-cloud** LOD + cross-fade with the impostor.
 - **Phase 5** — Hand-off cloud → real streamed catalog on entry; per-galaxy SMBH + backdrop.

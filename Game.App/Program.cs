@@ -28,6 +28,7 @@ internal static class Program
     private static StarCatalogPager _starPager = null!;
     private static GalaxyCatalogPager _galaxyPager = null!;
     private static StarRenderer _starRenderer = null!;
+    private static GalaxyRenderer _galaxyRenderer = null!;
     private static GalaxyBackdrop _backdrop = null!;
     private static NebulaField _nebulaField = null!;
     private static NebulaRenderer _nebulaRenderer = null!;
@@ -196,6 +197,7 @@ internal static class Program
         _galaxyPager = new GalaxyCatalogPager(new GalaxyField(WorldSeed));
         _starPager = new StarCatalogPager(_galaxyPager); // stars are confined to the galaxies it streams
         _starRenderer = new StarRenderer(_gl);
+        _galaxyRenderer = new GalaxyRenderer(_gl);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
         _nebulaField = new NebulaField(WorldSeed);
         _nebulaRenderer = new NebulaRenderer(_gl);
@@ -534,6 +536,9 @@ internal static class Program
         // Distant galaxy first (writes no depth), so the streamed stars, system, and atmosphere all
         // composite over it and any opaque body occludes the sky behind it.
         _backdrop.Render(_camera);
+        // Other galaxies as bright point sprites (the farthest LOD tier) — additive, direction-only,
+        // over the painted backdrop. Skips the galaxy we're inside (its stars stream via the catalog).
+        _galaxyRenderer.Render(_camera, _galaxyPager);
         // Nebulae over the backdrop but under the catalog stars — additive, so the stars that fall inside a
         // nebula read as points embedded in its glow.
         _nebulaRenderer.Render(_camera, _nebulaField);
@@ -875,6 +880,7 @@ internal static class Program
             ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.8f, 1f, 1f),
                 $"Intergalactic — nearest {g.Name} ({g.Type}) {mly:0.00} Mly");
         }
+        ImGui.Text($"Galaxies: {_galaxyPager.LoadedGalaxyCount} resident, {_galaxyRenderer.LastDrawn} drawn");
     }
 
     /// <summary>
