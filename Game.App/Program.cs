@@ -26,6 +26,7 @@ internal static class Program
     private static Camera _camera = null!;
     private static FreeFlyController _controller = null!;
     private static StarCatalogPager _starPager = null!;
+    private static GalaxyCatalogPager _galaxyPager = null!;
     private static StarRenderer _starRenderer = null!;
     private static GalaxyBackdrop _backdrop = null!;
     private static NebulaField _nebulaField = null!;
@@ -193,6 +194,7 @@ internal static class Program
         ResetToHome();
 
         _starPager = new StarCatalogPager(new GalaxyModel(WorldSeed));
+        _galaxyPager = new GalaxyCatalogPager(new GalaxyField(WorldSeed));
         _starRenderer = new StarRenderer(_gl);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
         _nebulaField = new NebulaField(WorldSeed);
@@ -424,6 +426,7 @@ internal static class Program
 
         if (!_driving && !_galaxy3DVisible) _controller.Update(dt); // ship is frozen while orbiting the 3D map
         _starPager.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
+        _galaxyPager.Update(_camera.Position);
         _asteroidFields.Update(_camera.Position, AsteroidFieldRadiusCells);
         _systemManager.Update(dt, _camera.Position, _starPager);
 
@@ -728,6 +731,7 @@ internal static class Program
         double distLy = p.DistanceTo(UniversePosition.Origin) / MathUtil.LightYear;
         ImGui.Text($"Sector: {p.Sector.X}, {p.Sector.Y}, {p.Sector.Z}");
         ImGui.Text($"From origin: {distLy:0.000} ly");
+        DrawGalaxyStatus();
         ImGui.Text($"Speed: {FormatSpeed(_controller.CurrentSpeed)}");
         if (_controller.SpeedCapped)
             ImGui.TextColored(new System.Numerics.Vector4(1f, 0.8f, 0.4f, 1f),
@@ -845,6 +849,28 @@ internal static class Program
         if (_jumpStatus.Length > 0)
             ImGui.TextColored(new System.Numerics.Vector4(0.6f, 1f, 0.7f, 1f), _jumpStatus);
         ImGui.End();
+    }
+
+    /// <summary>
+    /// One HUD line locating the camera in the universe-of-galaxies hierarchy: the galaxy you're inside
+    /// (green) or, in intergalactic space, the nearest galaxy and its distance. Phase-0 readout that
+    /// confirms the galaxy lattice resolves (you start inside the Milky Way).
+    /// </summary>
+    private static void DrawGalaxyStatus()
+    {
+        if (_galaxyPager.IsInside)
+        {
+            Galaxy g = _galaxyPager.Containing;
+            ImGui.TextColored(new System.Numerics.Vector4(0.6f, 1f, 0.7f, 1f),
+                $"Galaxy: {g.Name} ({g.Type}, {g.RadiusLy / 1000.0:0.#}k ly r)");
+        }
+        else if (_galaxyPager.HasNearest)
+        {
+            Galaxy g = _galaxyPager.Nearest;
+            double mly = _galaxyPager.NearestDistanceMeters / MathUtil.LightYear / 1.0e6;
+            ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.8f, 1f, 1f),
+                $"Intergalactic — nearest {g.Name} ({g.Type}) {mly:0.00} Mly");
+        }
     }
 
     /// <summary>

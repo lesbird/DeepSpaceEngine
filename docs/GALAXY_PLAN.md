@@ -134,9 +134,16 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
 
 ## 4. Phasing (each phase independently shippable & verifiable)
 
-- **Phase 0** — `Galaxy` + `GalaxyField`/`GalaxyCatalog` + `GalaxyCatalogPager`; place the Milky
-  Way at the origin. No visible change; assert the home galaxy resolves and the camera reports
-  "inside Milky Way."
+- **Phase 0 — DONE 2026-06-23** (build + 76 tests green; pending on-device verify). New
+  `Game.Universe` types: `Galaxy` (descriptor), `GalaxyType`, `GalaxyId` (pack/unpack, mirrors
+  `StarId`), `GalaxyField` (universe density, uniform for now), `GalaxyCatalog` (one 20 Mly lattice
+  block; Poisson-places galaxies; **forces the Milky Way at the origin** in block (0,0,0) — Spiral,
+  50 kly radius, seed = `WorldSeed`, disk normal +Y), `GalaxyCatalogPager : INearestGalaxy` (pages
+  blocks 3×3×3 / evict 2, tracks nearest + containing galaxy). Wired into `Program`:
+  `_galaxyPager.Update(camera)` each frame + a Navigation HUD line (`DrawGalaxyStatus`) showing the
+  galaxy you're inside (green) or nearest galaxy + Mly distance. Note: `GalaxyId` uses `AxisBias`
+  like `StarId`, so the Milky Way's id is a fixed opaque value, **not** 0 (both classes' "keeps
+  id 0" doc claims are aspirational). No star-generation or rendering change yet.
 - **Phase 1** — Gate star generation to galaxies; per-galaxy `GalaxyModel`. Verify the Milky Way
   looks the same as today and intergalactic space goes empty.
 - **Phase 2** — `GalaxyRenderer` **point-sprite tier**. *First "wow": fly out, see other galaxies
