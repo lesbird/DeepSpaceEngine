@@ -167,7 +167,18 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
   HUD line extended with "Galaxies: N resident, M drawn". Public `Brightness`/`SizeScale`/Min/Max
   fields for tuning (not yet in TuningConfig). No new unit tests (GPU path). **First visual payoff:
   fly out of the Milky Way and the other galaxies appear as bright stars.**
-- **Phase 3** — Galaxy **impostor / billboard** LOD (shape resolves on approach).
+- **Phase 3 — DONE 2026-06-23** (build + 87 tests green; pending on-device verify). `GalaxyRenderer`
+  gains an **impostor disk** tier cross-faded with the point tier by apparent angular radius
+  (`ratio = galaxyRadius / distance`; point-only below `RatioLo=0.01`, impostor-only above
+  `RatioHi=0.03`, complementary alphas between). Each impostor is a unit quad (gl_VertexID triangle
+  strip, no VBO) placed in the galaxy's **real disk plane** via a normal-derived basis, so it shows
+  inclination (face-on down the normal, edge-on along it), sized so `half/ImpostorRenderDist =
+  radius/distance` to reproduce true angular size (ratio clamped 1.2 for the near boundary). Fragment
+  shades a procedural disk in [-1,1]² uv: bright core + exponential disk × log-spiral arms (per-type
+  arm count/strength/swirl) × fbm dust, soft circular edge. Drawn per-galaxy (usually a handful close
+  enough). All giant-vector math kept in double before casting (the overflow lesson). HUD now "N
+  resident, P pts, D disks". KNOWN: when you cross into a galaxy (dist < radius → IsInside → excluded)
+  the impostor pops to streamed stars — Phase 4 volumetric cloud + Phase 5 hand-off smooth that.
 - **Phase 4** — **Volumetric star-cloud** LOD + cross-fade with the impostor.
 - **Phase 5** — Hand-off cloud → real streamed catalog on entry; per-galaxy SMBH + backdrop.
 - **Phase 6** — Universe-level **map view** (extend the `N` galaxy map to zoom out to the cosmic
