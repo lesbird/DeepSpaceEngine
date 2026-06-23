@@ -2173,6 +2173,10 @@ internal static class Program
 
     private static string FormatSpeed(double mps)
     {
+        if (mps >= 0.1 * 1e9 * MathUtil.LightYear)
+            return $"{mps / (1e9 * MathUtil.LightYear):0.000} Gly/s";
+        if (mps >= 0.1 * 1e6 * MathUtil.LightYear)
+            return $"{mps / (1e6 * MathUtil.LightYear):0.000} Mly/s";
         if (mps >= 0.1 * MathUtil.LightYear)
             return $"{mps / MathUtil.LightYear:0.000} ly/s";
         if (mps >= 0.1 * MathUtil.AstronomicalUnit)

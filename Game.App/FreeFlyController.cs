@@ -35,7 +35,10 @@ public sealed class FreeFlyController
     public bool MouseLookEnabled = true;
 
     private const float MinSpeedExp = 0f;   // 1 m/s
-    private const float MaxSpeedExp = 18f;  // 1e18 m/s (~100 ly/s)
+    // Top speed reaches intergalactic scale: galaxies are millions of ly apart (true scale), so ~100 ly/s
+    // would take hours to cross the void. 1e24 m/s ≈ 1e8 ly/s ≈ 100 Mly/s lets you reach a neighbour in
+    // seconds; wheel down for fine control. The proximity cap still clamps you on approach to any body.
+    private const float MaxSpeedExp = 24f;  // 1e24 m/s (~100 Mly/s)
 
     // Never advance more than this fraction of the distance to the nearest engaged surface in a single
     // frame. Keeps a fast approach from tunnelling through a body before the cap can react, regardless

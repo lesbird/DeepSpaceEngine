@@ -205,6 +205,8 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
 ## 7. Open decisions (settled / deferred)
 
 - **Intergalactic scale:** TRUE cosmic scale (decided 2026-06-23).
-- **Warp / travel between galaxies:** likely needs a higher speed cap and/or a "jump to galaxy"
-  affordance — revisit in Phase 2 once voids are real.
+- **Warp / travel between galaxies:** top speed cap raised to 1e24 m/s (~100 Mly/s) in Phase 2
+  (`FreeFlyController.MaxSpeedExp = 24`), with Mly/s & Gly/s readouts in `FormatSpeed`, so the void
+  is crossable in seconds. A "jump to galaxy" affordance is still possible later if wheeling up feels
+  slow.
 - **Star id format across galaxies:** `(galaxyId, starId)`; Milky Way = galaxy 0 for back-compat.
