@@ -31,6 +31,11 @@ public sealed class GalaxyRenderer : IDisposable
     /// <summary>Galaxies drawn last frame (HUD/debug).</summary>
     public int LastDrawn { get; private set; }
 
+    // Brightness-cue reference: a Milky-Way-class galaxy (this many stars) at this distance reads as
+    // cue ≈ 1 — a clear point. Closer ⇒ brighter/bigger (clamped); farther ⇒ fades to the floor.
+    private const double RefStarCount = 2.0e11;
+    private const double RefDistLy = 1.0e6;
+
     // Direction-only projection radius — well inside the camera far plane (1e18 m), like the backdrop dome.
     private const float DomeRadius = 1.0e15f;
     private const int FloatsPerGalaxy = 8; // dir(3) + color(3) + size(1) + brightness(1)
@@ -111,13 +116,13 @@ void main() {
                 if (distM < 1.0) continue; // degenerate (effectively at the centre)
 
                 double distLy = distM / MathUtil.LightYear;
-                // Apparent flux ∝ luminosity / distance². Star count is the luminosity proxy; the
-                // 1e-11 reference keeps the numbers near unity for a ~2e11-star galaxy a few hundred
-                // thousand ly away (a clearly visible point), tapering to a faint dot tens of Mly out.
-                double flux = g.StarCount * 1e-11 / (distLy * distLy);
-                float cue = (float)Math.Sqrt(Math.Max(flux, 0.0));
+                // Apparent brightness cue = sqrt(flux), flux ∝ luminosity / distance². Star count is the
+                // luminosity proxy, normalised against a Milky-Way-class reference so the magnitudes are
+                // interpretable: cue ≈ 1 for a ~2e11-star galaxy at 1 Mly (a clear point), clamping up
+                // huge just outside a galaxy and fading toward the floor tens of Mly out.
+                float cue = (float)(Math.Sqrt(g.StarCount / RefStarCount) * (RefDistLy / distLy));
                 float size = Math.Clamp(MinSizePx + SizeScale * cue, MinSizePx, MaxSizePx);
-                float bright = Math.Clamp(0.35f + 0.9f * cue, 0.3f, 2.0f);
+                float bright = Math.Clamp(0.4f + 0.8f * cue, 0.3f, 2.0f);
 
                 var dir = Vector3D.Normalize(new Vector3D<float>((float)rel.X, (float)rel.Y, (float)rel.Z));
 
