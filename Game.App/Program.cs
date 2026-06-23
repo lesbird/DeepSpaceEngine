@@ -892,7 +892,7 @@ internal static class Program
             ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.8f, 1f, 1f),
                 $"Intergalactic — nearest {g.Name} ({g.Type}) {mly:0.00} Mly");
         }
-        ImGui.Text($"Galaxies: {_galaxyPager.LoadedGalaxyCount} resident, {_galaxyRenderer.LastDrawn} pts, {_galaxyRenderer.LastImpostors} disks");
+        ImGui.Text($"Galaxies: {_galaxyPager.LoadedGalaxyCount} resident, {_galaxyRenderer.LastDrawn} pts, {_galaxyRenderer.LastImpostors} disks, {_galaxyRenderer.LastClouds} clouds");
     }
 
     /// <summary>

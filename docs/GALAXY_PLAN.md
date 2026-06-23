@@ -179,7 +179,19 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
   enough). All giant-vector math kept in double before casting (the overflow lesson). HUD now "N
   resident, P pts, D disks". KNOWN: when you cross into a galaxy (dist < radius → IsInside → excluded)
   the impostor pops to streamed stars — Phase 4 volumetric cloud + Phase 5 hand-off smooth that.
-- **Phase 4** — **Volumetric star-cloud** LOD + cross-fade with the impostor.
+- **Phase 4 — DONE 2026-06-23** (build + 91 tests green; pending on-device verify). `GalaxyCloud`
+  (`Game.Universe`) generates ~120k deterministic sample points per galaxy from the density model
+  (exponential disk + arm-biased angle + spheroidal bulge), as offsets-from-centre + colour + size.
+  `GalaxyRenderer` gains the **cloud tier**: async-generated, cached per-galaxy static VBOs for the
+  nearest ≤3 galaxies (`CloudCap`), drawn camera-relative with a dedicated wide-far-plane projection
+  (`CloudFar=3e22`) so a whole galaxy fits; additive, depth off. Three-way cross-fade by angular
+  radius: point→impostor `[0.01,0.03]`, impostor→cloud `[0.05,0.15]` (impostor alpha =
+  `impostorMix·(1−cloudMix)`). A **per-point near-fade** (40→200 ly, scaled inside `length()` to dodge
+  the float overflow) hides cloud points within the catalog bubble, so streamed real stars take over
+  as you enter. The cloud renders for the galaxy you're INSIDE too (point/impostor skip it), giving a
+  real 3-D disk around you. HUD: "N resident, P pts, D disks, C clouds". 4 new `GalaxyCloud` tests.
+  NOTE: inside a galaxy you now see catalog stars + cloud disk + the still-painted fake band —
+  reconciled in Phase 5 (per-galaxy backdrop). `CloudBrightness` public for tuning.
 - **Phase 5** — Hand-off cloud → real streamed catalog on entry; per-galaxy SMBH + backdrop.
 - **Phase 6** — Universe-level **map view** (extend the `N` galaxy map to zoom out to the cosmic
   web), performance passes, photo-mode polish.
