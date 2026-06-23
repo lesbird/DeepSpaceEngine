@@ -5,7 +5,7 @@ procedurally-generated star systems, light-years apart, with seamless transition
 interstellar flight down to standing on a planet. See the full design in
 [`docs/PLAN.md`](docs/PLAN.md).
 
-> **Status: Milestones M0–M4 complete.** Window + GL 4.1 context, the hierarchical
+> **Status: Milestones M0–M4 complete; M5 (fidelity) + M6 (a hierarchical universe of galaxies) in.** Window + GL 4.1 context, the hierarchical
 > coordinate system, a free-fly camera, a streaming procedural **star field**,
 > **spawnable solar systems**, and now **landable planets**. Fly within 0.5 ly of a star
 > and its deterministic system materialises (emissive sun, lit Keplerian-orbiting planets +
@@ -68,7 +68,15 @@ interstellar flight down to standing on a planet. See the full design in
 > vegetation skips airless moons), a **spawn-chance** dice-roll, and an optional **altitude band** (a
 > min/max height above the base radius, so a layer can stay out of the oceans and off the high peaks):
 > the foundation for trees, grass and
-> pickups. Generation is fully deterministic. M5 (fidelity) is underway.
+> pickups. The universe is now a **hierarchy of galaxies**: you start inside the Milky Way, and if
+> you fly out you see other galaxies — at first as bright points, resolving on approach into oriented
+> **spiral/elliptical disks** (a glowing bulge + dark dust lanes), then into a **volumetric star
+> cloud** with parallax, and finally into real streamed stars as you cross in. Stars only exist inside
+> galaxies (intergalactic space is genuinely empty), each galaxy carries its own **central black hole**
+> and its own **nebulae**, and the top speed reaches **~100 Mly/s** so the voids are crossable (with a
+> *travel-to-galaxy* list in the HUD). A galaxy's halo is dotted with **globular clusters** — fuzzy
+> stars from thousands of ly out that resolve into a dense knot of **real, visitable stars**, each with
+> its own solar system. Generation is fully deterministic. M5 (fidelity) is underway.
 
 ## Screenshots
 
@@ -103,9 +111,9 @@ interstellar flight down to standing on a planet. See the full design in
 | `Engine.Rendering` | GL wrappers: `Shader`, `Mesh`, `Camera`, `Primitives`, matrix helpers |
 | `Engine.Platform` | `GameWindow` — Silk.NET window + GL context + input bootstrap |
 | `Engine.Audio` | `AudioEngine` — OpenAL device/context, a pooled one-shot SFX player, a gapless looping music streamer, master/music/sfx volume buses, and a `WavLoader` + procedural `Synth` fallback |
-| `Game.Universe` | procedural generation: galaxy, the **tiled star lattice** — `StarCatalog` (one indexed block), `StarCatalogPager` (loads/evicts blocks around the camera, the `INearestStar` source) and `StarId` (packs the global, invertible catalog id); `StarField` is the legacy infinite cell-streamer; the `BackdropStars` far-field dome, `SystemGenerator` (planets + moons), `Noise` (fBm + ridged), `PlanetTerrain`, atmospheres, the `Rover` surface-physics sim, and the live knobs (`TerrainTuning`/`BiomeTuning` globals + `PlanetTuning` per-type overrides) |
+| `Game.Universe` | procedural generation. **Universe of galaxies** — `Galaxy` + `GalaxyCatalog`/`GalaxyCatalogPager` (a sparse lattice of galaxies, the `INearestGalaxy` source), `GalaxyField` (cosmic density), `GalaxyModel` (one galaxy's stellar density: disk/arms/bulge), `GalaxyId`, and `GalaxyCloud` (a galaxy's volumetric point set). **Tiled star lattice** confined to galaxy interiors — `StarCatalog` (one indexed block; injects globular-cluster stars), `StarCatalogPager` (loads/evicts blocks around the camera, the `INearestStar` source) and `StarId` (packs the global, invertible catalog id). **Globular clusters** — `GlobularCluster`/`GlobularClusters` (halo clusters + their shared per-star generator). Plus `BackdropStars`, `NebulaField` (per-galaxy), `SystemGenerator` (planets + moons), `Noise` (fBm + ridged), `PlanetTerrain`, atmospheres, the `Rover` surface-physics sim, the live knobs (`TerrainTuning`/`BiomeTuning` globals + `PlanetTuning` per-type overrides), and the legacy `StarField` cell-streamer |
 | `Game.Systems` | runtime systems: `SolarSystemManager` (spawn/despawn lifecycle, sim time), `SpeedPolicy` (the free-fly proximity speed limiter), and `Discovery/` (the networked discovery client — `ObjectId` id scheme, async `DiscoveryClient`, thread-safe `DiscoveryService`) |
-| `Game.App` | entry point, main loop, `FreeFlyController` + `RoverController` (chase-cam driving), renderers (`StarRenderer`, `GalaxyBackdrop`, `SystemRenderer`, `PlanetTerrainRenderer` — either GPU-generated tiles (`TerrainTileGenerator` + `TerrainTileCache`, the default) or CPU patches baked on a background worker pool and uploaded on the render thread, `RoverRenderer`, depth-aware `AtmosphereRenderer` over a `SceneFramebuffer`), `StarOverlay`, HUD + tuning panel (`TuningConfig` save/load) |
+| `Game.App` | entry point, main loop, `FreeFlyController` + `RoverController` (chase-cam driving), renderers (`StarRenderer`, `GalaxyRenderer` (the point→impostor→cloud galaxy LOD), `GlobularClusterRenderer` (fuzzy sprite→resolved star cloud), `GalaxyBackdrop`, `SystemRenderer`, `PlanetTerrainRenderer` — either GPU-generated tiles (`TerrainTileGenerator` + `TerrainTileCache`, the default) or CPU patches baked on a background worker pool and uploaded on the render thread, `RoverRenderer`, depth-aware `AtmosphereRenderer` over a `SceneFramebuffer`), `StarOverlay`, HUD + tuning panel (`TuningConfig` save/load) |
 | `Engine.Core.Tests` | xUnit tests: coordinate precision, generation determinism, terrain, rover, backdrop & speed policy |
 | `server/` | standalone **PHP + MySQL** discovery API + server-rendered HTML log (not part of the .NET solution) |
 
@@ -116,7 +124,9 @@ instead stores `Sector` (an `Int64` cube index per axis, sector = 1 AU) plus a `
 `Local` offset within that sector. The fractional position always lives inside a small
 sector, so the double's full precision yields **sub-millimetre resolution everywhere**, with
 effectively unlimited range. Nothing absolute is ever sent to the GPU — `ToCameraRelative`
-produces a small, precise float vector relative to the camera (floating origin).
+produces a small, precise float vector relative to the camera (floating origin). The range is vast
+enough that the **entire observable universe fits** (galaxies millions of light-years apart) at the
+same sub-mm precision — which is what lets the galaxy hierarchy share one coordinate space.
 
 ## Build & run
 
@@ -143,7 +153,7 @@ dotnet run --project Game.App      # launch the engine
 | Mouse | Look — true 6-DOF, no pitch limit / no gimbal lock |
 | `W` `A` `S` `D` | Move forward / left / back / right |
 | `Q` / `E` | Roll left / right |
-| Mouse wheel | Speed — sets a logarithmic *desired* speed (1 m/s → ~100 ly/s); the proximity limiter clamps it automatically near bodies |
+| Mouse wheel | Speed — sets a logarithmic *desired* speed (1 m/s → ~100 Mly/s, for crossing intergalactic voids); the proximity limiter clamps it automatically near bodies |
 | `,` / `.` | Orbit time-lapse slower / faster |
 | `P` | Pause / resume orbital time |
 | `F` | Toggle the body scanner panel |
@@ -177,7 +187,7 @@ wheel travels independently in its well while the chassis bobs and rocks, settli
 ever bouncing back off the ground.
 
 **Proximity speed.** The wheel always sets a single *desired* speed — logarithmic, from 1 m/s up to
-~100 ly/s. Your actual speed is that value clamped by a **proximity limiter** that depends only on how
+~100 Mly/s (galaxies are millions of ly apart, so the void needs real warp). Your actual speed is that value clamped by a **proximity limiter** that depends only on how
 close you are to a body: far from everything there is **no limit** (cruise the galaxy at full speed),
 but as you approach a star your top speed is smoothly reeled in, and tighter still as you near its
 planets and moons — so you decelerate into an approach instead of blasting past. The slowdown is
@@ -200,6 +210,18 @@ that star with an amber target marker (on-screen brackets, or an edge arrow when
 behind you), then *Go to it* to jump the camera in to frame it within system-spawn range. Every star
 in the lattice is addressable: the id encodes its block, so finding one **loads that block on demand**
 even if it's nowhere near you. Stars in the home block keep the small numbers `0 … N-1`.
+
+**Galaxies & clusters.** Fly out of the Milky Way and the other galaxies appear — a faint point far off
+that **swells into a bright star** as you approach, then resolves into a tilted **spiral or elliptical
+disk** (glowing bulge + dark dust lanes), then a **3-D star cloud** you can fly into, and finally the
+galaxy's real streamed stars as you cross inside. Each galaxy has its own central black hole, its own
+nebulae, and a halo of **globular clusters**: from thousands of ly away each reads as a fuzzy star
+(tagged on the HUD with a `GC` bracket reticle + distance), and as you close in it resolves into a dense
+ball of **real stars you can visit** — every one spawns its own solar system, just like the disk stars.
+The Navigation panel lists the nearest galaxies with a **Go** button (a few radii out, framed) so the
+millions-of-ly voids are actually crossable; intergalactic space itself is empty (stars exist only
+inside galaxies). The galaxy look (point/impostor/cloud brightness and sizes, cloud point size, and the
+globular sprite/star brightness) is live-tunable in the Tuning panel and saved to `tuning.json`.
 
 **Maps.** Press `M` for the **system map** — a top-down schematic of the active system with the sun at
 centre, planets on log-radial orbit rings at their live angle, moons, the asteroid belt, and a "you are
@@ -230,7 +252,9 @@ your altitude and live terrain patch counts. Fly to extreme distances to confirm
 **no positional jitter**.
 
 **Tuning panel.** A second HUD window with live controls for the **star field** (catalog
-brightness, perceptual falloff/gamma, and point size), the **galaxy backdrop** (an on/off
+brightness, perceptual falloff/gamma, and point size), the **galaxies (LOD)** (point brightness/size,
+impostor and cloud brightness, cloud point size — fewer/larger for performance), the **globular
+clusters** (sprite and resolved-star brightness, star size), the **galaxy backdrop** (an on/off
 toggle plus band-glow and distant-star brightness), the **fly-to nebulae** (an on/off toggle, glow
 intensity, and the generation knobs — how many and their min/max radius in light-years, which
 regenerate the field on release), the **atmosphere** (an on/off
@@ -309,13 +333,17 @@ names, never geometry.
 - **M3 — Planets & terrain** ✅ cube-sphere quadtree-LOD terrain with **ridged-multifractal mountains** + domain warp + **per-LOD band-limited detail** + **slope-aware biome colouring**, skirts, per-patch floating origin, frame-riding, descend & land with no jitter; **ocean worlds** (rugged sea floor + translucent water surface + coastlines); **moons**; **volumetric (Rayleigh + Mie) atmospheres**; **live tuning HUD** with `tuning.json` save/load
 - **M4 — Rover** ✅ drivable surface vehicle: per-planet gravity, terrain-following + slope tilt, ledge falls/landings, throttle/steer driving under a third-person chase camera (`R` to deploy/exit); arcade-grounded, pure testable sim
 - **M5 — Fidelity** (in progress) — **distant-galaxy backdrop** ✅ (a deterministic far-field dome of background stars concentrated on the galactic plane + a fullscreen Milky-Way band with dust lanes and a central bulge, drawn behind the streamed star field, with live brightness knobs saved to `tuning.json`); **smooth terrain LOD** ✅ (continuous fractional-octave detail fade + geomorphing between levels + merge hysteresis, so the surface no longer pops/rebuilds across LOD transitions); **planetary rings** ✅ (gas/ice giants get a deterministic banded annulus in their tilted equatorial plane — procedural radial bands with Cassini-like gaps, sunlit and translucent, with the planet casting a real shadow across the ring); **threaded terrain generation** ✅ (patch meshes baked on a background worker pool, uploaded on the render thread, so descending to a surface no longer stalls the frame — bakes are several× faster via one-pass fine+coarse height sampling, a shared crater field, and a speculative descent that keeps the pool saturated instead of advancing one LOD level per frame); **crisp near-surface detail** ✅ (procedural surface detail is keyed to the mesh resolution rather than the pixel footprint, so the ground stays textured right up to the camera instead of blurring out on the nearest patches); **proximity speed limiter** ✅ (continuous distance-based slowdown near stars, planets and moons — unlimited in open space, with anti-tunnelling so you can't skip through a body; stars now begin reeling you in from much farther out on a gentler dedicated approach rate, so you ease in rather than zip past); **tiled star catalog** ✅ (the foreground field is a **distance-paged lattice** of spatially-indexed star blocks — billions of stars addressable, only a few million resident, blocks generated/evicted around the camera; each star keeps a stable, invertible catalog id, so search-by-number and jump-to-star load any block on demand, and per-block re-centring removes the floating-point jitter the single block had far from the origin); **rover terrain-follow & suspension** ✅ (a CPU collision mesh of the drawn triangles pins the rover to the visible surface — no float, no LOD-feedback bounce — with ground-stick over crests/dips, plus a damped-kinematic **per-wheel suspension** so each wheel travels independently in its well while the chassis bobs and rocks); **sun glow** ✅ (the active system's star stays a bright point from across the system); **HUD toggle** ✅ (`H` hides all on-screen UI); **composition-driven atmospheres** ✅ (colour + thickness derived from the scanned chemistry — scale height from mean molar mass, Rayleigh strength from gas refractivity, absorption tint from coloured gases like methane, and a Mie haze layer from haze gases + suspended surface dust, with surface pressure modelled and shown in the scanner); **GPU terrain path (now default)** ✅ (terrain height/normal/albedo generated on the GPU instead of the CPU worker pool — a fragment pass bakes each quadtree patch into a texture tile and the vertex shader displaces the base sphere via vertex texture fetch, all on the GL 4.1 baseline with no compute shaders. It carries the full feature set: fBm continents, domain-warped ridged mountains, **eroded detail** (slope-damped fBm → carved valley floors with roughness on the ridges), **impact craters + dark maria** on airless worlds, **oceans**, and a per-pixel **orbital macro-relief** that shades the *same* mountain/crater field the tiles bake — so the ranges and craters seen from space match the surface you land on and fade out seamlessly as the real geometry resolves on approach. The CPU bake stays as a one-click HUD fallback for A/B comparison); **biome expansion** ✅ (a fuller Whittaker matrix — tundra/taiga/steppe/forest/savanna/jungle — driven by geographic moisture (latitude rain belts × orographic drying) and tinted by the scanned surface chemistry, so lifeless and alien worlds vary by mineral instead of all reading grey); **lava worlds** ✅ (real 3-D volcano cones with summit calderas baked into the terrain, plus emissive molten lava — glowing fissures in the cracked low ground and glowing vents — that glows on the night side and blooms); **city lights** ✅ (clustered emissive sodium glow on the night side of life-bearing worlds — coastal-lowland clusters that fade in from orbit); **banded gas giants** ✅ (gas/ice giants get procedural zonal latitude bands with turbulent warp, longitudinal wind streaks and a storm oval, instead of plain spheres); **eclipses** ⏸ (built — a focused world dims toward twilight, both terrain lighting and the scattered sky, when another body transits its sun, from angular-disk coverage — but shipped **disabled**: the drop to twilight was too abrupt and read as a bug; the coverage math is kept for a future gradual ramp); **planet rotation / day-night** ✗ (prototyped as a tied-to-sim-time sweep of the sun direction, then **dropped** — sweeping only the lighting left the rendered sun frozen in the sky while the ground darkened, which reads as broken, and true geometric spin is out of scope for now); **micro-relief + strata on the GPU path** ✅ (mesas and banded canyon walls plus a fine LOD-gated micro layer baked into the tiles and mirrored in the collision field — completing GPU↔CPU parity); **multi-spawner surface-object scatter** ✅ (up-close objects instanced over the terrain's own near leaves — each samples the *same* height tile the mesh displaces with, so it sits exactly on the drawn surface regardless of how far the surface sits above the base sphere on high-relief worlds, and leaves are gathered by direction around the camera's ground point rather than by an easily-fooled distance. Now a **multi-spawner** system: any number of layers (rocks/trees/pickups…), each with its own mesh, density, random per-object size and orientation — world-up, surface-normal or random tumble — and a per-spawner hash salt so layers don't land on the same vertices. Each layer is gated per world by an **environment-trait mask** (so vegetation only appears where there's life, never on airless moons) and a deterministic **spawn-chance** roll, both editable in a live add/remove HUD list and saved to `tuning.json`; placeholder meshes — cube/cone/rock/tetra — today, the foundation for real tree/grass/pickup art). See **Ideas & backlog** below for what's next.
+- **M6 — Universe of galaxies** ✅ a hierarchy above the star field. A sparse **galaxy lattice** (`GalaxyCatalog`/`GalaxyCatalogPager`) places galaxies across the observable universe at true scale; the foreground star lattice is **confined to galaxy interiors** (each `StarCatalog` block samples its host galaxy's density model — disk fall-off, spiral arms, bulge — so intergalactic space is empty). A four-tier **galaxy LOD** cross-fades by apparent size — **point** sprite → oriented **impostor disk** (bulge + spiral arms + fbm dust lanes) → **volumetric star cloud** → the real streamed catalog as you enter — capped/tuned so a galaxy cluster doesn't tank the frame rate. Each galaxy carries a **per-galaxy central black hole** and its **own nebulae** (the painted Milky-Way backdrop recedes as the real cloud takes over). **Globular clusters** dot each galaxy's halo: a fuzzy sprite resolves into a star cloud whose stars are **injected as real catalog stars** (same generator as the decorative cloud, so the hand-off is seamless) — each visitable and system-spawning, tagged on the HUD with a `GC` reticle. Top speed raised to **~100 Mly/s** with a **travel-to-galaxy** HUD list; galaxy/cluster LOD knobs persist in `tuning.json`. Smoother in-galaxy streaming too (per-block density + a temporal block fade-in, so the starfield flows in rather than popping in chunks).
 
 ## Ideas & backlog
 
 Candidate features, roughly by area — the first group is what's being built next.
 
 **Recently shipped**
-- [x] **Fly-to nebulae** — a few enormous procedurally-placed emissive gas clouds you can spot from afar, see on the galaxy map and drift through; count/size live-tunable and saved to `tuning.json`
+- [x] **Universe of galaxies** — a galaxy lattice above the star field; fly out and other galaxies resolve point → spiral/elliptical impostor (bulge + dust lanes) → volumetric star cloud → real streamed stars on entry. Stars confined to galaxy interiors; per-galaxy black hole + nebulae; ~100 Mly/s top speed + travel-to-galaxy list; LOD knobs in `tuning.json`
+- [x] **Globular clusters** — halo clusters that read as a fuzzy star from thousands of ly out (HUD `GC` reticle) and resolve into a dense ball of **real, visitable stars** (injected into the catalog; each spawns a system), with a seamless cloud→catalog hand-off
+- [x] **Smoother in-galaxy starfield** — per-block density sampling + a temporal block fade-in, so streamed stars flow in instead of arriving in chunks
+- [x] **Fly-to nebulae** — a few enormous procedurally-placed emissive gas clouds you can spot from afar, see on the galaxy map and drift through; count/size live-tunable and saved to `tuning.json`; now placed per-galaxy
 - [x] **City lights on inhabited worlds** — clustered emissive glow on the night side of life-bearing worlds
 - [x] **Banded gas giants** — procedural zonal cloud bands + a storm oval on gas/ice giants
 - [x] **Micro-relief + strata on the GPU path** — mesas and banded canyon walls (full CPU parity)

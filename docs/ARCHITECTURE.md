@@ -57,7 +57,7 @@ Engine.Core        coords, hashing/RNG, math constants        (no deps)
 Engine.Rendering   GL wrappers: Shader, Mesh, Camera, …        → Engine.Core
 Engine.Platform    GameWindow: Silk.NET window + GL + input    → Core, Rendering
 Engine.Audio       AudioEngine: OpenAL sound + music + synth    → Engine.Core
-Game.Universe      procedural generation (stars→terrain)       → Engine.Core
+Game.Universe      procedural generation (galaxies→stars→terrain) → Engine.Core
 Game.Systems       runtime lifecycle: systems, speed, fields,  → Universe, Core
                    Discovery/ (networked discovery client)
 Game.App           entry point, main loop, all renderers, HUD  → everything
@@ -290,55 +290,93 @@ The data flow, top to bottom:
 
 ```
 WorldSeed
- ├─ GalaxyModel ............ stellar-density field over the disk
- ├─ StarCatalog (per block) → Star ........ a star (id, position, class, colour…)
- │    via StarCatalogPager (streaming) / StarId (id pack) / INearestStar
+ ├─ GalaxyField ............. cosmic galaxy density
+ ├─ GalaxyCatalog (per block) → Galaxy ..... a galaxy (id, centre, type, seed, radius…)
+ │    via GalaxyCatalogPager (streaming) / GalaxyId / INearestGalaxy
+ │    └─ GalaxyModel(Galaxy) ... that galaxy's stellar density (disk/arms/bulge)
+ │    └─ GalaxyCloud(Galaxy) ... volumetric point-cloud LOD
+ │    └─ GlobularClusters.ForGalaxy(Galaxy) → GlobularCluster (halo knots)
+ ├─ StarCatalog (per block, GATED to a galaxy) → Star ..... a star
+ │    via StarCatalogPager (streaming) / StarId / INearestStar
+ │    └─ injects GlobularCluster stars where a cluster overlaps the block
  ├─ SystemGenerator(Star) → SolarSystem → Planet/Moon (: CelestialBody)
  │    └─ AtmosphereModel.Derive(body), AsteroidBelt, PlanetRing
  ├─ PlanetTerrain(body) ..... height + colour field, backed by Noise
- ├─ NebulaField ............. fly-to gas clouds
+ ├─ NebulaField(Galaxy) ..... fly-to gas clouds (per galaxy)
  └─ BackdropStars ........... direction-only sky dome
 Tuning globals: TerrainTuning · BiomeTuning · PlanetTuning · NebulaTuning · EnvTrait/Spawner
 ```
 
-### 7.1 Stars & the lattice
+### 7.1 The galaxy hierarchy & the star lattice
 
-**GalaxyModel** (sealed) — the large-scale density function.
-`GalaxyModel(ulong worldSeed)`; `double DensityAt(Vector3D<double> meters)`
-returns stars/ly³ via exponential radial+vertical falloff modulated by
-logarithmic spiral arms. Tunable fields: `BaseDensity`, `ScaleLength`,
-`ScaleHeight`, `ArmCount`, `ArmStrength`, `ArmWind`.
+The universe is a hierarchy: a sparse lattice of **galaxies**, each containing a streamed **star
+lattice**. The galaxy level mirrors the star level one tier up (catalog block + distance pager +
+packed id), so the same patterns recur.
+
+**Galaxy** (readonly struct) — `Id`, `Center` (`UniversePosition`), `Type` (`GalaxyType`
+Spiral/Elliptical/Irregular/Dwarf), `Seed`, `RadiusMeters`, `DiskNormal`, `StarCount`, `Color`, `Name`.
+
+**GalaxyField** (sealed) — the cosmic galaxy density: `double DensityAt(meters)` (≈ uniform; the
+default ~5.8e-22/ly³ gives a ~12 Mly mean separation — true scale).
+
+**GalaxyCatalog** (sealed) — one ~20 Mly lattice block; Poisson-places galaxies, and **forces the
+Milky Way at the universe origin** in block `(0,0,0)` (Spiral, 50 kly radius, seed = `WorldSeed`). Exposes `Galaxies`, `Count`, `Origin`, `BlockCoord`.
+
+**GalaxyCatalogPager** (sealed, implements `INearestGalaxy`) — `Update(in camera)` pages galaxy blocks
+(3×3×3 resident, evict at 2), tracks `Nearest` and the galaxy the camera `IsInside`/`Containing`.
+`bool TryGetGalaxyForBlock(point, boundingRadius, out Galaxy)` — which galaxy a star-lattice block
+belongs to (the gate that confines stars to galaxies). Exposes `LoadedBlocks`, `LoadedGalaxyCount`.
+
+**GalaxyId** (static) — invertible `(block, local) ↔ ulong`, like `StarId` (16 local + 3×16 axis bits).
+
+**GalaxyModel** (sealed) — **one galaxy's** stellar-density field. `GalaxyModel.For(Galaxy)` builds it
+(centre + disk normal + type-scaled shape); `DensityAtLocal(offsetFromCentre)` returns stars/ly³ via
+exponential radial+vertical fall-off × logarithmic spiral arms, zeroed beyond the galaxy radius. The
+Spiral/50 kly case reproduces the tuned Milky-Way values, so the home galaxy is unchanged.
+
+**GalaxyCloud** (static) — `float[] Generate(Galaxy, count)`: a galaxy's volumetric point cloud (disk +
+arm-biased angle + bulge), offsets-from-centre + colour + size, for the near-LOD render tier.
+
+#### Stars & the lattice (confined to galaxies)
 
 **StarId** (static) — invertible global id.
 `ulong Pack(Vector3D<long> block, int local)` /
 `void Unpack(ulong id, out block, out local)`. Layout: 21 local bits, 14 bits per
-block axis. Home block `(0,0,0)` keeps ids `0…N-1`.
+block axis. (The `(0,0,0)`-keeps-`0…N-1` claim is aspirational — the axis bias makes block 0 a fixed,
+non-zero field; ids are simply stable and invertible.)
 
-**StarCatalog** (sealed) — one 350 ly cube of stars with a spatial grid.
-`StarCatalog(GalaxyModel, Vector3D<long> blockCoord)` generates deterministically;
-`bool TryGetLocal(int, out Star)`; `void Collect(in camera, radius, List<Star>
-visible, ref bestSq, ref nearest, ref hasNearest)` gathers stars in range and
-tracks the nearest across blocks. Exposes `Stars`, `Count`, `Origin`, `BlockCoord`.
+**StarCatalog** (sealed) — one 350 ly cube of stars with a spatial grid, **populated from the host
+galaxy**. `StarCatalog(Galaxy, Vector3D<long> blockCoord)` samples the galaxy's density once at the
+block centre and places that many stars (macro disk/arm/edge structure emerges from per-block density);
+`StarCatalog(Vector3D<long>)` is the empty (intergalactic) block. It also **injects globular-cluster
+stars** where a halo cluster overlaps the block (`CollectClusterStars`, shared per-star generator with
+`GlobularClusters.Stars`), so cluster stars are real catalog stars. `bool TryGetLocal(int, out Star)`;
+`void Collect(in camera, radius, …)` gathers stars in range + tracks the nearest. Exposes `Stars`,
+`Count`, `Origin`, `BlockCoord`.
 
 **StarCatalogPager** (sealed, the live source — implements `INearestStar`).
-`StarCatalogPager(GalaxyModel)`; `void Update(in camera, double trackRadiusMeters)`
-loads blocks within 1 Chebyshev block (camera's own block synchronously, the rest
-off-thread) and evicts beyond 2; rebuilds `Visible` + `Nearest`.
-`bool TryGetStar(ulong id, out Star)` loads any star's block on demand (the
-find-by-number feature). `StarCatalog EnsureLoaded(Vector3D<long>)`. Exposes
-`Visible`, `LoadedBlocks`, `LoadedBlockCount`, `LoadedStarCount`, `HasNearest`,
-`Nearest`, `NearestDistanceMeters`.
+`StarCatalogPager(GalaxyCatalogPager)`; `void Update(in camera, double trackRadiusMeters)`
+resolves each block's galaxy (on the main thread, captured into the off-thread gen), loads blocks
+within 1 Chebyshev block and evicts beyond 2; blocks with no galaxy are empty. Rebuilds `Visible` +
+`Nearest`. `bool TryGetStar(ulong id, out Star)` loads any star's block on demand (find-by-number).
+`StarCatalog EnsureLoaded(Vector3D<long>)`. Exposes `Visible`, `LoadedBlocks`, `LoadedBlockCount`,
+`LoadedStarCount`, `HasNearest`, `Nearest`, `NearestDistanceMeters`.
 
 **Star** (readonly struct) — `Id`, `Position`, `Temperature`, `Luminosity`,
 `MassSolar`, `RadiusMeters`, `Class` (`SpectralClass` M…O), `Color` (from
 `Blackbody.ColorOf`), plus `SizeCue`, `ClassLetter`, `Designation`.
+
+**GlobularCluster** (readonly struct) + **GlobularClusters** (static) — `ForGalaxy(Galaxy)` places
+~200 clusters in a galaxy's spheroidal outer halo (40–200 ly across); `StarRng(c,i)` + `StarOffset` is
+the **shared per-star generator** used by both the decorative cloud (`Stars(c)`) and the catalog
+injection, so the resolved cloud and the real stars co-locate. `FloatsPerStar = 7`.
 
 **BackdropStars** (sealed) — `BackdropStars(ulong worldSeed, int count = 9000)`
 builds an interleaved `float[]` (`FloatsPerStar = 7`: dir3+colour3+size) of
 direction-only distant stars concentrated on the galactic plane.
 
 **StarField** (legacy infinite cell-streamer, also `INearestStar`) — superseded by
-the pager; retained as a fallback.
+the pager; retained for tests + `SampleStarType`.
 
 ### 7.2 Systems & bodies
 
@@ -400,12 +438,13 @@ which is what makes terrain LOD pop-free.
 
 ### 7.4 Nebulae
 
-**NebulaField** (sealed): `NebulaField(ulong worldSeed, int count = -1)` — `-1`
-reads `NebulaTuning.Count`. Scatters clouds over ±6000 ly radially / ±1800 ly
-vertically (sqrt-radius for uniform area, power-biased height toward the plane);
-radius drawn from `[NebulaTuning.MinRadiusLy, MaxRadiusLy]` (clamped so the range
-can't invert); colour from an emission palette + jitter. Exposes
-`IReadOnlyList<Nebula> Nebulae`.
+**NebulaField** (sealed): `NebulaField(Galaxy galaxy, int count = -1)` — placed in **that galaxy's**
+disk frame (centre + disk normal, seeded from `galaxy.Seed`), so every galaxy has its own nebulae; the
+parameterless ctor is the empty (intergalactic) field. Scatters clouds over the inner disk (~12% of the
+galaxy radius, thin vertical spread; sqrt-radius for uniform area, power-biased height toward the
+plane); radius drawn from `[NebulaTuning.MinRadiusLy, MaxRadiusLy]` (clamped so the range can't invert);
+colour from an emission palette + jitter. Exposes `IReadOnlyList<Nebula> Nebulae`. (`Program` rebuilds
+the field when the camera enters a different galaxy.)
 
 **Nebula** (readonly struct): `Position`, `RadiusMeters`, `Color`, `Seed`, `Name`.
 
@@ -490,8 +529,9 @@ three phases.
 
 ### 9.1 OnLoad — construction order
 
-Camera + `FreeFlyController` → `StarCatalogPager`/`StarRenderer` → `GalaxyBackdrop`
-→ `NebulaField`/`NebulaRenderer` → `SolarSystemManager`/`SystemRenderer` →
+Camera + `FreeFlyController` → `GalaxyCatalogPager` → `StarCatalogPager`(galaxyPager)/`StarRenderer`
+→ `GalaxyRenderer`/`GlobularClusterRenderer` → `GalaxyBackdrop`
+→ `NebulaField`(empty)/`NebulaRenderer` → `SolarSystemManager`/`SystemRenderer` →
 terrain (`PlanetTerrainRenderer`, tile cache, `ScatterRenderer`, `PlanetSurfaceMap`)
 → rover, asteroid/glow/grid/black-hole renderers → atmosphere/cloud →
 framebuffers (`SceneFramebuffer`, `ColorTarget`, `BloomRenderer`) → `ImGuiController`,
@@ -509,6 +549,7 @@ Tuning ▸ Audio panel. Music is skipped in `--smoke` runs.
 
 Edge-detected key toggles (Tab capture, F scanner, R rover, H HUD, P grid, M/N
 maps, B/J jumps, Space pause, `,`/`.` time-lapse) → if not driving/orbiting,
+`_galaxyPager.Update(camera)` (then rebuild nebulae + globular clusters if the host galaxy changed) →
 `_controller.Update(dt)` → `_starPager.Update` → `_asteroidFields.Update` →
 `_systemManager.Update(dt, camera, _starPager)` → rover step *or* carry the camera
 along a moving body's frame → `PickTerrainTarget()` sets the terrain body and
@@ -525,11 +566,13 @@ can fit its own near/far for precision.
 
 ```
 SceneFramebuffer.Bind(); clear color+depth
-  backdrop.Render(camera)                       // Milky-Way band + dome stars (additive, no depth)
+  backdrop.ExternalDim = …; backdrop.Render(camera)  // painted sky; recedes when a real galaxy cloud is up
+  galaxyRenderer.Render(camera, galaxyPager)    // other galaxies: point → impostor → cloud (additive)
   nebulaRenderer.Render(camera, nebulaField)    // fly-to clouds (additive, no depth)
-  starRenderer.SyncBlocks(...); RenderCatalog(camera, activeStarId)
+  starRenderer.SyncBlocks(..., clock); RenderCatalog(camera, activeStarId)   // per-block temporal fade-in
+  globularRenderer.Render(camera, viewportH)    // halo clusters: fuzzy sprite ↔ resolved star cloud
   [deep-space asteroids, fitted projection];  clear depth
-  galacticGrid.Render(camera) [if on];  blackHole.Render(camera);  clear depth
+  galacticGrid.Render(camera) [if on];  if inside a galaxy: blackHole.Render(camera, galaxy.Center);  clear depth
   if active system:
      surfaceMap.Request/Update                  // bakes the focused body's albedo/normal
      systemRenderer.Render(camera, system, terrainTarget, surfaceMap)
@@ -542,7 +585,8 @@ SceneFramebuffer.BlitColorTo(postFbo)
   cloudRenderer.Render(... depthTex, near, far ...)     // raymarched, depth-clamped
   atmosphereRenderer.Render(... depthTex, near, far ...) // volumetric scattering
 bloom.Render(postFbo.ColorTexture); bloom.Composite(scene, bloom)   // to screen
-HUD: overlay.Draw + DrawHud/DrawTuning/DrawScanner/DrawSystemMap/DrawGalaxyMap; imgui.Render()
+HUD: overlay.Draw + overlay.DrawGlobularReticles(camera, globularRenderer.Marks)
+     + DrawHud/DrawTuning/DrawScanner/DrawSystemMap/DrawGalaxyMap; imgui.Render()
 ```
 
 ### 9.4 Renderers (key entry points)
@@ -551,8 +595,10 @@ All take `Camera` and compute camera-relative geometry; most fit their own near/
 
 | Renderer | Entry point | Draws |
 |---|---|---|
-| **StarRenderer** | `RenderCatalog(camera, ulong? excludeId)`, `SyncBlocks(loadedBlocks)`, `Render(camera, visible, bubbleMeters, excludeId)` | additive point sprites; magnitude falloff `bright·flux^gamma`; skips the active sun. Tunables: `CatBrightScale/Gamma/SizeScale`, min/max size |
-| **GalaxyBackdrop** | `Render(camera)` | fullscreen band (fBm dust + arms + bulge), 6 painted nebula patches, dome stars. `Enabled`, `BandBrightness`, `StarBrightness`, `NebulaBrightness` |
+| **StarRenderer** | `RenderCatalog(camera, ulong? excludeId)`, `SyncBlocks(loadedBlocks, now)`, `Render(camera, visible, bubbleMeters, excludeId)` | additive point sprites; magnitude falloff `bright·flux^gamma`; **per-block temporal fade-in** (streamed blocks ramp in over ~0.7 s, no chunk-pop); skips the active sun. Tunables: `CatBrightScale/Gamma/SizeScale`, min/max size |
+| **GalaxyRenderer** | `Render(camera, galaxyPager)` | other galaxies, cross-faded by apparent size: **point** sprite → oriented **impostor disk** (bulge + spiral arms + fbm dust lanes, capped to the nearest few) → **volumetric cloud** (`GalaxyCloud`, nearest 1, async-cached, near-faded to the catalog). Skips the galaxy you're inside. Tunables: point/impostor/cloud brightness, sizes, cloud point scale |
+| **GlobularClusterRenderer** | `SetClusters(GlobularCluster[])`, `Render(camera, viewportH)` | halo clusters cross-faded by apparent size: **fuzzy sprite** (positioned, sized by angular radius) ↔ **resolved star cloud** (async-cached, near-faded to the real injected catalog stars); exposes `Marks` for the HUD reticle. `SpriteBrightness`, `CloudBrightness`, `CloudPointScale` |
+| **GalaxyBackdrop** | `Render(camera)` | fullscreen band (fBm dust + arms + bulge), 6 painted nebula patches, dome stars. `ExternalDim` (set per-frame — recedes once a real galaxy cloud is on screen). `Enabled`, `BandBrightness`, `StarBrightness`, `NebulaBrightness` |
 | **NebulaRenderer** | `Render(camera, NebulaField)` | additive fBm billboards, fade-on-entry; wide depth-irrelevant projection. `Enabled`, `Intensity` |
 | **SystemRenderer** | `Render(camera, system, terrainBody?, map?)` | emissive sun, lit planets/moons (procedural relief/craters/maria or gas bands, or the baked map for the focused body), banded rings + planet shadow, faint orbit rings. `LastNear/LastFar` feed atmosphere |
 | **PlanetTerrainRenderer** | `Render(camera, sunDir, renderClock, map)`; `SetBody(body)`, `FocusPoint`, `Rebuild()`, `TrySurfaceHeight(dir, out h)` | cube-sphere quadtree LOD with geomorph; GPU tile path by default (`TerrainTileGenerator`/`TerrainTileCache` bake height/normal/albedo into an atlas; vertex texture fetch displaces). Counts: `PatchCount`, `LeafCount`, `GrassLeaves` |
@@ -563,7 +609,7 @@ All take `Camera` and compute camera-relative geometry; most fit their own near/
 | **SceneFramebuffer** | `Bind()`, `BlitColorTo(fbo)`, `DepthTexture`, `Resize` | offscreen colour + sampleable depth |
 | **AsteroidRenderer** | `Render(camera, instances, viewProj, sunRel, hasSun, viewportH)`; `static FitProjection(...)` | hybrid LOD: 3D tumbling rocks ↔ point sprites, cross-faded |
 | **PlanetGlowRenderer** | `Render(camera, system, viewportH, terrainBody)`, `RenderStar(...)` | additive distance-scaled body markers that hand off to the real disk |
-| **BlackHoleRenderer** | `Render(camera)` | event-horizon sphere + photon ring + banded, beamed accretion disk |
+| **BlackHoleRenderer** | `Render(camera, UniversePosition center)` | the host galaxy's central SMBH (event-horizon sphere + photon ring + banded, beamed accretion disk); drawn only when inside a galaxy, at its centre |
 | **RoverRenderer** | `Render(camera, bodyPos, forward, up, wheelTravel, sunDir, near, far)` | chassis + 4 independently-sprung wheels |
 | **GalacticGridRenderer** | `Render(camera)` | faint galactic-plane reference grid |
 
@@ -591,15 +637,16 @@ testable.
 
 ### 9.6 TuningConfig — persistence
 
-A serializable snapshot of every live knob (backdrop incl. `NebulaCount`/
-`NebulaMinRadiusLy`/`NebulaMaxRadiusLy`, atmosphere, terrain globals, biome,
-per-type overrides, scatter spawners).
+A serializable snapshot of every live knob (the **galaxy LOD** renderer — point/impostor/cloud
+brightness, sizes, cloud point scale; backdrop incl. `NebulaCount`/`NebulaMinRadiusLy`/
+`NebulaMaxRadiusLy`; atmosphere; terrain globals; biome; per-type overrides; scatter spawners).
+Old `tuning.json` files without the galaxy fields load to the matching defaults.
 
 ```csharp
-static TuningConfig Capture(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s)
-void Apply(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s)
-static bool Save(a, b, s, string path)     // → tuning.json
-static bool Load(a, b, s, string path)     // ← tuning.json, then Apply
+static TuningConfig Capture(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, GalaxyRenderer g)
+void Apply(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, GalaxyRenderer g)
+static bool Save(a, b, s, g, string path)     // → tuning.json
+static bool Load(a, b, s, g, string path)     // ← tuning.json, then Apply
 ```
 
 `Capture` reads live renderer state + the static tuning classes; `Apply` writes
@@ -611,11 +658,13 @@ captures and writes it. Because nebula count/radius are generation inputs,
 ### 9.7 HUD / overlays
 
 `StarOverlay.Draw(camera, pager, systems, searchTarget?)` paints reticles, labels
-and the nearest-star arrow. ImGui panels: `DrawHud` (position/speed/FPS/system,
-find-star box), `DrawTuning` (all sliders + save/load, including the **Audio** panel:
-master/music/sfx volume, music on/off, Test-SFX — see §6), `DrawScanner` (body / star
-/ sector readout, F), `DrawSystemMap` (top-down system, M, with nebula disks and
-click-to-travel), `DrawGalaxyMap`/3D neighbourhood (N).
+and the nearest-star arrow; `DrawGlobularReticles(camera, marks)` adds a `GC` bracket reticle +
+distance on each in-range globular cluster (projected by direction, since clusters sit past the far
+plane). ImGui panels: `DrawHud` (position/speed/FPS/system, the **galaxy/cluster** status line, a
+**travel-to-galaxy** list, find-star box), `DrawTuning` (all sliders + save/load, including the
+**Galaxies (LOD)** and **Globular clusters** sections and the **Audio** panel: master/music/sfx volume,
+music on/off, Test-SFX — see §6), `DrawScanner` (body / star / sector readout, F), `DrawSystemMap`
+(top-down system, M, with nebula disks and click-to-travel), `DrawGalaxyMap`/3D neighbourhood (N).
 
 ---
 
@@ -685,8 +734,13 @@ decimal ids render exactly). See [server/README.md](../server/README.md) for dep
   renderer), add a slider in `DrawTuning`, and add it to `TuningConfig`'s
   `Capture`/`Apply` (+ a DTO field) so it persists. If it's a *generation* input,
   rebuild the affected object after `Load` — see the nebula precedent in §9.6.
-- **Query the nearest star/body:** depend on `INearestStar` (the pager), not a
-  concrete field, so legacy/streamed sources are interchangeable.
+- **Query the nearest star/body/galaxy:** depend on `INearestStar` / `INearestGalaxy`
+  (the pagers), not a concrete field, so legacy/streamed sources are interchangeable.
+- **Render at galaxy scale:** camera-relative positions reach ~1e22 m, where a `float`
+  component *squared* overflows (`>3.4e38`). Do every length/normalize/delta in `double`
+  (or scale before `length()` in a shader, e.g. `length(world*1e-18)*1e18`) and cast only the
+  small/unit result to `float`. Things past the far plane (galaxies, clusters) render
+  direction-only on a dome radius or with a dedicated wide-far-plane projection (additive, depth off).
 - **Play a sound or music:** load a WAV (`_audio.LoadSound`/`WavLoader`) or synth a
   clip, then `PlaySound` (UI, head-relative) / `PlaySoundAt(sound, camRel)` (in-world,
   pass `body.CurrentPosition.ToCameraRelative(camera.Position)`) / `PlayMusic`. Guard
