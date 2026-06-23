@@ -56,6 +56,29 @@ public sealed class GalaxyCatalogPager : INearestGalaxy
     }
 
     /// <summary>
+    /// Find the resident galaxy whose volume overlaps a sphere of <paramref name="boundingRadiusMeters"/>
+    /// around <paramref name="point"/> — i.e. which galaxy a star-lattice block belongs to. Returns the
+    /// nearest such galaxy (overlaps are rare at true scale). False ⇒ intergalactic space (no stars).
+    /// Call on the main thread; the result <see cref="Galaxy"/> is a value type, safe to hand to a
+    /// background generation task.
+    /// </summary>
+    public bool TryGetGalaxyForBlock(in UniversePosition point, double boundingRadiusMeters, out Galaxy galaxy)
+    {
+        bool found = false;
+        double bestSq = double.MaxValue;
+        Galaxy best = default;
+        foreach (GalaxyCatalog block in _loaded.Values)
+            foreach (Galaxy g in block.Galaxies)
+            {
+                double reach = g.RadiusMeters + boundingRadiusMeters;
+                double dSq = g.Center.DistanceSquaredTo(point);
+                if (dSq <= reach * reach && dSq < bestSq) { bestSq = dSq; best = g; found = true; }
+            }
+        galaxy = best;
+        return found;
+    }
+
+    /// <summary>
     /// Page galaxy blocks around the camera (load near, evict far), then rebuild the nearest galaxy and
     /// the containing galaxy. Cheap to call every frame.
     /// </summary>

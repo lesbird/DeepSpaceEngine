@@ -39,8 +39,11 @@ public sealed class StarCatalog
     public IReadOnlyList<Star> Stars => _stars;
     public int Count => _stars.Length;
 
-    /// <summary>Generate the block at <paramref name="blockCoord"/> of the lattice.</summary>
-    public StarCatalog(GalaxyModel galaxy, Vector3D<long> blockCoord)
+    /// <summary>Generate the block at <paramref name="blockCoord"/> of the lattice, populated from the
+    /// density of the <paramref name="galaxy"/> that overlaps it. Stars are sampled across the block
+    /// and kept with probability proportional to the galaxy's density at their position, so the disk,
+    /// arms and edge fall-off all emerge and a block beyond the galaxy's reach ends up empty.</summary>
+    public StarCatalog(Galaxy galaxy, Vector3D<long> blockCoord)
     {
         BlockCoord = blockCoord;
         SideMeters = BlockSideLy * MathUtil.LightYear;
@@ -49,12 +52,7 @@ public sealed class StarCatalog
         double side = SideMeters;
         Origin = UniversePosition.FromMeters(blockCoord.X * side, blockCoord.Y * side, blockCoord.Z * side);
 
-        // Uniform density → a fixed star count per block (so every block is the same size on the
-        // lattice). Clamp to the id layout's per-block capacity.
-        int count = (int)Math.Round(Math.Max(galaxy.BaseDensity, 1e-6) * BlockSideLy * BlockSideLy * BlockSideLy);
-        count = Math.Clamp(count, 1, StarId.MaxLocal);
-
-        _stars = Generate(galaxy, blockCoord, count, Origin, _halfMeters);
+        _stars = Generate(galaxy, blockCoord, Origin, _halfMeters);
 
         // Grid cells ~6 ly across: a handful of stars each, so a ~25 ly query touches a small
         // neighbourhood of cells.
@@ -63,31 +61,62 @@ public sealed class StarCatalog
         (_cellStart, _cellItems) = BuildGrid(_stars, Origin, _gridDim, _cellMeters, _halfMeters);
     }
 
-    private static Star[] Generate(GalaxyModel galaxy, Vector3D<long> block, int count,
-        in UniversePosition origin, double half)
+    /// <summary>An empty block: intergalactic space, where no galaxy overlaps. Carries no stars and a
+    /// trivial 1-cell grid, so it's cheap to keep resident as a "checked, nothing here" marker.</summary>
+    public StarCatalog(Vector3D<long> blockCoord)
     {
-        // Seed from the block coordinate so each block is independent yet reproducible.
-        ulong seed = Hashing.HashCell(block.X, block.Y, block.Z, galaxy.WorldSeed);
+        BlockCoord = blockCoord;
+        SideMeters = BlockSideLy * MathUtil.LightYear;
+        _halfMeters = SideMeters * 0.5;
+        double side = SideMeters;
+        Origin = UniversePosition.FromMeters(blockCoord.X * side, blockCoord.Y * side, blockCoord.Z * side);
+
+        _stars = Array.Empty<Star>();
+        _gridDim = 1;
+        _cellMeters = SideMeters;
+        _cellStart = new int[] { 0, 0 };
+        _cellItems = Array.Empty<int>();
+    }
+
+    private static Star[] Generate(Galaxy galaxy, Vector3D<long> block, in UniversePosition origin, double half)
+    {
+        GalaxyModel model = GalaxyModel.For(galaxy);
+
+        // Candidate count from the galaxy's PEAK density (so the acceptance probability below is always
+        // ≤ 1); each candidate is then kept with probability density(pos)/peak. Near the centre that's
+        // ~1 (full neighbourhood density, matching the old uniform field); out in the disk it tapers
+        // with the exponential fall-off, so the arms and the galaxy edge emerge for free.
+        double peak = Math.Max(model.PeakDensity, 1e-12);
+        int candidates = (int)Math.Round(peak * BlockSideLy * BlockSideLy * BlockSideLy);
+        candidates = Math.Clamp(candidates, 0, StarId.MaxLocal);
+
+        // Seed from the block coordinate AND the galaxy seed, so each galaxy's lattice is distinct.
+        ulong seed = Hashing.HashCell(block.X, block.Y, block.Z, galaxy.Seed);
         var rng = new DeterministicRng(Hashing.Combine(seed, 0xCA7A106UL));
-        var stars = new Star[count];
-        for (int i = 0; i < count; i++)
+
+        var stars = new List<Star>(Math.Min(candidates, 4096));
+        for (int i = 0; i < candidates; i++)
         {
-            // Uniform placement in the cube. At neighbourhood density this is a Poisson process,
-            // so stars naturally land light-years apart and effectively never overlap.
+            // Uniform candidate placement in the cube. (Draw order is fixed — position, then the
+            // acceptance roll — so the stream stays deterministic regardless of which are kept.)
             double x = rng.Range(-half, half);
             double y = rng.Range(-half, half);
             double z = rng.Range(-half, half);
+            double roll = rng.NextDouble();
+
             UniversePosition pos = origin.Translated(new Vector3D<double>(x, y, z));
+            double d = model.DensityAtLocal(pos.DeltaMeters(galaxy.Center));
+            if (roll * peak >= d) continue; // reject: keeps with probability d/peak
 
             StarField.SampleStarType(ref rng, out float temp, out float lum, out float mass,
                 out double radius, out SpectralClass cls);
 
             // Global id packs (block, local index): unique and deterministic, so downstream system
             // and belt seeds (which run it through Mix64) still produce well-varied systems, and the
-            // "find #N" box can unpack it back to a block + index.
-            stars[i] = new Star(StarId.Pack(block, i), pos, temp, lum, mass, radius, cls);
+            // "find #N" box can unpack it back to a block + index. Kept stars get sequential indices.
+            stars.Add(new Star(StarId.Pack(block, stars.Count), pos, temp, lum, mass, radius, cls));
         }
-        return stars;
+        return stars.ToArray();
     }
 
     private static (int[] start, int[] items) BuildGrid(Star[] stars, in UniversePosition origin,

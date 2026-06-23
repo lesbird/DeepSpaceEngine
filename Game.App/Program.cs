@@ -193,8 +193,8 @@ internal static class Program
         // saved position exists, so a fresh install opens here but returning players resume in place.
         ResetToHome();
 
-        _starPager = new StarCatalogPager(new GalaxyModel(WorldSeed));
         _galaxyPager = new GalaxyCatalogPager(new GalaxyField(WorldSeed));
+        _starPager = new StarCatalogPager(_galaxyPager); // stars are confined to the galaxies it streams
         _starRenderer = new StarRenderer(_gl);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
         _nebulaField = new NebulaField(WorldSeed);
@@ -340,6 +340,11 @@ internal static class Program
 
     private static void OnUpdate(double dt)
     {
+        // Resolve the galaxy lattice first: the star pager confines star generation to whichever galaxy
+        // contains/overlaps the camera, so its resident galaxies must be current before it runs (here
+        // and in the smoke jump below). Galaxies are enormous, so a frame's motion is negligible.
+        _galaxyPager.Update(_camera.Position);
+
         if (_smoke && _smokeFrames == 0)
         {
             // Headless: jump next to the nearest star so the spawn/generate/render path runs. The
@@ -426,7 +431,6 @@ internal static class Program
 
         if (!_driving && !_galaxy3DVisible) _controller.Update(dt); // ship is frozen while orbiting the 3D map
         _starPager.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
-        _galaxyPager.Update(_camera.Position);
         _asteroidFields.Update(_camera.Position, AsteroidFieldRadiusCells);
         _systemManager.Update(dt, _camera.Position, _starPager);
 

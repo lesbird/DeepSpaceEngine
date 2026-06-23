@@ -234,6 +234,7 @@ void main() {
         foreach (StarCatalog block in loaded)
         {
             if (uploads >= CatUploadsPerFrame) break;
+            if (block.Count == 0) continue; // empty (intergalactic) block — nothing to draw
             if (_catBlocks.ContainsKey(block.BlockCoord)) continue;
             UploadBlock(block);
             uploads++;

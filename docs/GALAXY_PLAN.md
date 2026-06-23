@@ -144,8 +144,19 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
   galaxy you're inside (green) or nearest galaxy + Mly distance. Note: `GalaxyId` uses `AxisBias`
   like `StarId`, so the Milky Way's id is a fixed opaque value, **not** 0 (both classes' "keeps
   id 0" doc claims are aspirational). No star-generation or rendering change yet.
-- **Phase 1** — Gate star generation to galaxies; per-galaxy `GalaxyModel`. Verify the Milky Way
-  looks the same as today and intergalactic space goes empty.
+- **Phase 1 — DONE 2026-06-23** (build + 83 tests green; pending on-device verify). `GalaxyModel`
+  is now **per-galaxy** (center + disk normal + radial cutoff; `DensityAtLocal(offset)` for precise
+  galaxy-relative sampling; `GalaxyModel.For(Galaxy)` maps type+radius→shape, and the Spiral/50 kly
+  case reproduces the tuned Milky-Way values exactly). `StarCatalog` takes a `Galaxy` and
+  **acceptance-samples** candidates against `density/peak`, so the disk/arms/edge emerge and blocks
+  beyond a galaxy's reach come out empty; a second `StarCatalog(blockCoord)` ctor makes a cheap
+  empty (intergalactic) block. `StarCatalogPager` now takes the `GalaxyCatalogPager`, resolves each
+  block's galaxy on the main thread (value-type `Galaxy` captured into the async gen task) and falls
+  back to empty when none overlaps. `StarRenderer.SyncBlocks` skips 0-star blocks. `Program` builds
+  the galaxy pager first and updates it before the star pager each frame. Net effect: the Milky Way
+  near home is unchanged (now with subtle arm structure); fly out past ~50 kly and the star field
+  fades to empty intergalactic space. NOTE: star ids change vs the old uniform field (acceptance
+  sampling + galaxy-seeded blocks) — old discovery records won't match new ids (universe regen).
 - **Phase 2** — `GalaxyRenderer` **point-sprite tier**. *First "wow": fly out, see other galaxies
   as bright stars.*
 - **Phase 3** — Galaxy **impostor / billboard** LOD (shape resolves on approach).

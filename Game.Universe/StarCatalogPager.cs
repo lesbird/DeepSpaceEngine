@@ -23,8 +23,9 @@ public sealed class StarCatalogPager : INearestStar
     private const int LoadRadiusBlocks = 1;   // 3×3×3 resident around the camera
     private const int EvictRadiusBlocks = 2;
 
-    private readonly GalaxyModel _galaxy;
+    private readonly GalaxyCatalogPager _galaxies;
     private readonly double _sideMeters;
+    private readonly double _blockBoundingRadius; // bounding-sphere radius of one block (half-diagonal)
 
     private readonly Dictionary<Vector3D<long>, StarCatalog> _loaded = new();
     private readonly HashSet<Vector3D<long>> _pending = new();
@@ -46,10 +47,22 @@ public sealed class StarCatalogPager : INearestStar
     /// <summary>Edge length of one lattice block (metres) — also the spacing of block centres.</summary>
     public double BlockSideMeters => _sideMeters;
 
-    public StarCatalogPager(GalaxyModel galaxy)
+    public StarCatalogPager(GalaxyCatalogPager galaxies)
     {
-        _galaxy = galaxy;
+        _galaxies = galaxies;
         _sideMeters = StarCatalog.BlockSideLy * MathUtil.LightYear;
+        _blockBoundingRadius = _sideMeters * 0.5 * Math.Sqrt(3.0);
+    }
+
+    /// <summary>Build a block, populated from whichever galaxy overlaps it or empty if none (intergalactic).
+    /// The galaxy is resolved here on the caller's thread; the returned generation may then run anywhere.</summary>
+    private StarCatalog MakeBlock(Vector3D<long> coord)
+    {
+        UniversePosition center = UniversePosition.FromMeters(
+            coord.X * _sideMeters, coord.Y * _sideMeters, coord.Z * _sideMeters);
+        return _galaxies.TryGetGalaxyForBlock(center, _blockBoundingRadius, out Galaxy g)
+            ? new StarCatalog(g, coord)
+            : new StarCatalog(coord);
     }
 
     /// <summary>The lattice block a world position falls in (blocks are centred on lattice points).</summary>
@@ -82,10 +95,12 @@ public sealed class StarCatalogPager : INearestStar
         if (!_loaded.ContainsKey(camBlock))
         {
             _pending.Remove(camBlock);
-            _loaded[camBlock] = new StarCatalog(_galaxy, camBlock);
+            _loaded[camBlock] = MakeBlock(camBlock);
         }
 
-        // Request any not-yet-resident block within the load radius (off-thread generation).
+        // Request any not-yet-resident block within the load radius (off-thread generation). The
+        // galaxy is resolved HERE on the main thread (the galaxy dictionary isn't thread-safe) and the
+        // value-type result captured into the task, which then does the heavy star generation.
         for (long dx = -LoadRadiusBlocks; dx <= LoadRadiusBlocks; dx++)
         for (long dy = -LoadRadiusBlocks; dy <= LoadRadiusBlocks; dy++)
         for (long dz = -LoadRadiusBlocks; dz <= LoadRadiusBlocks; dz++)
@@ -94,7 +109,10 @@ public sealed class StarCatalogPager : INearestStar
             if (_loaded.ContainsKey(coord) || _pending.Contains(coord)) continue;
             _pending.Add(coord);
             Vector3D<long> c = coord;
-            Task.Run(() => _ready.Enqueue(new StarCatalog(_galaxy, c)));
+            UniversePosition center = UniversePosition.FromMeters(
+                c.X * _sideMeters, c.Y * _sideMeters, c.Z * _sideMeters);
+            bool has = _galaxies.TryGetGalaxyForBlock(center, _blockBoundingRadius, out Galaxy g);
+            Task.Run(() => _ready.Enqueue(has ? new StarCatalog(g, c) : new StarCatalog(c)));
         }
 
         // Evict blocks that have drifted past the evict radius (Chebyshev distance in blocks).
@@ -137,7 +155,7 @@ public sealed class StarCatalogPager : INearestStar
     public StarCatalog EnsureLoaded(Vector3D<long> coord)
     {
         if (_loaded.TryGetValue(coord, out StarCatalog? cat)) return cat;
-        cat = new StarCatalog(_galaxy, coord);
+        cat = MakeBlock(coord);
         _pending.Remove(coord);
         _loaded[coord] = cat;
         return cat;
