@@ -27,10 +27,10 @@ namespace Game.App;
 public sealed class GalaxyRenderer : IDisposable
 {
     public bool Enabled = true;
-    public float Brightness = 1.8f;          // point sprites
-    public float SizeScale = 16.0f;
-    public float MinSizePx = 4.0f;
-    public float MaxSizePx = 28.0f;
+    public float Brightness = 2.2f;          // point sprites
+    public float SizeScale = 22.0f;
+    public float MinSizePx = 6.0f;
+    public float MaxSizePx = 30.0f;
     public float ImpostorBrightness = 1.3f;  // impostor disks
     public float CloudBrightness = 1.0f;     // volumetric clouds
     public float CloudPointScale = 2.5f;     // size multiplier on cloud points (fewer, larger = cheaper)
@@ -47,6 +47,11 @@ public sealed class GalaxyRenderer : IDisposable
     private const float RatioHi = 0.040f;
     private const float CloudLo = 0.300f;   // ~3 radii out, cloud begins to take over
     private const float CloudHi = 0.700f;   // ~1.4 radii out, cloud is the whole galaxy
+
+    // When the camera is inside a galaxy, its own stars wash the sky out, so distant external galaxies
+    // fade and only the near/bright ones survive. ExtGateCue is the apparent-brightness cue at which a
+    // galaxy is fully kept while you are deep inside another galaxy; fainter galaxies fade out below it.
+    private const float ExtGateCue = 0.55f;
 
     private const float PointDomeRadius = 1.0e15f;
     private const float ImpostorRenderDist = 1.0e14f;
@@ -97,7 +102,11 @@ out vec4 FragColor;
 void main() {
     vec2 c = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(c, c);
-    float a = exp(-r2 * 2.5) * smoothstep(1.0, 0.35, r2);
+    // Fuzzy galaxy: a soft Gaussian core plus a wide low falloff halo, so a distant galaxy reads as a
+    // diffuse smudge rather than a hard pixel. Low exponents = soft, bloomy edge out to the sprite rim.
+    float core = exp(-r2 * 3.2);
+    float halo = exp(-r2 * 0.9);
+    float a = (core + 0.45 * halo) * smoothstep(1.0, 0.05, r2);
     FragColor = vec4(vColor * (vBright * uBrightness), 1.0) * a;
 }";
 
@@ -248,6 +257,16 @@ void main() {
 
         ulong? exclude = galaxies.IsInside ? galaxies.Containing.Id : null;
 
+        // How deep inside a galaxy the camera is (0 = intergalactic / at the rim, 1 = well inside). Drives
+        // the external-galaxy fade: outside, every galaxy shows; the deeper in, the more the faint distant
+        // ones recede until only the near/bright ones remain. Leaving a galaxy reverses it (they fade in).
+        float insideAmount = 0f;
+        if (galaxies.IsInside && galaxies.Containing.RadiusMeters > 0)
+        {
+            double d = galaxies.Containing.Center.DeltaMeters(camera.Position).Length;
+            insideAmount = Smoothstep(1.0f, 0.55f, (float)(d / galaxies.Containing.RadiusMeters));
+        }
+
         int n = 0;
         _impostors.Clear();
         _cloudJobs.Clear();
@@ -264,24 +283,30 @@ void main() {
                 var relF = new Vector3D<float>((float)rel.X, (float)rel.Y, (float)rel.Z);
 
                 double ratio = g.RadiusMeters / distM;
+                double distLy = distM / MathUtil.LightYear;
+                float cue = (float)(Math.Sqrt(g.StarCount / RefStarCount) * (RefDistLy / distLy));
+
+                // Inside-a-galaxy fade: keep is 1 in intergalactic space; the deeper inside a galaxy you
+                // are, the more this gates external galaxies by apparent brightness (faint → fades out).
+                float gate = Smoothstep(0f, ExtGateCue, cue);
+                float keep = 1f - insideAmount * (1f - gate);
+
                 float impostorMix = Smoothstep(RatioLo, RatioHi, (float)ratio);
                 float cloudMix = Smoothstep(CloudLo, CloudHi, (float)ratio);
                 bool isInside = exclude is { } ex && g.Id == ex;
 
                 // --- Cloud (renders for the galaxy you're inside too, near-faded) ---
                 if (cloudMix > 0.001f)
-                    _cloudJobs.Add(new CloudJob { Galaxy = g, Rel = relF, DistM = distM, Alpha = cloudMix });
+                    _cloudJobs.Add(new CloudJob { Galaxy = g, Rel = relF, DistM = distM, Alpha = cloudMix * keep });
 
                 if (isInside) continue; // point/impostor skip the galaxy you're inside
 
                 // --- Point sprite (faded out as impostor, then cloud, take over) ---
                 float pointFade = 1f - impostorMix;
-                if (pointFade > 0.001f)
+                if (pointFade > 0.001f && keep > 0.002f)
                 {
-                    double distLy = distM / MathUtil.LightYear;
-                    float cue = (float)(Math.Sqrt(g.StarCount / RefStarCount) * (RefDistLy / distLy));
                     float size = Math.Clamp(MinSizePx + SizeScale * cue, MinSizePx, MaxSizePx);
-                    float bright = Math.Clamp(0.8f + 1.2f * cue, 0.7f, 3.0f) * pointFade;
+                    float bright = Math.Clamp(0.8f + 1.2f * cue, 0.7f, 3.0f) * pointFade * keep;
                     EnsureCapacity(n + 1);
                     int o = n * FloatsPerPoint;
                     _data[o + 0] = dir.X; _data[o + 1] = dir.Y; _data[o + 2] = dir.Z;
@@ -291,7 +316,7 @@ void main() {
                 }
 
                 // --- Impostor disk (faded in by impostorMix, out again by cloudMix) ---
-                float impostorAlpha = impostorMix * (1f - cloudMix);
+                float impostorAlpha = impostorMix * (1f - cloudMix) * keep;
                 if (impostorAlpha > 0.001f)
                 {
                     DiskBasis(g.DiskNormal, out Vector3D<float> u, out Vector3D<float> v);

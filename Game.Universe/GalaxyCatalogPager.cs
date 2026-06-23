@@ -17,8 +17,8 @@ public sealed class GalaxyCatalogPager : INearestGalaxy
 {
     // Load every block within this Chebyshev (cube) radius of the camera's block; evict past the evict
     // radius. evict > load gives a one-ring hysteresis band so a camera on a boundary doesn't thrash.
-    private const int LoadRadiusBlocks = 1;   // 3×3×3 resident around the camera
-    private const int EvictRadiusBlocks = 2;
+    private const int LoadRadiusBlocks = 2;   // 5×5×5 resident around the camera — a deep galaxy field
+    private const int EvictRadiusBlocks = 3;
 
     private readonly GalaxyField _field;
     private readonly double _sideMeters;
