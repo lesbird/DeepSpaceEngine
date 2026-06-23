@@ -22,6 +22,14 @@ public sealed class TuningConfig
     public float NebulaMinRadiusLy { get; set; } = 120f;
     public float NebulaMaxRadiusLy { get; set; } = 400f;
 
+    // Galaxy LOD renderer (point / impostor / cloud tiers).
+    public float GalaxyBrightness { get; set; } = 1.8f;
+    public float GalaxySizeScale { get; set; } = 16f;
+    public float GalaxyMinSize { get; set; } = 4f;
+    public float GalaxyMaxSize { get; set; } = 28f;
+    public float GalaxyImpostorBrightness { get; set; } = 1.3f;
+    public float GalaxyCloudBrightness { get; set; } = 1.0f;
+
     // Atmosphere.
     public bool RenderAtmosphere { get; set; } = true;
     public float SunIntensity { get; set; } = 20f;
@@ -98,8 +106,14 @@ public sealed class TuningConfig
     private static float[] ToArr(Vector3D<float> v) => new[] { v.X, v.Y, v.Z };
 
     /// <summary>Read the current live values into a config snapshot.</summary>
-    public static TuningConfig Capture(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s) => new()
+    public static TuningConfig Capture(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, GalaxyRenderer g) => new()
     {
+        GalaxyBrightness = g.Brightness,
+        GalaxySizeScale = g.SizeScale,
+        GalaxyMinSize = g.MinSizePx,
+        GalaxyMaxSize = g.MaxSizePx,
+        GalaxyImpostorBrightness = g.ImpostorBrightness,
+        GalaxyCloudBrightness = g.CloudBrightness,
         RenderBackdrop = b.Enabled,
         BandBrightness = b.BandBrightness,
         BackdropStarBrightness = b.StarBrightness,
@@ -181,8 +195,14 @@ public sealed class TuningConfig
     }
 
     /// <summary>Push this snapshot back onto the live backdrop / atmosphere / terrain / biome state.</summary>
-    public void Apply(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s)
+    public void Apply(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, GalaxyRenderer g)
     {
+        g.Brightness = GalaxyBrightness;
+        g.SizeScale = GalaxySizeScale;
+        g.MinSizePx = GalaxyMinSize;
+        g.MaxSizePx = GalaxyMaxSize;
+        g.ImpostorBrightness = GalaxyImpostorBrightness;
+        g.CloudBrightness = GalaxyCloudBrightness;
         b.Enabled = RenderBackdrop;
         b.BandBrightness = BandBrightness;
         b.StarBrightness = BackdropStarBrightness;
@@ -258,11 +278,11 @@ public sealed class TuningConfig
     }
 
     /// <summary>Serialize the current live values to <paramref name="path"/>. Returns false on IO error.</summary>
-    public static bool Save(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, string path)
+    public static bool Save(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, GalaxyRenderer g, string path)
     {
         try
         {
-            File.WriteAllText(path, JsonSerializer.Serialize(Capture(a, b, s), Options));
+            File.WriteAllText(path, JsonSerializer.Serialize(Capture(a, b, s, g), Options));
             return true;
         }
         catch
@@ -272,14 +292,14 @@ public sealed class TuningConfig
     }
 
     /// <summary>Load and apply values from <paramref name="path"/> if it exists. Returns false if absent/invalid.</summary>
-    public static bool Load(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, string path)
+    public static bool Load(AtmosphereRenderer a, GalaxyBackdrop b, ScatterRenderer s, GalaxyRenderer g, string path)
     {
         if (!File.Exists(path)) return false;
         try
         {
             TuningConfig? c = JsonSerializer.Deserialize<TuningConfig>(File.ReadAllText(path));
             if (c == null) return false;
-            c.Apply(a, b, s);
+            c.Apply(a, b, s, g);
             return true;
         }
         catch

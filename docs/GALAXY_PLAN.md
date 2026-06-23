@@ -204,8 +204,15 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
   (real stars to the resident-block extent, several hundred ly) owns the foreground and the coarse
   cloud only fills the galaxy body beyond it. Net: inside a galaxy you now see real catalog stars +
   the volumetric cloud disk + a per-galaxy black hole, with the fake band faded away.
-- **Phase 6** — Universe-level **map view** (extend the `N` galaxy map to zoom out to the cosmic
-  web), performance passes, photo-mode polish.
+- **Phase 6 — PARTIAL/DONE 2026-06-23** (build + 91 tests green; pending on-device verify). Polish &
+  usability: (1) **Jump-to-galaxy** — Navigation panel lists the nearest ≤6 resident galaxies
+  (`GatherNearbyGalaxies`) with a "Go" button (`GoToGalaxy`) that warps ~4 radii out, framed, so the
+  void is navigable despite true scale. (2) **Galaxy tuning + persistence** — a "Galaxies (LOD)"
+  section in the Tuning panel exposes the point/impostor/cloud knobs live, and they now round-trip
+  through `tuning.json` (`TuningConfig` gained 6 galaxy fields + a `GalaxyRenderer` param on
+  Capture/Apply/Save/Load). STILL DEFERRED (future): a true universe-level 3-D map (extend the `N`
+  map to zoom out to the cosmic web), perf passes, photo mode. The core LOD pyramid (phases 0–5) is
+  complete and shippable; these are nice-to-haves.
 
 ---
 

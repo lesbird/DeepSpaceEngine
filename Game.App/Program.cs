@@ -228,7 +228,7 @@ internal static class Program
         _imgui = new ImGuiController(_gl, _window.Window, _window.Input);
 
         // Restore previously-saved tuning so the sliders persist across launches.
-        if (TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, TuningPath))
+        if (TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, _galaxyRenderer, TuningPath))
         {
             _tuningStatus = $"Loaded {TuningPath}";
             _nebulaField = new NebulaField(WorldSeed); // load may have changed count/radius — rebuild from the new tuning
@@ -824,6 +824,19 @@ internal static class Program
                 : new System.Numerics.Vector4(1f, 0.6f, 0.5f, 1f), _searchStatus);
 
         ImGui.Separator();
+        ImGui.Text("Travel to galaxy:");
+        GatherNearbyGalaxies(6);
+        if (_nearbyGalaxies.Count == 0)
+            ImGui.TextDisabled("  (none resident)");
+        foreach ((Galaxy gx, double distM) in _nearbyGalaxies)
+        {
+            double mly = distM / MathUtil.LightYear / 1.0e6;
+            if (ImGui.Button($"Go##gx{gx.Id}")) { Blip(); GoToGalaxy(gx); }
+            ImGui.SameLine();
+            ImGui.Text($"{gx.Name}  {gx.Type}  {mly:0.00} Mly");
+        }
+
+        ImGui.Separator();
         if (_systemManager.HasActive)
         {
             SolarSystem sys = _systemManager.Active!;
@@ -958,6 +971,34 @@ internal static class Program
         _searchStatus = $"#{_searchTarget.Id}: {_searchTarget.ClassLetter}-class, {ly:0.000} ly";
     }
 
+    /// <summary>The resident galaxies nearest the camera (excluding the one we're inside), sorted by
+    /// distance — drives the Navigation "travel to galaxy" list.</summary>
+    private static readonly List<(Galaxy g, double distM)> _nearbyGalaxies = new();
+    private static void GatherNearbyGalaxies(int max)
+    {
+        _nearbyGalaxies.Clear();
+        ulong inside = _galaxyPager.IsInside ? _galaxyPager.Containing.Id : 0;
+        foreach (GalaxyCatalog block in _galaxyPager.LoadedBlocks)
+            foreach (Galaxy g in block.Galaxies)
+            {
+                if (g.Id == inside) continue;
+                _nearbyGalaxies.Add((g, g.Center.DistanceTo(_camera.Position)));
+            }
+        _nearbyGalaxies.Sort((x, y) => x.distM.CompareTo(y.distM));
+        if (_nearbyGalaxies.Count > max) _nearbyGalaxies.RemoveRange(max, _nearbyGalaxies.Count - max);
+    }
+
+    /// <summary>Warp to a galaxy: drop in a few radii out, looking at it, so it fills the view as an
+    /// impostor/cloud ready to fly into. The galaxy-scale analogue of <see cref="GoToStar"/>.</summary>
+    private static void GoToGalaxy(Galaxy g)
+    {
+        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.3f);
+        Vector3D<float> fwd = _camera.Forward;
+        double dist = g.RadiusMeters * 4.0; // ~4 radii: full impostor/cloud, framed
+        _camera.Position = g.Center.Translated(new Vector3D<double>(-fwd.X * dist, -fwd.Y * dist, -fwd.Z * dist));
+        _jumpStatus = $"Arrived at {g.Name} ({g.Type})";
+    }
+
     private static void DrawTuning()
     {
         ImGui.SetNextWindowPos(new System.Numerics.Vector2(990, 10), ImGuiCond.FirstUseEver);
@@ -1088,6 +1129,24 @@ internal static class Program
             ImGui.SliderFloat("Falloff (gamma)", ref _starRenderer.CatGamma, 0.12f, 0.6f);
             ImGui.SliderFloat("Star size", ref _starRenderer.CatSizeScale, 1f, 20f);
             ImGui.SliderFloat("Max size", ref _starRenderer.CatMaxSize, 20f, 300f);
+        }
+
+        if (ImGui.CollapsingHeader("Galaxies (LOD)", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            // The point / impostor / cloud tiers that draw other galaxies (see GalaxyRenderer).
+            GalaxyRenderer g = _galaxyRenderer;
+            ImGui.Checkbox("Render galaxies", ref g.Enabled);
+            ImGui.SliderFloat("Point brightness", ref g.Brightness, 0.2f, 5f);
+            ImGui.SliderFloat("Point size", ref g.SizeScale, 2f, 40f);
+            ImGui.SliderFloat("Point min px", ref g.MinSizePx, 1f, 12f);
+            ImGui.SliderFloat("Point max px", ref g.MaxSizePx, 8f, 64f);
+            ImGui.SliderFloat("Impostor brightness", ref g.ImpostorBrightness, 0.2f, 4f);
+            ImGui.SliderFloat("Cloud brightness", ref g.CloudBrightness, 0.2f, 4f);
+            if (ImGui.Button("Reset galaxies"))
+            {
+                g.Enabled = true; g.Brightness = 1.8f; g.SizeScale = 16f; g.MinSizePx = 4f;
+                g.MaxSizePx = 28f; g.ImpostorBrightness = 1.3f; g.CloudBrightness = 1.0f;
+            }
         }
 
         if (ImGui.CollapsingHeader("Ocean", ImGuiTreeNodeFlags.DefaultOpen))
@@ -1254,12 +1313,12 @@ internal static class Program
 
         ImGui.Separator();
         if (ImGui.Button("Save settings"))
-            _tuningStatus = TuningConfig.Save(_atmosphereRenderer, _backdrop, _scatter, TuningPath)
+            _tuningStatus = TuningConfig.Save(_atmosphereRenderer, _backdrop, _scatter, _galaxyRenderer, TuningPath)
                 ? $"Saved {TuningPath}" : "Save failed";
         ImGui.SameLine();
         if (ImGui.Button("Reload"))
         {
-            _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, TuningPath)
+            _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, _galaxyRenderer, TuningPath)
                 ? $"Loaded {TuningPath}" : "No saved file";
             _terrainRenderer.Rebuild();
             _nebulaField = new NebulaField(WorldSeed); // pick up any loaded count/radius change
