@@ -29,6 +29,7 @@ public sealed class TuningConfig
     public float GalaxyMaxSize { get; set; } = 28f;
     public float GalaxyImpostorBrightness { get; set; } = 1.3f;
     public float GalaxyCloudBrightness { get; set; } = 1.0f;
+    public float GalaxyCloudPointScale { get; set; } = 2.5f;
 
     // Atmosphere.
     public bool RenderAtmosphere { get; set; } = true;
@@ -114,6 +115,7 @@ public sealed class TuningConfig
         GalaxyMaxSize = g.MaxSizePx,
         GalaxyImpostorBrightness = g.ImpostorBrightness,
         GalaxyCloudBrightness = g.CloudBrightness,
+        GalaxyCloudPointScale = g.CloudPointScale,
         RenderBackdrop = b.Enabled,
         BandBrightness = b.BandBrightness,
         BackdropStarBrightness = b.StarBrightness,
@@ -203,6 +205,7 @@ public sealed class TuningConfig
         g.MaxSizePx = GalaxyMaxSize;
         g.ImpostorBrightness = GalaxyImpostorBrightness;
         g.CloudBrightness = GalaxyCloudBrightness;
+        g.CloudPointScale = GalaxyCloudPointScale;
         b.Enabled = RenderBackdrop;
         b.BandBrightness = BandBrightness;
         b.StarBrightness = BackdropStarBrightness;

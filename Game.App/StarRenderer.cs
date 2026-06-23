@@ -64,6 +64,7 @@ uniform float uGamma;                   // perceptual compression of the huge fl
 uniform float uSizeScale;
 uniform float uMinSize;
 uniform float uMaxSize;
+uniform float uBlockFade;               // 0→1 temporal fade as a freshly-streamed block ramps in
 out vec3 vColor;
 out float vBright;
 const float LY = 9.4607e15;             // metres per light-year
@@ -77,7 +78,10 @@ void main() {
     // of snapping to black just past a light-year.
     float flux = aLum / (distLy * distLy);
     float bright = uBrightScale * pow(flux, uGamma);
-    vBright = bright;
+    // Per-block temporal fade-in: a 350 ly block streams in with its near edge only a few hundred ly
+    // away, so without this a whole block's worth of stars pops on at once ('a chunk spawns in'). Each
+    // block instead ramps from 0→1 brightness over ~⅔ s after it loads, so the field flows in smoothly.
+    vBright = bright * uBlockFade;
     gl_PointSize = clamp(uSizeScale * sqrt(bright), uMinSize, uMaxSize);
 }";
 
@@ -94,6 +98,8 @@ void main() {
 }";
 
     private Shader? _catShader;
+    private double _now;                        // current time (s), for the per-block streaming fade-in
+    private const double CatFadeInSeconds = 0.7; // how long a freshly-streamed block takes to ramp in
 
     // One GPU buffer per resident lattice block, keyed by block coordinate. Mirrors the
     // StarCatalogPager's loaded set (see SyncBlocks); positions are baked relative to each block's
@@ -104,8 +110,9 @@ void main() {
         public readonly uint Vbo;
         public readonly int Count;
         public readonly UniversePosition Origin;
-        public CatBlock(uint vao, uint vbo, int count, in UniversePosition origin)
-        { Vao = vao; Vbo = vbo; Count = count; Origin = origin; }
+        public readonly double UploadTime; // seconds, for the streaming fade-in
+        public CatBlock(uint vao, uint vbo, int count, in UniversePosition origin, double uploadTime)
+        { Vao = vao; Vbo = vbo; Count = count; Origin = origin; UploadTime = uploadTime; }
     }
     private readonly Dictionary<Vector3D<long>, CatBlock> _catBlocks = new();
     private readonly HashSet<Vector3D<long>> _desiredScratch = new();
@@ -211,8 +218,9 @@ void main() {
     /// <summary>Mirror the pager's resident block set into per-block GPU buffers: upload any block we
     /// don't have a buffer for yet (bounded per frame so a burst can't stall), and free buffers for
     /// blocks that have been evicted. Call once per frame before <see cref="RenderCatalog"/>.</summary>
-    public unsafe void SyncBlocks(IReadOnlyCollection<StarCatalog> loaded)
+    public unsafe void SyncBlocks(IReadOnlyCollection<StarCatalog> loaded, double now)
     {
+        _now = now;
         EnsureCatShader();
 
         // Evict GPU buffers whose block is no longer resident.
@@ -276,7 +284,7 @@ void main() {
         _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, new ReadOnlySpan<float>(data), BufferUsageARB.StaticDraw);
         _gl.BindVertexArray(0);
 
-        _catBlocks[block.BlockCoord] = new CatBlock(vao, vbo, stars.Count, block.Origin);
+        _catBlocks[block.BlockCoord] = new CatBlock(vao, vbo, stars.Count, block.Origin, _now);
     }
 
     /// <summary>Draw every resident block as apparent-brightness point sprites. The active system's
@@ -310,6 +318,9 @@ void main() {
         {
             Vector3D<float> camRel = camera.Position.ToCameraRelative(b.Origin); // camera relative to this block
             _catShader.SetVector3("uCamRel", camRel);
+            // Temporal fade-in: ramp this block's stars up over CatFadeInSeconds after it streamed in.
+            float t = (float)Math.Clamp((_now - b.UploadTime) / CatFadeInSeconds, 0.0, 1.0);
+            _catShader.SetFloat("uBlockFade", t * t * (3f - 2f * t)); // smoothstep
             _gl.BindVertexArray(b.Vao);
 
             if (exLocal >= 0 && exLocal < b.Count && coord == exBlock)

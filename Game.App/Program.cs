@@ -29,9 +29,11 @@ internal static class Program
     private static GalaxyCatalogPager _galaxyPager = null!;
     private static StarRenderer _starRenderer = null!;
     private static GalaxyRenderer _galaxyRenderer = null!;
+    private static GlobularClusterRenderer _globularRenderer = null!;
     private static GalaxyBackdrop _backdrop = null!;
     private static NebulaField _nebulaField = null!;
     private static NebulaRenderer _nebulaRenderer = null!;
+    private static ulong _nebulaGalaxyId = ulong.MaxValue; // galaxy the nebula field was built for (sentinel = none yet)
     private static StarOverlay _overlay = null!;
     private static SolarSystemManager _systemManager = null!;
     private static SystemRenderer _systemRenderer = null!;
@@ -199,8 +201,9 @@ internal static class Program
         _starPager = new StarCatalogPager(_galaxyPager); // stars are confined to the galaxies it streams
         _starRenderer = new StarRenderer(_gl);
         _galaxyRenderer = new GalaxyRenderer(_gl);
+        _globularRenderer = new GlobularClusterRenderer(_gl);
         _backdrop = new GalaxyBackdrop(_gl, WorldSeed);
-        _nebulaField = new NebulaField(WorldSeed);
+        _nebulaField = new NebulaField(); // empty until the first update builds it for the host galaxy
         _nebulaRenderer = new NebulaRenderer(_gl);
         _overlay = new StarOverlay();
         _systemManager = new SolarSystemManager();
@@ -231,7 +234,7 @@ internal static class Program
         if (TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, _galaxyRenderer, TuningPath))
         {
             _tuningStatus = $"Loaded {TuningPath}";
-            _nebulaField = new NebulaField(WorldSeed); // load may have changed count/radius — rebuild from the new tuning
+            _nebulaGalaxyId = ulong.MaxValue; // force the next update to rebuild nebulae with the loaded count/radius
         }
 
         // Restore the last quit position so you resume where you left off (overrides the home view).
@@ -347,6 +350,17 @@ internal static class Program
         // contains/overlaps the camera, so its resident galaxies must be current before it runs (here
         // and in the smoke jump below). Galaxies are enormous, so a frame's motion is negligible.
         _galaxyPager.Update(_camera.Position);
+
+        // Nebulae and globular clusters belong to whichever galaxy you're in; rebuild them when that
+        // changes (or when a tuning reload reset the sentinel), and clear them in intergalactic space.
+        ulong nebGalaxy = _galaxyPager.IsInside ? _galaxyPager.Containing.Id : 0;
+        if (nebGalaxy != _nebulaGalaxyId)
+        {
+            RebuildNebulaField();
+            _globularRenderer.SetClusters(_galaxyPager.IsInside
+                ? GlobularClusters.ForGalaxy(_galaxyPager.Containing)
+                : Array.Empty<GlobularCluster>());
+        }
 
         if (_smoke && _smokeFrames == 0)
         {
@@ -566,8 +580,11 @@ internal static class Program
         // Sync GPU buffers to the resident lattice blocks, then draw them all — skipping the active
         // sun (the system pass renders it precisely; its catalog dot would otherwise sit slightly off
         // when viewed up close).
-        _starRenderer.SyncBlocks(_starPager.LoadedBlocks);
+        _starRenderer.SyncBlocks(_starPager.LoadedBlocks, _renderClock);
         _starRenderer.RenderCatalog(_camera, _systemManager.ActiveStarId);
+
+        // Globular clusters in the host galaxy's halo: a fuzzy sprite from far, resolving into stars up close.
+        _globularRenderer.Render(_camera, _sceneFbo.Height);
 
         // Deep-space asteroid clusters: drawn on the still-clear depth buffer with their own fitted
         // projection so rocks self-occlude. Depth is cleared again below before the system pass, so
@@ -706,6 +723,7 @@ internal static class Program
         if (_hudVisible)
         {
             _overlay.Draw(_camera, _starPager, _systemManager, _discovery, _hasSearchTarget ? _searchTarget : null);
+            _overlay.DrawGlobularReticles(_camera, _globularRenderer.Marks);
             DrawSpeedOverlay();
             DrawHud();
             DrawTuning();
@@ -895,6 +913,22 @@ internal static class Program
         ImGui.End();
     }
 
+    /// <summary>Rebuild the nebula field for the galaxy the camera is currently inside (seeded from that
+    /// galaxy, placed in its disk frame); intergalactic space gets an empty field.</summary>
+    private static void RebuildNebulaField()
+    {
+        if (_galaxyPager.IsInside)
+        {
+            _nebulaField = new NebulaField(_galaxyPager.Containing);
+            _nebulaGalaxyId = _galaxyPager.Containing.Id;
+        }
+        else
+        {
+            _nebulaField = new NebulaField();
+            _nebulaGalaxyId = 0;
+        }
+    }
+
     /// <summary>
     /// One HUD line locating the camera in the universe-of-galaxies hierarchy: the galaxy you're inside
     /// (green) or, in intergalactic space, the nearest galaxy and its distance. Phase-0 readout that
@@ -916,6 +950,8 @@ internal static class Program
                 $"Intergalactic — nearest {g.Name} ({g.Type}) {mly:0.00} Mly");
         }
         ImGui.Text($"Galaxies: {_galaxyPager.LoadedGalaxyCount} resident, {_galaxyRenderer.LastDrawn} pts, {_galaxyRenderer.LastImpostors} disks, {_galaxyRenderer.LastClouds} clouds");
+        if (_globularRenderer.LastSprites + _globularRenderer.LastResolved > 0)
+            ImGui.Text($"Globulars: {_globularRenderer.LastSprites} sprites, {_globularRenderer.LastResolved} resolved");
     }
 
     /// <summary>
@@ -1115,7 +1151,7 @@ internal static class Program
             nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
             ImGui.SliderFloat("Nebula radius max (ly)", ref NebulaTuning.MaxRadiusLy, 10f, 800f);
             nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
-            if (nebDirty) _nebulaField = new NebulaField(WorldSeed);
+            if (nebDirty) RebuildNebulaField();
         }
 
         if (ImGui.CollapsingHeader("Star field", ImGuiTreeNodeFlags.DefaultOpen))
@@ -1142,10 +1178,25 @@ internal static class Program
             ImGui.SliderFloat("Point max px", ref g.MaxSizePx, 8f, 64f);
             ImGui.SliderFloat("Impostor brightness", ref g.ImpostorBrightness, 0.2f, 4f);
             ImGui.SliderFloat("Cloud brightness", ref g.CloudBrightness, 0.2f, 4f);
+            ImGui.SliderFloat("Cloud point size", ref g.CloudPointScale, 1f, 8f);
             if (ImGui.Button("Reset galaxies"))
             {
                 g.Enabled = true; g.Brightness = 1.8f; g.SizeScale = 16f; g.MinSizePx = 4f;
                 g.MaxSizePx = 28f; g.ImpostorBrightness = 1.3f; g.CloudBrightness = 1.0f;
+                g.CloudPointScale = 2.5f;
+            }
+        }
+
+        if (ImGui.CollapsingHeader("Globular clusters", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            GlobularClusterRenderer gc = _globularRenderer;
+            ImGui.Checkbox("Render globulars", ref gc.Enabled);
+            ImGui.SliderFloat("Sprite brightness", ref gc.SpriteBrightness, 0.2f, 4f);
+            ImGui.SliderFloat("Star brightness", ref gc.CloudBrightness, 0.2f, 4f);
+            ImGui.SliderFloat("Star size", ref gc.CloudPointScale, 0.5f, 5f);
+            if (ImGui.Button("Reset globulars"))
+            {
+                gc.Enabled = true; gc.SpriteBrightness = 1.0f; gc.CloudBrightness = 1.0f; gc.CloudPointScale = 1.6f;
             }
         }
 
@@ -1321,7 +1372,7 @@ internal static class Program
             _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, _galaxyRenderer, TuningPath)
                 ? $"Loaded {TuningPath}" : "No saved file";
             _terrainRenderer.Rebuild();
-            _nebulaField = new NebulaField(WorldSeed); // pick up any loaded count/radius change
+            _nebulaGalaxyId = ulong.MaxValue; // rebuild nebulae (loaded count/radius) on the next update
         }
         if (_tuningStatus.Length > 0)
             ImGui.TextDisabled(_tuningStatus);

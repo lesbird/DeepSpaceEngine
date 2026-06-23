@@ -25,17 +25,13 @@ public readonly struct Nebula
 }
 
 /// <summary>
-/// Deterministic set of nebulae scattered through the galactic disk, generated once from the world seed.
-/// They are few and enormous, so unlike the star catalog they are held as a flat list (not paged): a few
-/// hundred entries is trivial to keep resident and to test against each frame.
+/// Deterministic set of nebulae scattered through one galaxy's inner disk, seeded from that galaxy so
+/// every galaxy has its own nebulae (not just the home one). Few and enormous, so they are held as a
+/// flat list (not paged) and tested each frame. Rebuilt when you enter a different galaxy; an empty
+/// field is used in intergalactic space.
 /// </summary>
 public sealed class NebulaField
 {
-    // Galactic placement bounds (light-years). Nebulae scatter within DiskRadius of the centre, with a
-    // generous vertical spread so they fill a thick lens above and below the plane rather than sitting on it.
-    private const double DiskRadiusLy = 6000.0;
-    private const double DiskHeightLy = 1800.0;
-
     // Emission palette: H-alpha reds/magentas, reflection blues, O-III teals, dusty golds. One is picked and
     // jittered per nebula so the field has variety without looking random-confetti.
     private static readonly Vector3D<float>[] Palette =
@@ -51,25 +47,37 @@ public sealed class NebulaField
     private readonly Nebula[] _nebulae;
     public IReadOnlyList<Nebula> Nebulae => _nebulae;
 
-    public NebulaField(ulong worldSeed, int count = -1)
+    /// <summary>An empty field — intergalactic space has no nebulae.</summary>
+    public NebulaField() => _nebulae = Array.Empty<Nebula>();
+
+    /// <summary>Place nebulae through <paramref name="galaxy"/>'s inner disk, in its own frame (centre +
+    /// disk orientation), seeded from the galaxy so each galaxy's nebulae are distinct.</summary>
+    public NebulaField(Galaxy galaxy, int count = -1)
     {
         if (count < 0) count = Math.Max(0, NebulaTuning.Count);
         // Tolerate sliders set in either order; never let the RNG range invert.
         double minR = Math.Max(1.0, Math.Min(NebulaTuning.MinRadiusLy, NebulaTuning.MaxRadiusLy));
         double maxR = Math.Max(minR, Math.Max(NebulaTuning.MinRadiusLy, NebulaTuning.MaxRadiusLy));
-        var rng = new DeterministicRng(Hashing.Combine(worldSeed, 0xEB01AUL));
+        var rng = new DeterministicRng(Hashing.Combine(galaxy.Seed, 0xEB01AUL));
         double ly = MathUtil.LightYear;
+
+        // Scale the placement lens to the galaxy: nebulae sit in the inner disk (~12% of the radius) with
+        // a thin vertical spread. For a 50,000 ly galaxy this reproduces the original 6000/1800 ly bounds.
+        double diskRadiusLy = galaxy.RadiusLy * 0.12;
+        double diskHeightLy = galaxy.RadiusLy * 0.036;
+        Basis(galaxy.DiskNormal, out Vector3D<double> u, out Vector3D<double> v, out Vector3D<double> n);
+
         _nebulae = new Nebula[count];
         for (int i = 0; i < count; i++)
         {
             double ang = rng.Range(0.0, 2.0 * Math.PI);
-            double rad = DiskRadiusLy * Math.Sqrt(rng.Range(0.0, 1.0)); // sqrt → uniform over the disk area
-            // Vertical spread: a single signed sample with a mild power bias toward the plane, so nebulae
-            // populate the full ±DiskHeight extent up and down instead of clustering on it.
-            double u = rng.Range(-1.0, 1.0);
-            double height = Math.Sign(u) * Math.Pow(Math.Abs(u), 1.5) * DiskHeightLy;
-            var pos = UniversePosition.FromMeters(
-                Math.Cos(ang) * rad * ly, height * ly, Math.Sin(ang) * rad * ly);
+            double rad = diskRadiusLy * Math.Sqrt(rng.Range(0.0, 1.0)); // sqrt → uniform over the disk area
+            // Vertical spread: a signed sample with a mild power bias toward the plane.
+            double s = rng.Range(-1.0, 1.0);
+            double height = Math.Sign(s) * Math.Pow(Math.Abs(s), 1.5) * diskHeightLy;
+            Vector3D<double> offset =
+                (u * (Math.Cos(ang) * rad) + v * (Math.Sin(ang) * rad) + n * height) * ly;
+            UniversePosition pos = galaxy.Center.Translated(offset);
 
             double radius = rng.Range(minR, maxR) * ly;
 
@@ -82,5 +90,16 @@ public sealed class NebulaField
 
             _nebulae[i] = new Nebula(pos, radius, color, (float)rng.Range(0.0, 1000.0), $"Nebula N-{i + 1:000}");
         }
+    }
+
+    /// <summary>Orthonormal basis (u, v in the disk plane, n the normal) for a galaxy's disk normal.</summary>
+    private static void Basis(Vector3D<float> normal, out Vector3D<double> u, out Vector3D<double> v, out Vector3D<double> n)
+    {
+        var nn = new Vector3D<double>(normal.X, normal.Y, normal.Z);
+        nn = nn.LengthSquared < 1e-12 ? new Vector3D<double>(0, 1, 0) : Vector3D.Normalize(nn);
+        Vector3D<double> a = Math.Abs(nn.Y) < 0.99 ? new Vector3D<double>(0, 1, 0) : new Vector3D<double>(1, 0, 0);
+        u = Vector3D.Normalize(Vector3D.Cross(a, nn));
+        v = Vector3D.Cross(nn, u);
+        n = nn;
     }
 }

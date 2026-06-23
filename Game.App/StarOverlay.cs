@@ -274,6 +274,34 @@ public sealed class StarOverlay
         dl.AddCircleFilled(c, 1.5f, col, 6);                                            // centre dot
     }
 
+    /// <summary>Bracket reticle + label on each globular cluster currently shown as a fuzzy sprite.
+    /// Clusters sit far beyond the camera far plane, so they are projected by <i>direction</i> — a unit
+    /// vector at a safe radius inside the frustum gives the correct screen position for a point along
+    /// that ray. Call after <see cref="Draw"/>.</summary>
+    public void DrawGlobularReticles(Camera camera, IReadOnlyList<GlobularCluster> clusters)
+    {
+        if (clusters.Count == 0) return;
+        Vector2 vp = ImGui.GetIO().DisplaySize;
+        if (vp.X < 2 || vp.Y < 2) return;
+
+        var dl = ImGui.GetForegroundDrawList();
+        Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
+        uint col = Col(255, 225, 140, 220); // warm gold, matching the cluster tint
+
+        foreach (GlobularCluster c in clusters)
+        {
+            Vector3D<double> rel = c.Center.DeltaMeters(camera.Position);
+            double dist = rel.Length;
+            if (dist < 1.0) continue;
+            var dir = new Vector3D<float>((float)(rel.X / dist), (float)(rel.Y / dist), (float)(rel.Z / dist));
+            if (!Project(dir * 1.0e10f, m, vp, out Vector2 s) || !OnScreen(s, vp)) continue;
+
+            double distLy = dist / MathUtil.LightYear;
+            DrawBrackets(dl, s, 9f, col);
+            dl.AddText(s + new Vector2(13f, -7f), col, $"GC  {distLy:0} ly");
+        }
+    }
+
     private static bool Project(Vector3D<float> p, in Matrix4X4<float> m, Vector2 vp, out Vector2 screen)
     {
         // Matches the GPU path: clip = (p,1) * (view*proj) in Silk's row-vector convention.

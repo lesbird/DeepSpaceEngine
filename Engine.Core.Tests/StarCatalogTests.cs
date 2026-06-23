@@ -113,6 +113,33 @@ public class StarCatalogTests
         Assert.False(stars.HasNearest);
     }
 
+    [Fact]
+    public void GlobularClusterStars_AreInjectedAsRealCatalogStars()
+    {
+        Galaxy mw = new GalaxyCatalog(new GalaxyField(Seed), new Vector3D<long>(0, 0, 0)).Galaxies[0];
+        GlobularCluster c = GlobularClusters.ForGalaxy(mw)[0];
+
+        // The lattice block containing the cluster centre (blocks are centred on lattice points).
+        double side = StarCatalog.BlockSideLy * MathUtil.LightYear;
+        Vector3D<double> m = c.Center.DeltaMeters(UniversePosition.Origin);
+        var coord = new Vector3D<long>(
+            (long)Math.Round(m.X / side), (long)Math.Round(m.Y / side), (long)Math.Round(m.Z / side));
+
+        var block = new StarCatalog(mw, coord);
+
+        // The halo's galaxy density is ~0, so essentially all of these stars are the injected cluster.
+        Assert.True(block.Count > 100, $"expected the cluster's stars in the block, got {block.Count}");
+        bool anyInCluster = false;
+        foreach (Star s in block.Stars)
+            if (s.Position.DistanceTo(c.Center) <= c.RadiusMeters) { anyInCluster = true; break; }
+        Assert.True(anyInCluster, "no catalog star landed inside the cluster radius");
+
+        // Deterministic: regenerating the same block yields the same injected stars (stable ids).
+        var again = new StarCatalog(mw, coord);
+        Assert.Equal(block.Count, again.Count);
+        Assert.Equal(block.Stars[0].Id, again.Stars[0].Id);
+    }
+
     /// <summary>Tiny guard helper: only meaningful to assert "empty void" when the point really is
     /// outside every resident galaxy (the random field could, in principle, place one here).</summary>
     private static class Assume

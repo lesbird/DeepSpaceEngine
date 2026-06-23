@@ -33,6 +33,7 @@ public sealed class GalaxyRenderer : IDisposable
     public float MaxSizePx = 28.0f;
     public float ImpostorBrightness = 1.3f;  // impostor disks
     public float CloudBrightness = 1.0f;     // volumetric clouds
+    public float CloudPointScale = 2.5f;     // size multiplier on cloud points (fewer, larger = cheaper)
 
     public int LastDrawn { get; private set; }
     public int LastImpostors { get; private set; }
@@ -40,10 +41,12 @@ public sealed class GalaxyRenderer : IDisposable
 
     // Cross-fade bands in apparent angular radius (galaxyRadius / distance):
     //   point → impostor across [RatioLo, RatioHi]; impostor → cloud across [CloudLo, CloudHi].
+    // The impostor (the textured bulge+dust disk) is the dominant look across most of the approach;
+    // the volumetric cloud only takes over for the final close fly-in (within ~3 radii).
     private const float RatioLo = 0.010f;
-    private const float RatioHi = 0.030f;
-    private const float CloudLo = 0.050f;   // ~20 galaxy radii out, cloud begins
-    private const float CloudHi = 0.150f;   // ~7 radii out, cloud is the whole galaxy
+    private const float RatioHi = 0.040f;
+    private const float CloudLo = 0.300f;   // ~3 radii out, cloud begins to take over
+    private const float CloudHi = 0.700f;   // ~1.4 radii out, cloud is the whole galaxy
 
     private const float PointDomeRadius = 1.0e15f;
     private const float ImpostorRenderDist = 1.0e14f;
@@ -61,8 +64,12 @@ public sealed class GalaxyRenderer : IDisposable
     private static readonly float CloudNearFadeLo = (float)(300.0 * MathUtil.LightYear);
     private static readonly float CloudNearFadeHi = (float)(1500.0 * MathUtil.LightYear);
 
-    private const int CloudCount = 120_000; // sample points per galaxy
-    private const int CloudCap = 3;         // generate/draw clouds for at most this many nearest galaxies
+    // Render only the nearest few impostor disks (each runs a per-pixel fbm shader, so an uncapped
+    // cluster of galaxies tanks the frame rate). Farther galaxies stay as cheap point sprites.
+    private const int ImpostorCap = 4;
+
+    private const int CloudCount = 20_000;  // sample points per galaxy — few + large (via CloudPointScale) for perf
+    private const int CloudCap = 1;         // only the single nearest galaxy gets a volumetric cloud
 
     private const double RefStarCount = 2.0e11;
     private const double RefDistLy = 1.0e6;
@@ -104,6 +111,9 @@ void main() {
     gl_Position = uViewProj * vec4(uCenter + c.x * uAxisU + c.y * uAxisV, 1.0);
 }";
 
+    // A Space-Engine-style galaxy disk: a bright warm central bulge over a cool stellar haze, with
+    // dark dust lanes (fbm warped along the spiral) carved into the disk. Additive over black, so the
+    // dust reads as 'dark' by emitting less light where it lies.
     private const string ImpostorFrag = @"#version 410 core
 in vec2 vUv;
 uniform vec3 uColor; uniform float uArmCount; uniform float uArmStrength; uniform float uSwirl;
@@ -112,19 +122,34 @@ out vec4 FragColor;
 float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 34.56); return fract(p.x * p.y); }
 float vnoise(vec2 x) { vec2 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
     return mix(mix(hash(i), hash(i + vec2(1,0)), f.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y); }
-float fbm(vec2 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { s += a * vnoise(p); p *= 2.03; a *= 0.5; } return s; }
+float fbm(vec2 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 3; i++) { s += a * vnoise(p); p *= 2.1; a *= 0.5; } return s; }
 void main() {
     float r = length(vUv);
-    if (r > 1.0) { FragColor = vec4(0.0); return; }
+    if (r >= 1.0) { FragColor = vec4(0.0); return; }
     float phi = atan(vUv.y, vUv.x);
-    float core = exp(-r * r / (2.0 * 0.05 * 0.05));
-    float disk = exp(-r / 0.32);
-    float arm = 1.0;
-    if (uArmCount > 0.5) arm = 1.0 + uArmStrength * cos(uArmCount * phi - uSwirl * log(r + 0.06));
-    float dust = 0.55 + 0.45 * fbm(vUv * 5.0 + 3.0);
-    float intensity = core * 1.3 + disk * max(arm, 0.12) * dust;
-    float edge = smoothstep(1.0, 0.6, r);
-    FragColor = vec4(uColor * (intensity * uBrightness), 1.0) * (edge * uAlpha);
+
+    // Bright warm bulge.
+    float bulge = exp(-r * r / (2.0 * 0.11 * 0.11));
+    vec3 bulgeCol = vec3(1.0, 0.86, 0.66);
+
+    // Spiral phase → arm brightness + a coordinate to warp the dust along the arms.
+    float phase = (uArmCount > 0.5) ? (uArmCount * phi - uSwirl * log(r + 0.08)) : 0.0;
+    float armBright = (uArmCount > 0.5) ? (0.65 + 0.35 * cos(phase)) : 1.0;
+
+    // Cool stellar disk haze, brighter on the arms, fading to the rim.
+    float haze = exp(-r / 0.33) * smoothstep(1.0, 0.8, r) * armBright;
+    vec3 hazeCol = mix(vec3(0.62, 0.70, 0.92), uColor, 0.4);
+
+    // Dust lanes: warped fbm, dark, only in the disk (not the bright core).
+    vec2 sp = vUv * 3.2 + vec2(cos(phase), sin(phase)) * 0.8 + 5.0;
+    float dust = smoothstep(0.42, 0.72, fbm(sp)) * smoothstep(0.10, 0.35, r) * (1.0 - bulge);
+    vec3 dustCol = vec3(0.18, 0.12, 0.07);
+
+    vec3 col = bulgeCol * (bulge * 1.6)
+             + hazeCol * (haze * (1.0 - 0.8 * dust))
+             + dustCol * (dust * haze * 1.2);
+    float edge = smoothstep(1.0, 0.72, r);
+    FragColor = vec4(col * uBrightness, 1.0) * (edge * uAlpha);
 }";
 
     private const string CloudVert = @"#version 410 core
@@ -134,11 +159,12 @@ layout(location = 2) in float aSize;
 uniform mat4 uViewProj;
 uniform vec3 uGalaxyRel;             // galaxy centre relative to camera (m)
 uniform float uNear0; uniform float uNear1;
+uniform float uPointScale;          // global multiplier on point size (fewer, larger points = cheaper)
 out vec3 vColor; out float vFade;
 void main() {
     vec3 world = uGalaxyRel + aPos;
     gl_Position = uViewProj * vec4(world, 1.0);
-    gl_PointSize = aSize;
+    gl_PointSize = aSize * uPointScale;
     // Distance for the near-fade: scale before length() so squaring can't overflow float at galaxy
     // scale (a ~1e21 m component squared is ~1e42, past float's ~3.4e38 max).
     float distM = length(world * 1e-18) * 1e18;
@@ -168,7 +194,7 @@ void main() {
     private struct Impostor
     {
         public Vector3D<float> Center, AxisU, AxisV, Color;
-        public float ArmCount, ArmStrength, Swirl, Alpha;
+        public float ArmCount, ArmStrength, Swirl, Alpha, Ratio;
     }
     private readonly List<Impostor> _impostors = new();
 
@@ -275,7 +301,7 @@ void main() {
                     {
                         Center = dir * ImpostorRenderDist, AxisU = u * half, AxisV = v * half,
                         Color = g.Color, ArmCount = armCount, ArmStrength = armStrength, Swirl = swirl,
-                        Alpha = impostorAlpha,
+                        Alpha = impostorAlpha, Ratio = (float)ratio,
                     });
                 }
             }
@@ -307,12 +333,17 @@ void main() {
 
         if (_impostors.Count > 0)
         {
+            // Draw only the nearest ImpostorCap disks (largest angular radius); the rest stay as the
+            // already-drawn point sprites. Bounds the per-pixel fbm fill cost in galaxy clusters.
+            _impostors.Sort((a, b) => b.Ratio.CompareTo(a.Ratio));
+            int count = Math.Min(_impostors.Count, ImpostorCap);
             _impostorShader.Use();
             _impostorShader.SetMatrix("uViewProj", vp);
             _impostorShader.SetFloat("uBrightness", ImpostorBrightness);
             _gl.BindVertexArray(_impostorVao);
-            foreach (Impostor imp in _impostors)
+            for (int i = 0; i < count; i++)
             {
+                Impostor imp = _impostors[i];
                 _impostorShader.SetVector3("uCenter", imp.Center);
                 _impostorShader.SetVector3("uAxisU", imp.AxisU);
                 _impostorShader.SetVector3("uAxisV", imp.AxisV);
@@ -323,7 +354,7 @@ void main() {
                 _impostorShader.SetFloat("uAlpha", imp.Alpha);
                 _gl.DrawArrays(PrimitiveType.TriangleStrip, 0, 4);
             }
-            LastImpostors = _impostors.Count;
+            LastImpostors = count;
         }
 
         RenderClouds(camera);
@@ -365,6 +396,7 @@ void main() {
                 _cloudShader.SetMatrix("uViewProj", cloudVp);
                 _cloudShader.SetFloat("uNear0", CloudNearFadeLo);
                 _cloudShader.SetFloat("uNear1", CloudNearFadeHi);
+                _cloudShader.SetFloat("uPointScale", CloudPointScale);
                 shaderReady = true;
             }
             _cloudShader.SetVector3("uGalaxyRel", job.Rel);
