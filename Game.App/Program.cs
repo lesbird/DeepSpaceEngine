@@ -77,6 +77,10 @@ internal static class Program
     private const string TuningPath = "tuning.json";
     private static string _tuningStatus = "";
 
+    // Camera position persisted across launches: saved on quit, restored on load.
+    private const string PositionPath = "position.json";
+    private const float HomeSpeedExponent = 15f; // ~0.1 ly/s — roam between stars; wheel to adjust
+
     // Tuning panel: which surface type the terrain/biome sliders currently edit.
     private static readonly PlanetType[] EditableTypes =
         { PlanetType.Lava, PlanetType.Rocky, PlanetType.Desert, PlanetType.Ocean, PlanetType.Ice };
@@ -157,6 +161,11 @@ internal static class Program
             _cloudRenderer.Resize(size.X, size.Y);
         };
         _window.Run();
+        // Persist the camera location so the next launch resumes here. Skipped for the headless smoke
+        // run so an automated pass doesn't clobber the player's saved position. Save() swallows any
+        // error (e.g. if the window failed to load before the camera was built).
+        if (!_smoke)
+            PositionConfig.Save(_camera, _controller, PositionPath);
         _audio?.Dispose();
         _discoveryClient?.Dispose();
         _window.Dispose();
@@ -177,19 +186,11 @@ internal static class Program
             NearPlane = 1.0e3f,
             FarPlane = 1.0e18f, // stars stream out to ~tens of ly
         };
-        _controller = new FreeFlyController(_camera, _window.Keyboard, _window.Mouse)
-        {
-            SpeedExponent = 15f, // ~0.1 ly/s — roam between stars; wheel to adjust
-        };
+        _controller = new FreeFlyController(_camera, _window.Keyboard, _window.Mouse);
 
-        // Open on a framed, oblique view of the galactic-centre black hole rather than starting
-        // inside its event horizon (the origin). Pitch down a little, then back off along the
-        // resulting forward axis so the camera looks straight at the origin from above the disk.
-        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.5f);
-        Vector3D<float> fwd = _camera.Forward;
-        const double startDist = 1.4e15; // ~0.15 ly — frames the accretion disk
-        _camera.Position = UniversePosition.Origin.Translated(
-            new Vector3D<double>(-fwd.X * startDist, -fwd.Y * startDist, -fwd.Z * startDist));
+        // Frame the home view (oblique look at the galactic-centre black hole). Restored below if a
+        // saved position exists, so a fresh install opens here but returning players resume in place.
+        ResetToHome();
 
         _starPager = new StarCatalogPager(new GalaxyModel(WorldSeed));
         _starRenderer = new StarRenderer(_gl);
@@ -227,6 +228,9 @@ internal static class Program
             _tuningStatus = $"Loaded {TuningPath}";
             _nebulaField = new NebulaField(WorldSeed); // load may have changed count/radius — rebuild from the new tuning
         }
+
+        // Restore the last quit position so you resume where you left off (overrides the home view).
+        PositionConfig.Load(_camera, _controller, PositionPath);
 
         InitAudio();
 
@@ -756,6 +760,16 @@ internal static class Program
         }
 
         ImGui.Separator();
+        if (ImGui.Button("Reset to home"))
+        {
+            Blip();
+            ResetToHome();
+            _jumpStatus = "Returned to home (galactic centre)";
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled("(galactic centre)");
+
+        ImGui.Separator();
         ImGui.Text("Find star (catalog #):");
         ImGui.SetNextItemWidth(90);
         bool submit = ImGui.InputText("##starsearch", ref _starSearch, 20,
@@ -831,6 +845,22 @@ internal static class Program
         if (_jumpStatus.Length > 0)
             ImGui.TextColored(new System.Numerics.Vector4(0.6f, 1f, 0.7f, 1f), _jumpStatus);
         ImGui.End();
+    }
+
+    /// <summary>
+    /// Return the camera to its opening "home" view: an oblique look at the galactic-centre black
+    /// hole, backed off along the forward axis so the camera frames the accretion disk from above the
+    /// disk rather than starting inside the event horizon (the origin). Also restores the default
+    /// roam speed. Used both for the initial frame and the Navigation "Reset to home" button.
+    /// </summary>
+    private static void ResetToHome()
+    {
+        _controller.SpeedExponent = HomeSpeedExponent;
+        _camera.Orientation = Quaternion<float>.CreateFromAxisAngle(Vector3D<float>.UnitX, -0.5f);
+        Vector3D<float> fwd = _camera.Forward;
+        const double startDist = 1.4e15; // ~0.15 ly — frames the accretion disk
+        _camera.Position = UniversePosition.Origin.Translated(
+            new Vector3D<double>(-fwd.X * startDist, -fwd.Y * startDist, -fwd.Z * startDist));
     }
 
     /// <summary>Look a star up by its global catalog id (the number shown on HUD reticles) and flag

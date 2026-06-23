@@ -483,3 +483,6 @@ server/config.php
 
 # Player discovery settings (carries the API key)
 discovery.json
+
+# Last-quit camera position (per-user runtime state)
+position.json
