@@ -20,9 +20,10 @@ namespace Game.App;
 ///    so the galaxy gains parallax and volume as you fly in. A per-point near-fade hides cloud points
 ///    inside the catalog bubble, so the streamed real stars take over up close with no double image.
 ///
-/// Each tier overlaps the next so the swaps never pop. The point and impostor tiers skip the galaxy the
-/// camera is inside, but its cloud still renders (near-faded) to provide the far galaxy body around you.
-/// Cloud point sets are generated off-thread and cached per galaxy for the nearest few.
+/// Each tier overlaps the next so the swaps never pop. The galaxy the camera is INSIDE is skipped by
+/// every tier — its real catalog stars and the painted band render that view, and a cloud there would
+/// put the galactic-core glow on screen as a bright blob that drifts as you move. Cloud point sets are
+/// generated off-thread and cached per galaxy for the nearest few you're approaching.
 /// </summary>
 public sealed class GalaxyRenderer : IDisposable
 {
@@ -240,13 +241,15 @@ void main() {
                 double ratio = g.RadiusMeters / distM;
                 float impostorMix = Smoothstep(RatioLo, RatioHi, (float)ratio);
                 float cloudMix = Smoothstep(CloudLo, CloudHi, (float)ratio);
-                bool isInside = exclude is { } ex && g.Id == ex;
+                // Skip the galaxy you're inside for ALL tiers: its real catalog stars and the painted
+                // band already render the in-galaxy view, and a cloud here would put the galactic-core
+                // glow on screen as a bright blob that shifts as you move between systems. The cloud's
+                // job is the approach reveal from OUTSIDE, so it only renders for other galaxies.
+                if (exclude is { } ex && g.Id == ex) continue;
 
-                // --- Cloud (renders for the galaxy you're inside too, near-faded) ---
+                // --- Cloud (galaxies you're approaching, near-faded so the catalog takes over on entry) ---
                 if (cloudMix > 0.001f)
                     _cloudJobs.Add(new CloudJob { Galaxy = g, Rel = relF, DistM = distM, Alpha = cloudMix });
-
-                if (isInside) continue; // point/impostor skip the galaxy you're inside
 
                 // --- Point sprite (faded out as impostor, then cloud, take over) ---
                 float pointFade = 1f - impostorMix;
