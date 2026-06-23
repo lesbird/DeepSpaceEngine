@@ -485,11 +485,12 @@ colour, shape seed, spin axis/angle for the renderer.
 
 **SolarSystemManager** (sealed) — owns the single active system.
 `void Update(double dt, in UniversePosition camera, INearestStar field)`:
-despawns the active system past `DespawnLightYears`, spawns the nearest star's
-system inside `SpawnLightYears` (the gap is hysteresis against thrashing), and
-advances `SimTime += dt·TimeScale` then `Active.UpdatePositions(SimTime)`.
-Exposes `HasActive`, `Active`, `ActiveStarId`, `SimTime`, `ActiveStarDistanceLy`,
-and the tunables `SpawnLightYears`, `DespawnLightYears`, `TimeScale`.
+despawns the active system past `DespawnAu`, spawns the nearest star's system
+inside `SpawnAu` (≈500 AU — holds the whole system, whose outermost planet reaches
+~100 AU; the gap to despawn is hysteresis against thrashing), and advances
+`SimTime += dt·TimeScale` then `Active.UpdatePositions(SimTime)`. Exposes
+`HasActive`, `Active`, `ActiveStarId`, `SimTime`, `ActiveStarDistanceAu`, and the
+tunables `SpawnAu`, `DespawnAu`, `TimeScale`.
 
 **SpeedPolicy** (static) — the proximity speed limiter, stateless math:
 

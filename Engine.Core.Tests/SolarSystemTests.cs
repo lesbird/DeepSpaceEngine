@@ -183,10 +183,11 @@ public class SolarSystemTests
         Star n = field.Nearest;
 
         var mgr = new SolarSystemManager();
-        double spawn = mgr.SpawnLightYears, despawn = mgr.DespawnLightYears;
+        double au = MathUtil.AstronomicalUnit;
+        double spawn = mgr.SpawnAu, despawn = mgr.DespawnAu;
 
         // Approach to just inside the spawn radius → spawns.
-        UniversePosition near = n.Position.Translated(new Vector3D<double>(spawn * 0.5 * Ly, 0, 0));
+        UniversePosition near = n.Position.Translated(new Vector3D<double>(spawn * 0.5 * au, 0, 0));
         field.Update(near, 8);
         mgr.Update(0.0, near, field);
         Assert.True(mgr.HasActive);
@@ -194,7 +195,7 @@ public class SolarSystemTests
         UniversePosition activePos = mgr.Active!.Sun.Position;
 
         // Retreat between the thresholds → STAYS active (hysteresis), same star.
-        UniversePosition mid = activePos.Translated(new Vector3D<double>((spawn + despawn) * 0.5 * Ly, 0, 0));
+        UniversePosition mid = activePos.Translated(new Vector3D<double>((spawn + despawn) * 0.5 * au, 0, 0));
         field.Update(mid, 8);
         mgr.Update(0.0, mid, field);
         Assert.True(mgr.HasActive);

@@ -365,12 +365,12 @@ internal static class Program
         if (_smoke && _smokeFrames == 0)
         {
             // Headless: jump next to the nearest star so the spawn/generate/render path runs. The
-            // offset must be inside SolarSystemManager.SpawnLightYears (0.01 ly) or no system spawns —
-            // 0.005 ly lands us in-system so terrain (and discovery reporting) actually exercise.
+            // offset must be inside SolarSystemManager.SpawnAu (500 AU) or no system spawns — 300 AU
+            // lands us in-system so terrain (and discovery reporting) actually exercise.
             _starPager.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
             if (_starPager.HasNearest)
                 _camera.Position = _starPager.Nearest.Position
-                    .Translated(new Vector3D<double>(0.005 * MathUtil.LightYear, 0, 0));
+                    .Translated(new Vector3D<double>(300.0 * MathUtil.AstronomicalUnit, 0, 0));
         }
         if (_smoke && _smokeFrames == 1 && _systemManager.HasActive)
         {
@@ -803,9 +803,10 @@ internal static class Program
             ImGui.Text($"Nearest star: {s.ClassLetter}  #{s.Id}");
             ImGui.Text($"  {s.Temperature:0} K   lum {s.Luminosity:0.00} Lsun");
             ImGui.Text($"  Distance: {nLy:0.0000} ly");
-            if (nLy < _systemManager.SpawnLightYears)
+            double nAu = _starPager.NearestDistanceMeters / MathUtil.AstronomicalUnit;
+            if (nAu < _systemManager.SpawnAu)
                 ImGui.TextColored(new System.Numerics.Vector4(0.4f, 1f, 0.5f, 1f),
-                    $"  >> within {_systemManager.SpawnLightYears:0.###} ly (solar system range)");
+                    $"  >> within {_systemManager.SpawnAu:0} AU (solar system range)");
         }
         else
         {
@@ -900,7 +901,7 @@ internal static class Program
         }
         else
         {
-            ImGui.Text($"System: none (fly within {_systemManager.SpawnLightYears:0.###} ly of a star)");
+            ImGui.Text($"System: none (fly within {_systemManager.SpawnAu:0} AU of a star)");
         }
 
         ImGui.Separator();
@@ -1540,11 +1541,12 @@ internal static class Program
             ImGui.Text($"Luminosity: {s.Luminosity:0.00} Lsun");
             ImGui.Text($"Mass: {s.MassSolar:0.00} Msun");
             ImGui.Text($"Distance: {nLy:0.0000} ly");
-            if (nLy < _systemManager.SpawnLightYears)
+            double nAu = _starPager.NearestDistanceMeters / MathUtil.AstronomicalUnit;
+            if (nAu < _systemManager.SpawnAu)
                 ImGui.TextColored(new System.Numerics.Vector4(0.4f, 1f, 0.5f, 1f),
-                    $"  >> within {_systemManager.SpawnLightYears:0.###} ly — system in range");
+                    $"  >> within {_systemManager.SpawnAu:0} AU — system in range");
             else
-                ImGui.TextDisabled($"  Approach within {_systemManager.SpawnLightYears:0.###} ly to spawn its system.");
+                ImGui.TextDisabled($"  Approach within {_systemManager.SpawnAu:0} AU to spawn its system.");
         }
         else
         {

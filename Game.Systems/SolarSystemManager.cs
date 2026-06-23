@@ -5,14 +5,18 @@ namespace Game.Systems;
 
 /// <summary>
 /// Owns the lifecycle of the one solar system that can be active at a time. Spawns the
-/// nearest star's system when the camera crosses <see cref="SpawnLightYears"/>, and
-/// despawns it only after the camera retreats past <see cref="DespawnLightYears"/> — the
-/// gap between the two is hysteresis that prevents spawn/despawn thrash at the boundary.
+/// nearest star's system when the camera crosses <see cref="SpawnAu"/>, and despawns it
+/// only after the camera retreats past <see cref="DespawnAu"/> — the gap between the two
+/// is hysteresis that prevents spawn/despawn thrash at the boundary.
+///
+/// Ranges are in AU because that is the natural unit at system scale: a generated system's
+/// outermost planet reaches at most ~100 AU, so the ~500 AU spawn shell holds the whole
+/// system with margin while every body is still sub-pixel, so nothing visibly pops in.
 /// </summary>
 public sealed class SolarSystemManager
 {
-    public double SpawnLightYears = 0.01;
-    public double DespawnLightYears = 0.012;
+    public double SpawnAu = 500.0;
+    public double DespawnAu = 600.0;
 
     /// <summary>
     /// Simulation seconds elapsed per real second. Orbital motion you see is time-lapse, so
@@ -29,8 +33,8 @@ public sealed class SolarSystemManager
     public ulong? ActiveStarId => _active?.Sun.Id;
     public double SimTime => _simTime;
 
-    /// <summary>Distance from the camera to the active star, in light-years (∞ if none).</summary>
-    public double ActiveStarDistanceLy { get; private set; } = double.PositiveInfinity;
+    /// <summary>Distance from the camera to the active star, in AU (∞ if none).</summary>
+    public double ActiveStarDistanceAu { get; private set; } = double.PositiveInfinity;
 
     public void Update(double dt, in UniversePosition camera, INearestStar field)
     {
@@ -39,20 +43,20 @@ public sealed class SolarSystemManager
         // Despawn if we've drifted out of range of the currently active star.
         if (_active != null)
         {
-            ActiveStarDistanceLy = camera.DistanceTo(_active.Sun.Position) / MathUtil.LightYear;
-            if (ActiveStarDistanceLy > DespawnLightYears)
+            ActiveStarDistanceAu = camera.DistanceTo(_active.Sun.Position) / MathUtil.AstronomicalUnit;
+            if (ActiveStarDistanceAu > DespawnAu)
             {
                 _active = null;
-                ActiveStarDistanceLy = double.PositiveInfinity;
+                ActiveStarDistanceAu = double.PositiveInfinity;
             }
         }
 
         // Spawn the nearest system once we're close enough and nothing is active.
         if (_active == null && field.HasNearest &&
-            field.NearestDistanceMeters / MathUtil.LightYear < SpawnLightYears)
+            field.NearestDistanceMeters / MathUtil.AstronomicalUnit < SpawnAu)
         {
             _active = SystemGenerator.Generate(field.Nearest);
-            ActiveStarDistanceLy = field.NearestDistanceMeters / MathUtil.LightYear;
+            ActiveStarDistanceAu = field.NearestDistanceMeters / MathUtil.AstronomicalUnit;
         }
 
         _active?.UpdatePositions(_simTime);
