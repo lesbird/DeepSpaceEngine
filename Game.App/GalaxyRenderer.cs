@@ -125,7 +125,11 @@ void main() {
                 float size = Math.Clamp(MinSizePx + SizeScale * cue, MinSizePx, MaxSizePx);
                 float bright = Math.Clamp(0.8f + 1.2f * cue, 0.7f, 3.0f);
 
-                var dir = Vector3D.Normalize(new Vector3D<float>((float)rel.X, (float)rel.Y, (float)rel.Z));
+                // Normalise in DOUBLE then cast: galaxies are ~1e22 m away, so squaring a float-cast
+                // component (~1e44) overflows float's ~3.4e38 max to infinity, collapsing every sprite
+                // to a NaN/zero direction (drawn but invisible). distM is the precise double length.
+                var dir = new Vector3D<float>(
+                    (float)(rel.X / distM), (float)(rel.Y / distM), (float)(rel.Z / distM));
 
                 EnsureCapacity(n + 1);
                 int o = n * FloatsPerGalaxy;
