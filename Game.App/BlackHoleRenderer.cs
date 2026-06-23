@@ -117,10 +117,13 @@ void main() {
         _disk = Primitives.BuildRingAnnulus(gl, segments: 256);
     }
 
-    public void Render(Camera camera)
+    /// <summary>Draw the supermassive black hole at <paramref name="center"/> — the centre of the
+    /// galaxy you're in. (Each galaxy has its own SMBH; the caller renders it only when near that
+    /// galaxy's core.)</summary>
+    public void Render(Camera camera, UniversePosition center)
     {
-        Vector3D<float> centerRel = UniversePosition.Origin.ToCameraRelative(camera.Position);
-        Matrix4X4<float> viewProj = camera.ViewMatrix * Projection(camera);
+        Vector3D<float> centerRel = center.ToCameraRelative(camera.Position);
+        Matrix4X4<float> viewProj = camera.ViewMatrix * Projection(camera, center);
 
         // --- Event horizon: opaque, depth-tested so it occludes the far side of the disk. ---
         _gl.Enable(EnableCap.DepthTest);
@@ -155,9 +158,9 @@ void main() {
         _gl.Disable(EnableCap.DepthTest);
     }
 
-    private Matrix4X4<float> Projection(Camera camera)
+    private Matrix4X4<float> Projection(Camera camera, UniversePosition center)
     {
-        double d = camera.Position.DistanceTo(UniversePosition.Origin);
+        double d = camera.Position.DistanceTo(center);
         float near = (float)Math.Max(HorizonRadius * 0.05, (d - DiskOuter) * 0.5);
         float far = (float)Math.Max((d + DiskOuter) * 2.0, near * 10.0);
         return MatrixHelper.PerspectiveGL(camera.FovRadians, camera.AspectRatio, near, far);

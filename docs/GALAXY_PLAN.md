@@ -192,7 +192,18 @@ are strings) gain an optional galaxy prefix, e.g. `G<gid>-<starId>`.
   real 3-D disk around you. HUD: "N resident, P pts, D disks, C clouds". 4 new `GalaxyCloud` tests.
   NOTE: inside a galaxy you now see catalog stars + cloud disk + the still-painted fake band —
   reconciled in Phase 5 (per-galaxy backdrop). `CloudBrightness` public for tuning.
-- **Phase 5** — Hand-off cloud → real streamed catalog on entry; per-galaxy SMBH + backdrop.
+- **Phase 5 — DONE 2026-06-23** (build + 91 tests green; pending on-device verify). Reconciles the
+  in-galaxy view + makes the black hole per-galaxy. (1) **Per-galaxy SMBH**: `BlackHoleRenderer.Render`
+  now takes a `center` (was hard-coded `UniversePosition.Origin`); `Program` draws it only when
+  `IsInside`, at `Containing.Center`, so each galaxy has its own core and intergalactic space has none
+  (home view unchanged — Milky Way centre is the origin). (2) **Backdrop reconciliation**: the painted
+  Milky-Way band + dome is fake/redundant now that the real cloud renders the host disk, so it recedes
+  to a faint floor (0.10) whenever a real galaxy cloud is on screen (`LastClouds>0`), else eases down
+  by distance; smoothed across frames (`_backdropDim`, ~0.5 s) so it never pops. (3) **Cloud→catalog
+  hand-off** widened: cloud near-fade now 300→1500 ly (was 40→200) so the dense streamed catalog
+  (real stars to the resident-block extent, several hundred ly) owns the foreground and the coarse
+  cloud only fills the galaxy body beyond it. Net: inside a galaxy you now see real catalog stars +
+  the volumetric cloud disk + a per-galaxy black hole, with the fake band faded away.
 - **Phase 6** — Universe-level **map view** (extend the `N` galaxy map to zoom out to the cosmic
   web), performance passes, photo-mode polish.
 

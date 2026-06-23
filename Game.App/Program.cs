@@ -143,6 +143,7 @@ internal static class Program
     private static int _frameTimeIdx, _frameTimeCount;
     private static double _frameTimeSum;
     private static double _renderClock;
+    private static float _backdropDim = 1.0f; // smoothed painted-backdrop dimming (recedes as real galaxy clouds take over)
     private static bool _smoke;
     private static int _smokeFrames;
 
@@ -535,18 +536,26 @@ internal static class Program
 
         // Distant galaxy first (writes no depth), so the streamed stars, system, and atmosphere all
         // composite over it and any opaque body occludes the sky behind it.
-        // The painted backdrop (Milky-Way band + dome) is the view from INSIDE the galaxy; fade it out
-        // as you leave so it stops drowning the real galaxy sprites in intergalactic space. Full within
-        // the galaxy, easing to a dim cosmic floor by ~2× its radius.
-        float backdropDim = 0.12f;
-        if (_galaxyPager.HasNearest)
+        //
+        // The painted backdrop (Milky-Way band + dome) is a *fake* view from inside the galaxy. Now that
+        // the real volumetric cloud renders the host galaxy's disk, the painted band is redundant (and,
+        // for any galaxy other than the home one, pointing the wrong way). So recede it to a faint floor
+        // whenever a real galaxy cloud is on screen; otherwise ease it down toward the intergalactic
+        // floor by distance. Smoothed across frames so the change never pops. (LastClouds is last
+        // frame's value — additive passes are order-independent, so a one-frame lag is invisible.)
+        float dimTarget;
+        if (_galaxyRenderer.LastClouds > 0) dimTarget = 0.10f;          // real galaxy cloud present
+        else if (_galaxyPager.IsInside) dimTarget = 1.0f;              // inside, cloud not loaded yet
+        else if (_galaxyPager.HasNearest)
         {
             double r = _galaxyPager.Nearest.RadiusMeters;
             double d = _galaxyPager.NearestDistanceMeters;
             double t = r > 0 ? Math.Clamp((2.0 * r - d) / r, 0.0, 1.0) : 0.0;
-            backdropDim = (float)(0.12 + 0.88 * t);
+            dimTarget = (float)(0.12 + 0.88 * t);
         }
-        _backdrop.ExternalDim = backdropDim;
+        else dimTarget = 0.12f;
+        _backdropDim += (dimTarget - _backdropDim) * 0.04f; // ~half a second fade
+        _backdrop.ExternalDim = _backdropDim;
         _backdrop.Render(_camera);
         // Other galaxies as bright point sprites (the farthest LOD tier) — additive, direction-only,
         // over the painted backdrop. Skips the galaxy we're inside (its stars stream via the catalog).
@@ -576,12 +585,13 @@ internal static class Program
             }
         }
 
-        // Galactic-centre features at the origin: the optional plane grid, then the supermassive
-        // black hole. Drawn now while the depth buffer is still clear; both use their own wide
-        // projections, so we clear depth again afterwards to leave the system/terrain passes — and
-        // the depth-aware atmosphere that linearises this buffer with their near/far — unaffected.
+        // Galactic-centre features: the optional plane grid, then the supermassive black hole — now at
+        // the centre of the galaxy you're IN (each galaxy has its own SMBH), drawn only when inside one
+        // so intergalactic space has none. Drawn while the depth buffer is still clear; both use their
+        // own wide projections, so we clear depth again afterwards to leave the system/terrain passes —
+        // and the depth-aware atmosphere that linearises this buffer with their near/far — unaffected.
         if (_galacticGridVisible) _galacticGrid.Render(_camera);
-        _blackHole.Render(_camera);
+        if (_galaxyPager.IsInside) _blackHole.Render(_camera, _galaxyPager.Containing.Center);
         _gl.Clear((uint)ClearBufferMask.DepthBufferBit);
 
         if (_systemManager.HasActive)

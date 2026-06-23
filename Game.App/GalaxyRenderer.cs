@@ -53,10 +53,13 @@ public sealed class GalaxyRenderer : IDisposable
     private const float CloudNear = 1.0e9f;
     private const float CloudFar = 3.0e22f;
 
-    // Per-point near-fade band (metres): hide cloud points inside ~40 ly (the catalog renders real
-    // stars there), full beyond ~200 ly. Bridges cloud → resolved catalog as you enter a galaxy.
-    private static readonly float CloudNearFadeLo = (float)(40.0 * MathUtil.LightYear);
-    private static readonly float CloudNearFadeHi = (float)(200.0 * MathUtil.LightYear);
+    // Per-point near-fade band (metres): fade cloud points in across ~300 → 1500 ly, so the dense
+    // streamed catalog (which renders real stars out to the resident-block extent, several hundred ly)
+    // carries the foreground and the coarse cloud only fills the galaxy body beyond it. The slight
+    // overlap is preferable to an empty bubble between the two. This bridges cloud → resolved catalog
+    // as you enter a galaxy.
+    private static readonly float CloudNearFadeLo = (float)(300.0 * MathUtil.LightYear);
+    private static readonly float CloudNearFadeHi = (float)(1500.0 * MathUtil.LightYear);
 
     private const int CloudCount = 120_000; // sample points per galaxy
     private const int CloudCap = 3;         // generate/draw clouds for at most this many nearest galaxies
