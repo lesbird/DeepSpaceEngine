@@ -33,6 +33,12 @@ public sealed class GalaxyBackdrop : IDisposable
     /// <summary>Overall multiplier on the distant emission nebulae.</summary>
     public float NebulaBrightness = 0.7f;
 
+    /// <summary>Extra multiplier applied to the whole painted sky, set each frame by the caller. This
+    /// backdrop is the view from <i>inside</i> the Milky Way; out in intergalactic space it makes no
+    /// sense, so the caller fades it toward zero once you leave the galaxy — which also stops the fake
+    /// band + dome stars from drowning out the real galaxy point sprites.</summary>
+    public float ExternalDim = 1.0f;
+
     // Far enough to sit behind the near-field star bubble; exact value is irrelevant because the
     // rotation-only view has no translation, so dome points project by direction alone.
     private const float DomeRadius = 1.0e15f;
@@ -307,7 +313,7 @@ void main() {
         _band.SetFloat("uTanHalfFov", MathF.Tan(camera.FovRadians * 0.5f));
         _band.SetFloat("uAspect", camera.AspectRatio);
         _band.SetVector3("uCenterDir", toCenter);
-        _band.SetFloat("uBrightness", BandBrightness);
+        _band.SetFloat("uBrightness", BandBrightness * ExternalDim);
         _gl.BindVertexArray(_bandVao);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
 
@@ -321,7 +327,7 @@ void main() {
             _nebula.SetVector3("uUp", camera.Up);
             _nebula.SetFloat("uTanHalfFov", MathF.Tan(camera.FovRadians * 0.5f));
             _nebula.SetFloat("uAspect", camera.AspectRatio);
-            _nebula.SetFloat("uBrightness", NebulaBrightness);
+            _nebula.SetFloat("uBrightness", NebulaBrightness * ExternalDim);
             _nebula.SetInt("uCount", _nebCount);
             for (int i = 0; i < _nebCount; i++)
             {
@@ -343,7 +349,7 @@ void main() {
         // shader holds it at the floor and dims it instead (see DomeVert/DomeFrag).
         _dome.SetFloat("uMinSize", 2.5f);
         _dome.SetFloat("uMaxSize", 4f);
-        _dome.SetFloat("uBrightness", StarBrightness);
+        _dome.SetFloat("uBrightness", StarBrightness * ExternalDim);
         _gl.BindVertexArray(_domeVao);
         _gl.DrawArrays(PrimitiveType.Points, 0, (uint)_domeCount);
         _gl.BindVertexArray(0);

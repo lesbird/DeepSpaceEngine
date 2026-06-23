@@ -535,6 +535,18 @@ internal static class Program
 
         // Distant galaxy first (writes no depth), so the streamed stars, system, and atmosphere all
         // composite over it and any opaque body occludes the sky behind it.
+        // The painted backdrop (Milky-Way band + dome) is the view from INSIDE the galaxy; fade it out
+        // as you leave so it stops drowning the real galaxy sprites in intergalactic space. Full within
+        // the galaxy, easing to a dim cosmic floor by ~2× its radius.
+        float backdropDim = 0.12f;
+        if (_galaxyPager.HasNearest)
+        {
+            double r = _galaxyPager.Nearest.RadiusMeters;
+            double d = _galaxyPager.NearestDistanceMeters;
+            double t = r > 0 ? Math.Clamp((2.0 * r - d) / r, 0.0, 1.0) : 0.0;
+            backdropDim = (float)(0.12 + 0.88 * t);
+        }
+        _backdrop.ExternalDim = backdropDim;
         _backdrop.Render(_camera);
         // Other galaxies as bright point sprites (the farthest LOD tier) — additive, direction-only,
         // over the painted backdrop. Skips the galaxy we're inside (its stars stream via the catalog).

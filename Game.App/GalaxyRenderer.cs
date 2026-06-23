@@ -22,11 +22,12 @@ public sealed class GalaxyRenderer : IDisposable
 {
     public bool Enabled = true;
     /// <summary>Overall brightness multiplier on the galaxy sprites.</summary>
-    public float Brightness = 1.0f;
-    /// <summary>Scales apparent point size (px) with apparent flux.</summary>
-    public float SizeScale = 6.0f;
-    public float MinSizePx = 2.0f;
-    public float MaxSizePx = 16.0f;
+    public float Brightness = 1.8f;
+    /// <summary>Scales apparent point size (px) with the brightness cue.</summary>
+    public float SizeScale = 16.0f;
+    /// <summary>Floor size (px): even a far galaxy stays a clearly visible dot, distinct from a backdrop star.</summary>
+    public float MinSizePx = 4.0f;
+    public float MaxSizePx = 28.0f;
 
     /// <summary>Galaxies drawn last frame (HUD/debug).</summary>
     public int LastDrawn { get; private set; }
@@ -122,7 +123,7 @@ void main() {
                 // huge just outside a galaxy and fading toward the floor tens of Mly out.
                 float cue = (float)(Math.Sqrt(g.StarCount / RefStarCount) * (RefDistLy / distLy));
                 float size = Math.Clamp(MinSizePx + SizeScale * cue, MinSizePx, MaxSizePx);
-                float bright = Math.Clamp(0.4f + 0.8f * cue, 0.3f, 2.0f);
+                float bright = Math.Clamp(0.8f + 1.2f * cue, 0.7f, 3.0f);
 
                 var dir = Vector3D.Normalize(new Vector3D<float>((float)rel.X, (float)rel.Y, (float)rel.Z));
 
