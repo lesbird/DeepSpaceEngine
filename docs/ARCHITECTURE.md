@@ -324,10 +324,14 @@ default ~5.8e-22/ly³ gives a ~12 Mly mean separation — true scale).
 Milky Way at the universe origin** in block `(0,0,0)` (Spiral, 50 kly radius, seed = `WorldSeed`). Exposes `Galaxies`, `Count`, `Origin`, `BlockCoord`.
 
 **GalaxyCatalogPager** (sealed, implements `INearestGalaxy`) — `Update(in camera)` pages galaxy blocks
-(5×5×5 resident, evict at 3 — a deep field for the universe map / intergalactic view), tracks `Nearest`
+(9×9×9 resident, evict at 5 — a deep field for the universe map / intergalactic view), tracks `Nearest`
 and the galaxy the camera `IsInside`/`Containing`.
 `bool TryGetGalaxyForBlock(point, boundingRadius, out Galaxy)` — which galaxy a star-lattice block
-belongs to (the gate that confines stars to galaxies). Exposes `LoadedBlocks`, `LoadedGalaxyCount`.
+belongs to (the gate that confines stars to galaxies).
+`bool TryGetAimedGalaxy(in camera, forward, out Galaxy, out distance, tolerance)` — the galaxy under the
+centre reticle (smallest angular offset within the galaxy's own apparent radius + a small cone), for the
+intergalactic HUD readout. Exposes `LoadedBlocks`, `LoadedGalaxyCount`. The resident radius is kept
+larger than `GalaxyRenderer`'s far-fade so distant galaxies fade out before a block can pop in/out.
 
 **GalaxyId** (static) — invertible `(block, local) ↔ ulong`, like `StarId` (16 local + 3×16 axis bits).
 
@@ -371,7 +375,13 @@ within 1 Chebyshev block and evicts beyond 2; blocks with no galaxy are empty. R
 
 **Star** (readonly struct) — `Id`, `Position`, `Temperature`, `Luminosity`,
 `MassSolar`, `RadiusMeters`, `Class` (`SpectralClass` M…O), `Color` (from
-`Blackbody.ColorOf`), plus `SizeCue`, `ClassLetter`, `Designation`.
+`Blackbody.ColorOf`), plus `SizeCue`, `ClassLetter`, `Designation`, and `Name` (from `Naming`).
+
+**Naming** (static) — deterministic display names from a 64-bit id, regenerated never stored.
+`StarName(id)` builds an evocative two-word name (*Helix Prime*, *Crimson Vega*) from curated word lists
+× patterns — a large but deliberately **non-unique** space (the id stays the unique handle; the name is
+flavour). `GalaxyName(id)` builds a catalog-style designation (*M 31*, *NGC 224*, *UGC 12158*), weighted
+toward the larger real catalogs. The Milky Way keeps its literal name (special-cased in `GalaxyCatalog`).
 
 **GlobularCluster** (readonly struct) + **GlobularClusters** (static) — `ForGalaxy(Galaxy)` places
 ~200 clusters in a galaxy's spheroidal outer halo (40–200 ly across); `StarRng(c,i)` + `StarOffset` is
@@ -519,10 +529,12 @@ star and every body in the active system, plus the smallest surface gap for
 anti-tunnelling, and feeds both to the controller via `SetSpeedContext`.
 
 **AsteroidFieldManager** (sealed) — streams deep-space clusters on a coarse grid
-(`CellSizeSectors = 32_768` ≈ 0.52 ly; ~20% of cells roll a cluster).
-`Update(in camera, int radiusCells)` rebuilds `Visible` and evicts distant cells;
-`Collect(t, camera, maxDist, output)` gathers camera-relative rocks;
-`bool TryFindNearest(in from, int searchCells, out AsteroidField)` backs the
+(`CellSizeSectors = 32_768` ≈ 0.52 ly; ~20% of cells roll a cluster, each ~1800–4800 rocks generated
+synchronously). `Update(in camera, int radiusCells)` rebuilds `Visible` and evicts distant cells — but
+**short-circuits when the camera's cell jumped farther than the visible bubble** since last frame (i.e.
+faster than any 0.5 ly cluster could be seen), so intergalactic warp doesn't burn the main thread
+generating clusters that whip past invisibly. `Collect(t, camera, maxDist, output)` gathers
+camera-relative rocks; `bool TryFindNearest(in from, int searchCells, out AsteroidField)` backs the
 jump-to-cluster key.
 
 **Discovery** (`Game.Systems/Discovery/`) — the client half of the networked
@@ -577,9 +589,9 @@ can fit its own near/far for precision.
 ```
 SceneFramebuffer.Bind(); clear color+depth
   backdrop.ExternalDim = …; backdrop.Render(camera)  // painted sky; recedes when a real galaxy cloud is up
-  galaxyRenderer.Render(camera, galaxyPager)    // other galaxies: point → impostor → cloud + body glow (additive)
-  nebulaRenderer.Render(camera, nebulaField)    // fly-to clouds (additive, no depth)
-  starRenderer.SyncBlocks(..., clock); RenderCatalog(camera, activeStarId)   // per-block temporal fade-in
+  galaxyRenderer.Render(camera, galaxyPager, sceneFbo, w, h)  // point → impostor → body glow (glow at half-res); cloud off by default
+  nebulaRenderer.Render(camera, nebulaField, sceneFbo, w, h)  // fly-to clouds, rendered half-res & composited up (additive, no depth)
+  starRenderer.SyncBlocks(..., clock); RenderCatalog(camera, activeStarId)   // per-block fade-in; frustum-culled + distance-thinned
   globularRenderer.Render(camera, viewportH)    // halo clusters: fuzzy sprite ↔ resolved star cloud
   [deep-space asteroids, fitted projection];  clear depth
   galacticGrid.Render(camera) [if on];  if inside a galaxy: blackHole.Render(camera, galaxy.Center);  clear depth
@@ -596,7 +608,8 @@ SceneFramebuffer.BlitColorTo(postFbo)
   atmosphereRenderer.Render(... depthTex, near, far ...) // volumetric scattering
 bloom.Render(postFbo.ColorTexture); bloom.Composite(scene, bloom)   // to screen
 HUD: overlay.Draw + overlay.DrawGlobularReticles(camera, globularRenderer.Marks)
-     + if inside a galaxy: overlay.DrawGalaxyCenterReticle(camera, galaxy.Center)   // CORE/SMBH reticle
+     + if inside a galaxy: overlay.DrawGalaxyCenterReticle(camera, galaxy.Center)        // CORE/SMBH reticle
+     + else if TryGetAimedGalaxy: overlay.DrawAimedGalaxyReticle(camera, galaxy, dist)   // name/shape/stars/distance
      + DrawHud/DrawTuning/DrawScanner/DrawSystemMap/DrawGalaxyMap/DrawUniverseMap; imgui.Render()
 ```
 
@@ -606,11 +619,11 @@ All take `Camera` and compute camera-relative geometry; most fit their own near/
 
 | Renderer | Entry point | Draws |
 |---|---|---|
-| **StarRenderer** | `RenderCatalog(camera, ulong? excludeId)`, `SyncBlocks(loadedBlocks, now)`, `Render(camera, visible, bubbleMeters, excludeId)` | additive point sprites; magnitude falloff `bright·flux^gamma`; **per-block temporal fade-in** (streamed blocks ramp in over ~0.7 s, no chunk-pop); skips the active sun. Catalog positions baked **hi/lo float pairs** (compensated relative-to-camera, §11) so stars within a few hundred AU — e.g. a cluster neighbour — don't jitter. Tunables: `CatBrightScale/Gamma/SizeScale`, min/max size |
-| **GalaxyRenderer** | `Render(camera, galaxyPager)` | other galaxies, cross-faded by apparent size: fuzzy **point** sprite → oriented **impostor disk** (bulge + spiral arms + fbm dust lanes, capped to the nearest few) → **volumetric cloud** (`GalaxyCloud`, nearest 1, async-cached) + nebula-style **body glow** (`GalaxyGlow` puffs, nearest 2, per-puff fade-on-enter). An `insideAmount` gate fades distant faint galaxies out as you enter one. Skips point/impostor for the galaxy you're inside. Tunables: point/impostor/cloud/**glow** brightness, sizes, cloud point scale |
-| **GlobularClusterRenderer** | `SetClusters(GlobularCluster[])`, `Render(camera, viewportH)` | halo clusters cross-faded by apparent size: **fuzzy sprite** (positioned, sized by angular radius) ↔ **resolved star cloud** (async-cached, near-faded to the real injected catalog stars); exposes `Marks` for the HUD reticle. `SpriteBrightness`, `CloudBrightness`, `CloudPointScale` |
+| **StarRenderer** | `RenderCatalog(camera, ulong? excludeId)`, `SyncBlocks(loadedBlocks, now)`, `Render(camera, visible, bubbleMeters, excludeId)` | additive point sprites; magnitude falloff `bright·flux^gamma`; **per-block temporal fade-in** (streamed blocks ramp in over ~0.7 s, no chunk-pop); skips the active sun. **Frustum-culls** resident blocks (planes from the view-proj) and **distance-thins** far blocks (draws a shrinking front-prefix — unbiased since stars are stored in uniform-random order), so a dense region draws a few million of its tens of millions resident, no visual change (`LastDrawn`/`LastBlocksDrawn`). Catalog positions baked **hi/lo float pairs** (compensated relative-to-camera, §11) so near stars don't jitter. Tunables: `CatBrightScale/Gamma/SizeScale`, min/max size |
+| **GalaxyRenderer** | `Render(camera, galaxyPager, sceneFbo, w, h)` | other galaxies, cross-faded by apparent size: fuzzy **point** sprite (visible out to ~56 Mly, fading before the streaming pop-in distance) → oriented **impostor disk** (bulge + arms + fbm dust lanes, nearest few) → optional **volumetric cloud** (`GalaxyCloud`; **off by default** via `CloudEnabled` — inside a galaxy it looked flyable but isn't) + nebula-style **body glow** (`GalaxyGlow` puffs, nearest 2, per-puff fade-on-enter) **rendered to a half-res buffer and composited up** (≈4× less fill on the screen-filling fBm). An `insideAmount` gate fades faint distant galaxies as you enter one; skips point/impostor for the galaxy you're inside. Tunables: point/impostor/cloud/**glow** brightness, sizes, cloud point scale, `CloudEnabled` |
+| **GlobularClusterRenderer** | `SetClusters(GlobularCluster[])`, `Render(camera, viewportH)` | halo clusters cross-faded by apparent size: **fuzzy sprite** (positioned, sized by angular radius) ↔ **resolved star cloud** (async-cached, near-faded to the real injected catalog stars). The sprite **holds at full strength until that cluster's cloud is actually resident**, so a fast approach (or a re-approach after eviction) never shows a gap between sprite and resolved stars. Exposes `Marks` for the HUD reticle. `SpriteBrightness`, `CloudBrightness`, `CloudPointScale` |
 | **GalaxyBackdrop** | `Render(camera)` | fullscreen band (fBm dust + arms + bulge), 6 painted nebula patches, dome stars. `ExternalDim` (set per-frame — recedes once a real galaxy cloud is on screen). `Enabled`, `BandBrightness`, `StarBrightness`, `NebulaBrightness` |
-| **NebulaRenderer** | `Render(camera, NebulaField)` | additive fBm billboards, fade-on-entry; wide depth-irrelevant projection. `Enabled`, `Intensity` |
+| **NebulaRenderer** | `Render(camera, NebulaField, sceneFbo, w, h)` | additive fBm billboards, fade-on-entry; wide depth-irrelevant projection. **Half-res** (rendered into a quarter-pixel buffer, composited up), 3-octave fBm, and size-culled/capped to the prominent few — soft clouds upscale invisibly, overdraw falls ~5–6×. `Enabled`, `Intensity` |
 | **SystemRenderer** | `Render(camera, system, terrainBody?, map?)` | emissive sun, lit planets/moons (procedural relief/craters/maria or gas bands, or the baked map for the focused body), banded rings + planet shadow, faint orbit rings. `LastNear/LastFar` feed atmosphere |
 | **PlanetTerrainRenderer** | `Render(camera, sunDir, renderClock, map)`; `SetBody(body)`, `FocusPoint`, `Rebuild()`, `TrySurfaceHeight(dir, out h)` | cube-sphere quadtree LOD with geomorph; GPU tile path by default (`TerrainTileGenerator`/`TerrainTileCache` bake height/normal/albedo into an atlas; vertex texture fetch displaces). Counts: `PatchCount`, `LeafCount`, `GrassLeaves` |
 | **ScatterRenderer** | `Render(camera, body, terrain, sunDir, near, far, clock)`; `Spawners`, `InvalidateActivation()` | instanced surface objects sampling the same height tile; per-layer mesh/density/size/orient + `EnvTrait`/spawn-chance/altitude gating |
@@ -668,17 +681,22 @@ captures and writes it. Because nebula count/radius are generation inputs,
 
 ### 9.7 HUD / overlays
 
-`StarOverlay.Draw(camera, pager, systems, searchTarget?)` paints reticles, labels
-and the nearest-star arrow; `DrawGlobularReticles(camera, marks)` adds a `GC` bracket reticle +
-distance on each in-range globular cluster; `DrawGalaxyCenterReticle(camera, galaxy.Center)` (when
-inside a galaxy) marks the **galactic core / SMBH** with a `CORE` reticle and an off-screen arrow — both
-projected by direction, since the target sits past the far plane. ImGui panels: `DrawHud`
-(position/speed/FPS/system, the **galaxy/cluster** status line, a **travel-to-galaxy** list, find-star
-box), `DrawTuning` (all sliders + save/load, including the **Galaxies (LOD)** — point/impostor/cloud +
-body-glow — and **Globular clusters** sections and the **Audio** panel: master/music/sfx volume, music
-on/off, Test-SFX — see §6), `DrawScanner` (body / star / sector readout, F), `DrawSystemMap` (top-down
-system, M, with nebula disks and click-to-travel), `DrawGalaxyMap`/3D neighbourhood (N), and
-`DrawUniverseMap` (top-down chart of the **galaxies**, U, click-to-jump via `GoToGalaxy`).
+`StarOverlay.Draw(camera, pager, systems, searchTarget?)` paints reticles, labels (now leading with each
+object's **name**) and the nearest-star arrow; `DrawGlobularReticles(camera, marks)` adds a `GC` bracket
+reticle + distance on each in-range globular cluster; `DrawGalaxyCenterReticle(camera, galaxy.Center)`
+(when inside a galaxy) marks the **galactic core / SMBH** with a `CORE` reticle and an off-screen arrow;
+`DrawAimedGalaxyReticle(camera, galaxy, dist)` (intergalactic) marks the galaxy under the centre reticle
+with its **name, morphology, star count and distance** — all projected by direction, since the targets
+sit past the far plane. The top **speed overlay** shows speed / target / **FPS + frame-time (ms)** /
+**framebuffer resolution**. ImGui panels: `DrawHud` (position/speed/FPS/system, the **galaxy/cluster**
+status line, a **travel-to-galaxy** list, find-star box, drawn-vs-resident star counts), `DrawTuning`
+(all sliders + save/load, including the **Galaxies (LOD)** — point/impostor/cloud + body-glow, with the
+**Render galaxy cloud** toggle — and **Globular clusters** sections and the **Audio** panel: master/music/
+sfx volume, music on/off, Test-SFX — see §6), `DrawScanner` (body / star / sector readout, F, which now
+**appends a host-galaxy section** — name, type, radius, star count, core distance — whenever inside a
+galaxy), `DrawSystemMap` (top-down system, M, with nebula disks and click-to-travel),
+`DrawGalaxyMap`/3D neighbourhood (N), and `DrawUniverseMap` (top-down chart of the **galaxies**, U,
+click-to-jump via `GoToGalaxy`).
 
 ---
 

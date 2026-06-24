@@ -76,7 +76,17 @@ interstellar flight down to standing on a planet. See the full design in
 > and its own **nebulae**, and the top speed reaches **~100 Mly/s** so the voids are crossable (with a
 > *travel-to-galaxy* list in the HUD). A galaxy's halo is dotted with **globular clusters** — fuzzy
 > stars from thousands of ly out that resolve into a dense knot of **real, visitable stars**, each with
-> its own solar system. Generation is fully deterministic. M5 (fidelity) is underway.
+> its own solar system. Every star and galaxy now carries a **deterministic proper name** derived from
+> its id — stars get evocative two-word names (*Helix Prime*, *Crimson Vega*), galaxies get catalog-style
+> designations (*NGC 224*, *M 31*, *UGC 12158*) — surfaced in the HUD reticles, scanner, search and maps.
+> Out in intergalactic space the centre reticle **locks onto whichever galaxy you aim at** and reads out
+> its name, morphology, star count and distance, the scanner appends a **host-galaxy** readout whenever
+> you're inside one, and distant galaxies stay visible as **fuzzy dots** far across the void. The inside-a-galaxy
+> view stays fast at true star densities: the **catalog star field is frustum-culled and distance-thinned**
+> (tens of millions resident, only the visible few million drawn), the soft volumetric layers — **nebulae
+> and galaxy body-glow — render at half resolution** and composite up (invisible on blurry gas, a quarter
+> of the fill), deep-space asteroid generation **skips itself at warp speed**, and the HUD shows the live
+> **resolution and frame time**. Generation is fully deterministic. M5 (fidelity) is underway.
 
 ## Screenshots
 
