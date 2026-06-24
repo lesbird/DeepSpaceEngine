@@ -11,11 +11,11 @@ public static class NebulaTuning
 {
     /// <summary>How many nebulae are scattered through the disk. Few and large reads better than
     /// many and small.</summary>
-    public static int Count = 40;
+    public static int Count = 12;
 
     /// <summary>Smallest visual radius, light-years.</summary>
-    public static float MinRadiusLy = 120f;
+    public static float MinRadiusLy = 400f;
 
     /// <summary>Largest visual radius, light-years.</summary>
-    public static float MaxRadiusLy = 400f;
+    public static float MaxRadiusLy = 1000f;
 }

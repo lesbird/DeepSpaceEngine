@@ -1169,9 +1169,9 @@ internal static class Program
             bool nebDirty = false;
             ImGui.SliderInt("Nebula count", ref NebulaTuning.Count, 1, 300);
             nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
-            ImGui.SliderFloat("Nebula radius min (ly)", ref NebulaTuning.MinRadiusLy, 10f, 800f);
+            ImGui.SliderFloat("Nebula radius min (ly)", ref NebulaTuning.MinRadiusLy, 10f, 2000f);
             nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
-            ImGui.SliderFloat("Nebula radius max (ly)", ref NebulaTuning.MaxRadiusLy, 10f, 800f);
+            ImGui.SliderFloat("Nebula radius max (ly)", ref NebulaTuning.MaxRadiusLy, 10f, 2000f);
             nebDirty |= ImGui.IsItemDeactivatedAfterEdit();
             if (nebDirty) RebuildNebulaField();
         }
@@ -2187,7 +2187,7 @@ internal static class Program
         {
             Galaxy g2 = _universeSel;
             double mly = g2.Center.DistanceTo(_camera.Position) / Ly / 1.0e6;
-            ImGui.Text($"{g2.Name}  •  {g2.Type}  •  {g2.RadiusLy / 1000.0:0.0} kly radius  •  {g2.StarCount:0.0e0} stars");
+            ImGui.Text($"{g2.Name}  •  {g2.Type}  •  {g2.RadiusLy / 1000.0:0.0} kly radius  •  {FormatCount(g2.StarCount)} stars");
             if (g2.Id == inside)
                 ImGui.TextDisabled("you are inside this galaxy");
             else

@@ -1,0 +1,99 @@
+{
+  "RenderBackdrop": true,
+  "BandBrightness": 0.600000024,
+  "BackdropStarBrightness": 1,
+  "NebulaBrightness": 0.699999988,
+  "NebulaCount": 12,
+  "NebulaMinRadiusLy": 400,
+  "NebulaMaxRadiusLy": 1000,
+  "GalaxyBrightness": 1.5,
+  "GalaxySizeScale": 26,
+  "GalaxyMinSize": 8.07999992,
+  "GalaxyMaxSize": 34,
+  "GalaxyImpostorBrightness": 1.29999995,
+  "GalaxyCloudBrightness": 1,
+  "GalaxyCloudPointScale": 2.5,
+  "RenderAtmosphere": true,
+  "SunIntensity": 20,
+  "Exposure": 1.20000005,
+  "RayleighStrength": 0.449999988,
+  "MieStrength": 0.159999996,
+  "MieG": 0.75999999,
+  "ShellHeight": 1,
+  "ReliefScale": 1,
+  "MountainScale": 1,
+  "FrequencyScale": 1,
+  "CraterScale": 1,
+  "CraterDensity": 1,
+  "SnowLine": 0.550000012,
+  "CliffThreshold": 0.685000002,
+  "CliffStrength": 0.850000024,
+  "LowlandTint": [
+    1,
+    1,
+    1
+  ],
+  "RockColor": [
+    0.419999987,
+    0.379999995,
+    0.330000013
+  ],
+  "SnowColor": [
+    0.920000017,
+    0.939999998,
+    0.980000019
+  ],
+  "CliffColor": [
+    0.300000012,
+    0.270000011,
+    0.239999995
+  ],
+  "Overrides": [],
+  "Spawners": [
+    {
+      "Name": "Rocks",
+      "Enabled": true,
+      "MeshId": 2,
+      "Density": 0.25,
+      "MinSize": 2,
+      "MaxSize": 6,
+      "Orient": 2,
+      "Seed": 11,
+      "Require": 1,
+      "Forbid": 0,
+      "SpawnChance": 1,
+      "MinAltitude": -1E+09,
+      "MaxAltitude": 1E+09
+    },
+    {
+      "Name": "Trees",
+      "Enabled": true,
+      "MeshId": 1,
+      "Density": 0.5,
+      "MinSize": 6,
+      "MaxSize": 14,
+      "Orient": 0,
+      "Seed": 22,
+      "Require": 4,
+      "Forbid": 0,
+      "SpawnChance": 1,
+      "MinAltitude": -1E+09,
+      "MaxAltitude": 1E+09
+    },
+    {
+      "Name": "Pickups",
+      "Enabled": true,
+      "MeshId": 3,
+      "Density": 0.100000001,
+      "MinSize": 2,
+      "MaxSize": 3,
+      "Orient": 1,
+      "Seed": 33,
+      "Require": 1,
+      "Forbid": 0,
+      "SpawnChance": 0.400000006,
+      "MinAltitude": -1E+09,
+      "MaxAltitude": 1E+09
+    }
+  ]
+}
