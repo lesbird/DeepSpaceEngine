@@ -51,14 +51,16 @@ void main() {
 }";
 
     // --- Static catalog path (draws a whole pre-generated block in one go) ---
-    private const int CatFloatsPerStar = 7; // pos(3) + color(3) + luminosity(1)
+    private const int CatFloatsPerStar = 10; // posHi(3) + posLo(3) + color(3) + luminosity(1)
 
     private const string CatVertexSource = @"#version 410 core
-layout(location = 0) in vec3 aPos;     // metres relative to the catalog origin
-layout(location = 1) in vec3 aColor;
-layout(location = 2) in float aLum;    // luminosity (Lsun)
+layout(location = 0) in vec3 aPosHi;   // metres relative to the catalog origin (high part)
+layout(location = 1) in vec3 aPosLo;   // low part of the same offset (compensated double-single)
+layout(location = 2) in vec3 aColor;
+layout(location = 3) in float aLum;    // luminosity (Lsun)
 uniform mat4 uViewProj;
-uniform vec3 uCamRel;                   // camera position relative to the catalog origin (m)
+uniform vec3 uCamRelHi;                 // camera position relative to the catalog origin (m), high part
+uniform vec3 uCamRelLo;                 // low part of the same
 uniform float uBrightScale;
 uniform float uGamma;                   // perceptual compression of the huge flux range
 uniform float uSizeScale;
@@ -70,7 +72,12 @@ out float vBright;
 const float LY = 9.4607e15;             // metres per light-year
 void main() {
     vColor = aColor;
-    vec3 rel = aPos - uCamRel;          // relative-to-camera (single-precision; far dots jitter sub-pixel)
+    // Compensated relative-to-camera: a 350 ly block's offsets reach ~3e18 m, whose float ulp is ~1.8 AU.
+    // A plain (aPos - uCamRel) subtraction quantises to that, so a star within a few hundred AU (i.e. inside
+    // a globular cluster) visibly jumps as the camera moves. Splitting both into hi/lo floats makes the hi
+    // difference EXACT for near stars (Sterbenz: the operands are within 2× of each other), so the position
+    // is precise to ~km; the lo terms carry the rest. Far stars lose the low bits but are sub-pixel anyway.
+    vec3 rel = (aPosHi - uCamRelHi) + (aPosLo - uCamRelLo);
     gl_Position = uViewProj * vec4(rel, 1.0);
     float distLy = max(length(rel) / LY, 1.0e-4);
     // Flux falls as 1/d^2, but raw flux spans an enormous range; a gamma far below 1 compresses it
@@ -263,11 +270,15 @@ void main() {
         for (int i = 0; i < stars.Count; i++)
         {
             Star s = stars[i];
-            Vector3D<float> p = s.Position.ToCameraRelative(block.Origin); // = position relative to origin
+            // Exact double offset from the block origin, split into hi/lo floats so the GPU can reconstruct
+            // it precisely (see CatVertexSource). ToCameraRelative would already round to float here.
+            Vector3D<double> d = s.Position.DeltaMeters(block.Origin); // = position relative to origin
+            float hx = (float)d.X, hy = (float)d.Y, hz = (float)d.Z;
             int o = i * CatFloatsPerStar;
-            data[o + 0] = p.X; data[o + 1] = p.Y; data[o + 2] = p.Z;
-            data[o + 3] = s.Color.X; data[o + 4] = s.Color.Y; data[o + 5] = s.Color.Z;
-            data[o + 6] = s.Luminosity;
+            data[o + 0] = hx; data[o + 1] = hy; data[o + 2] = hz;
+            data[o + 3] = (float)(d.X - hx); data[o + 4] = (float)(d.Y - hy); data[o + 5] = (float)(d.Z - hz);
+            data[o + 6] = s.Color.X; data[o + 7] = s.Color.Y; data[o + 8] = s.Color.Z;
+            data[o + 9] = s.Luminosity;
         }
 
         uint vao = _gl.GenVertexArray();
@@ -279,8 +290,10 @@ void main() {
         _gl.EnableVertexAttribArray(0);
         _gl.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, (void*)(3 * sizeof(float)));
         _gl.EnableVertexAttribArray(1);
-        _gl.VertexAttribPointer(2, 1, VertexAttribPointerType.Float, false, stride, (void*)(6 * sizeof(float)));
+        _gl.VertexAttribPointer(2, 3, VertexAttribPointerType.Float, false, stride, (void*)(6 * sizeof(float)));
         _gl.EnableVertexAttribArray(2);
+        _gl.VertexAttribPointer(3, 1, VertexAttribPointerType.Float, false, stride, (void*)(9 * sizeof(float)));
+        _gl.EnableVertexAttribArray(3);
         _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, new ReadOnlySpan<float>(data), BufferUsageARB.StaticDraw);
         _gl.BindVertexArray(0);
 
@@ -316,8 +329,12 @@ void main() {
         int drawn = 0;
         foreach ((Vector3D<long> coord, CatBlock b) in _catBlocks)
         {
-            Vector3D<float> camRel = camera.Position.ToCameraRelative(b.Origin); // camera relative to this block
-            _catShader.SetVector3("uCamRel", camRel);
+            // Camera relative to this block's origin, split hi/lo to match the baked star offsets.
+            Vector3D<double> dcam = camera.Position.DeltaMeters(b.Origin);
+            var camHi = new Vector3D<float>((float)dcam.X, (float)dcam.Y, (float)dcam.Z);
+            var camLo = new Vector3D<float>((float)(dcam.X - camHi.X), (float)(dcam.Y - camHi.Y), (float)(dcam.Z - camHi.Z));
+            _catShader.SetVector3("uCamRelHi", camHi);
+            _catShader.SetVector3("uCamRelLo", camLo);
             // Temporal fade-in: ramp this block's stars up over CatFadeInSeconds after it streamed in.
             float t = (float)Math.Clamp((_now - b.UploadTime) / CatFadeInSeconds, 0.0, 1.0);
             _catShader.SetFloat("uBlockFade", t * t * (3f - 2f * t)); // smoothstep
