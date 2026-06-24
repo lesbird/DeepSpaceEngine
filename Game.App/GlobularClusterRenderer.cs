@@ -172,9 +172,14 @@ void main() {
             float resolveMix = Smoothstep(ResolveLo, ResolveHi, (float)theta);
             var relF = new Vector3D<float>((float)rel.X, (float)rel.Y, (float)rel.Z);
 
-            float spriteAlpha = 1f - resolveMix;
+            // Hold the fuzzy sprite at full strength until this cluster's resolved star cloud is actually
+            // resident — the cloud is generated off-thread, so fading the sprite out on distance alone can
+            // leave a gap (sprite gone, cloud not ready yet) on a fast approach, or after the cloud was
+            // evicted and must regenerate. Only cross-fade once the cloud exists to take over.
+            bool cloudReady = _clouds.ContainsKey(c.Id);
+            float spriteAlpha = 1f - (cloudReady ? resolveMix : 0f);
             // HUD reticle while it's a clear fuzzy sprite (not yet mostly resolved) and close enough to read.
-            if (spriteAlpha > 0.15f && distM < ReticleRangeM) Marks.Add(c);
+            if (resolveMix < 0.85f && distM < ReticleRangeM) Marks.Add(c);
             if (spriteAlpha > 0.001f)
             {
                 double distLy = distM / ly;
