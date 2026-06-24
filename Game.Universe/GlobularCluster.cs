@@ -80,11 +80,21 @@ public static class GlobularClusters
     public static DeterministicRng StarRng(in GlobularCluster c, int index)
         => new(Hashing.Combine(c.Seed, (ulong)index));
 
-    /// <summary>Offset (m) of one cluster star from the centre — centrally concentrated (R·u^1.7),
-    /// isotropic. Drawn from <paramref name="rng"/> first, before any star-type draws.</summary>
+    /// <summary>Core-softening radius (m): the central stars are spread over at least this radius so the
+    /// densest of them stay well beyond the system spawn range (~500 AU) and you can fly to each star's
+    /// solar system individually. Without it the steep R·u^1.7 profile packed many stars within a few
+    /// hundred AU of the centre — an un-navigable knot.</summary>
+    private static readonly double CoreSoftenMeters = 0.05 * MathUtil.LightYear; // ~3160 AU
+
+    /// <summary>Offset (m) of one cluster star from the centre — centrally concentrated (density ∝ r⁻²)
+    /// with a softened flat core, isotropic. Drawn from <paramref name="rng"/> first, before any
+    /// star-type draws.</summary>
     public static Vector3D<double> StarOffset(ref DeterministicRng rng, double radiusMeters)
     {
-        double rr = radiusMeters * Math.Pow(rng.NextDouble(), 1.7);
+        // Linear-radius sample (was R·u^1.7) softened by a flat core: rr = sqrt(sample² + core²). The core
+        // is dense and bright but never collapses onto itself, so neighbouring solar systems stay flyable.
+        double sample = radiusMeters * rng.NextDouble();
+        double rr = Math.Sqrt(sample * sample + CoreSoftenMeters * CoreSoftenMeters);
         double z = rng.Range(-1, 1), ph = rng.Range(0, 2 * Math.PI);
         double rp = Math.Sqrt(Math.Max(0.0, 1.0 - z * z));
         return new Vector3D<double>(rp * Math.Cos(ph), z, rp * Math.Sin(ph)) * rr;

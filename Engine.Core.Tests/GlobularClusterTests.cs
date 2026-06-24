@@ -68,6 +68,35 @@ public class GlobularClusterTests
     }
 
     [Fact]
+    public void CoreStars_StaySpacedFartherThanTheSpawnRange()
+    {
+        // The dense core must not pack stars closer than the solar-system spawn range, or you can't fly
+        // to individual systems. Check the innermost stars are all mutually separated by > the spawn range.
+        const double au = MathUtil.AstronomicalUnit;
+        const double spawnRange = 500.0 * au;           // SolarSystemManager.SpawnAu
+
+        GlobularCluster c = GlobularClusters.ForGalaxy(MilkyWay())[0];
+
+        // Gather the 250 stars nearest the centre — the densest region, where pile-ups would occur.
+        var inner = new List<Vector3D<double>>();
+        for (int i = 0; i < c.StarCount; i++)
+        {
+            DeterministicRng rng = GlobularClusters.StarRng(c, i);
+            inner.Add(GlobularClusters.StarOffset(ref rng, c.RadiusMeters));
+        }
+        inner.Sort((a, b) => a.LengthSquared.CompareTo(b.LengthSquared));
+        int n = Math.Min(250, inner.Count);
+
+        double minSep = double.MaxValue;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++)
+                minSep = Math.Min(minSep, (inner[i] - inner[j]).Length);
+
+        Assert.True(minSep > spawnRange,
+            $"core stars only {minSep / au:0} AU apart — closer than the {spawnRange / au:0} AU spawn range");
+    }
+
+    [Fact]
     public void Stars_FillTheClusterRadius_Deterministically()
     {
         GlobularCluster c = GlobularClusters.ForGalaxy(MilkyWay())[0];
