@@ -83,6 +83,44 @@ public sealed class GalaxyCatalogPager : INearestGalaxy
     }
 
     /// <summary>
+    /// Find the resident galaxy the camera is <i>aiming at</i> — the one whose sprite sits under the
+    /// centre-screen reticle. A galaxy qualifies when the angle between <paramref name="forward"/> and
+    /// the direction to it is within the galaxy's own angular radius (so anywhere on a big near disk
+    /// counts) plus a small fixed cone <paramref name="toleranceRadians"/> (so a tiny distant point
+    /// sprite is still selectable by centring it). Among qualifiers the most centred one wins. False ⇒
+    /// the reticle isn't on any galaxy. Independent of <see cref="Nearest"/>, which is by distance.
+    /// </summary>
+    public bool TryGetAimedGalaxy(in UniversePosition camera, Vector3D<float> forward,
+        out Galaxy galaxy, out double distanceMeters, double toleranceRadians = 0.025)
+    {
+        // Forward arrives unit-length from the camera; normalise defensively.
+        double fLen = Math.Sqrt((double)forward.X * forward.X + (double)forward.Y * forward.Y + (double)forward.Z * forward.Z);
+        if (fLen < 1e-9) { galaxy = default; distanceMeters = 0; return false; }
+        double fx = forward.X / fLen, fy = forward.Y / fLen, fz = forward.Z / fLen;
+
+        bool found = false;
+        double bestCos = -2.0;
+        Galaxy best = default;
+        double bestDist = 0;
+        foreach (GalaxyCatalog block in _loaded.Values)
+            foreach (Galaxy g in block.Galaxies)
+            {
+                Vector3D<double> rel = g.Center.DeltaMeters(camera);
+                double dist = rel.Length;
+                if (dist < 1.0) continue; // sitting on the centre — no meaningful direction
+                double cos = (rel.X * fx + rel.Y * fy + rel.Z * fz) / dist;
+                if (cos <= 0) continue;   // behind the camera
+                double angle = Math.Acos(Math.Clamp(cos, -1.0, 1.0));
+                double angularRadius = Math.Atan2(g.RadiusMeters, dist);
+                if (angle > angularRadius + toleranceRadians) continue; // reticle isn't on this sprite
+                if (cos > bestCos) { bestCos = cos; best = g; bestDist = dist; found = true; }
+            }
+        galaxy = best;
+        distanceMeters = bestDist;
+        return found;
+    }
+
+    /// <summary>
     /// Page galaxy blocks around the camera (load near, evict far), then rebuild the nearest galaxy and
     /// the containing galaxy. Cheap to call every frame.
     /// </summary>

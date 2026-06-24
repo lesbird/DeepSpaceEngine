@@ -126,7 +126,7 @@ public sealed class GalaxyCatalog
         double starCount = 2.0e11 * rRel * rRel * rRel;
 
         return new Galaxy(id, pos, type, Hashing.Combine(id, 0x5EEDUL),
-            radiusLy * MathUtil.LightYear, RandomUnit(ref rng), starCount, color, $"Galaxy {id}");
+            radiusLy * MathUtil.LightYear, RandomUnit(ref rng), starCount, color, Naming.GalaxyName(id));
     }
 
     /// <summary>A deterministic unit vector, uniform on the sphere.</summary>

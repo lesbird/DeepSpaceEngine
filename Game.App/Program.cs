@@ -737,6 +737,9 @@ internal static class Program
             // A reticle on the galaxy core (its supermassive black hole) so you can fly to it.
             if (_galaxyPager.IsInside)
                 _overlay.DrawGalaxyCenterReticle(_camera, _galaxyPager.Containing.Center);
+            // In intergalactic space, show data for the galaxy the centre reticle is lined up with.
+            else if (_galaxyPager.TryGetAimedGalaxy(_camera.Position, _camera.Forward, out Galaxy aimed, out double aimedDist))
+                _overlay.DrawAimedGalaxyReticle(_camera, aimed, aimedDist);
             DrawSpeedOverlay();
             DrawHud();
             DrawTuning();
@@ -814,7 +817,7 @@ internal static class Program
         {
             var s = _starPager.Nearest;
             double nLy = _starPager.NearestDistanceMeters / MathUtil.LightYear;
-            ImGui.Text($"Nearest star: {s.ClassLetter}  #{s.Id}");
+            ImGui.Text($"Nearest star: {s.Name}  ({s.ClassLetter}, #{s.Id})");
             ImGui.Text($"  {s.Temperature:0} K   lum {s.Luminosity:0.00} Lsun");
             ImGui.Text($"  Distance: {nLy:0.0000} ly");
             double nAu = _starPager.NearestDistanceMeters / MathUtil.AstronomicalUnit;
@@ -1005,7 +1008,7 @@ internal static class Program
         _searchTarget = star;
         _hasSearchTarget = true;
         double ly = star.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
-        _searchStatus = $"#{star.Id}: {star.ClassLetter}-class, {ly:0.000} ly — Go to it";
+        _searchStatus = $"{star.Name} (#{star.Id}): {star.ClassLetter}-class, {ly:0.000} ly — Go to it";
     }
 
     /// <summary>Jump the camera to frame the current search target, a few AU out and looking at it
@@ -1020,8 +1023,8 @@ internal static class Program
         _camera.Position = _searchTarget.Position.Translated(
             new Vector3D<double>(-fwd.X * dist, -fwd.Y * dist, -fwd.Z * dist));
         double ly = _searchTarget.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
-        _jumpStatus = $"Arrived at star #{_searchTarget.Id} ({_searchTarget.ClassLetter}-class)";
-        _searchStatus = $"#{_searchTarget.Id}: {_searchTarget.ClassLetter}-class, {ly:0.000} ly";
+        _jumpStatus = $"Arrived at {_searchTarget.Name} (#{_searchTarget.Id}, {_searchTarget.ClassLetter}-class)";
+        _searchStatus = $"{_searchTarget.Name} (#{_searchTarget.Id}): {_searchTarget.ClassLetter}-class, {ly:0.000} ly";
     }
 
     /// <summary>The resident galaxies nearest the camera (excluding the one we're inside), sorted by
@@ -1429,6 +1432,7 @@ internal static class Program
         {
             // Out in interstellar space — no system to scan. Report the sector instead.
             DrawSectorScan();
+            AppendGalaxyScan();
             ImGui.End();
             return;
         }
@@ -1438,6 +1442,7 @@ internal static class Program
         if (target == null || dist > target.RadiusMeters * ScanRangeRadii)
         {
             DrawSystemScan(_systemManager.Active!, target, dist);
+            AppendGalaxyScan();
             ImGui.End();
             return;
         }
@@ -1491,7 +1496,37 @@ internal static class Program
             ImGui.TextDisabled($"Satellites: {pl.Moons.Length}");
         }
 
+        AppendGalaxyScan();
         ImGui.End();
+    }
+
+    /// <summary>Append the host-galaxy readout to the scanner whenever the camera is inside a galaxy — the
+    /// universe-tier context (which galaxy, its morphology, size and population, and how far the core is)
+    /// beneath whatever system/sector detail the scanner is already showing.</summary>
+    private static void AppendGalaxyScan()
+    {
+        if (!_galaxyPager.IsInside) return;
+        Galaxy g = _galaxyPager.Containing;
+        double coreLy = g.Center.DeltaMeters(_camera.Position).Length / MathUtil.LightYear;
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.8f, 1f, 1f), $"GALAXY — {g.Name}");
+        ImGui.Text($"Type: {g.Type}");
+        ImGui.Text($"Radius: {g.RadiusLy / 1000.0:0.#}k ly");
+        ImGui.Text($"Stars: {FormatCount(g.StarCount)}");
+        ImGui.Text($"Core distance: {(coreLy >= 1000 ? $"{coreLy / 1000.0:0.0} kly" : $"{coreLy:0} ly")}");
+        ImGui.TextDisabled($"Galaxy ID: {g.Id}");
+    }
+
+    /// <summary>Compact population readout for the galaxy scan (12.3 billion, 4.5 million, …).</summary>
+    private static string FormatCount(double n)
+    {
+        if (n >= 1e12) return $"{n / 1e12:0.#} trillion";
+        if (n >= 1e9) return $"{n / 1e9:0.#} billion";
+        if (n >= 1e6) return $"{n / 1e6:0.#} million";
+        if (n >= 1e3) return $"{n / 1e3:0.#} thousand";
+        return $"{n:0}";
     }
 
     /// <summary>Scanner fallback when a system is active but no body is in scan range: read out the
@@ -1499,10 +1534,11 @@ internal static class Program
     private static void DrawSystemScan(SolarSystem sys, CelestialBody? nearest, double nearestDist)
     {
         Star sun = sys.Sun;
-        ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"STAR SCAN — {sun.Designation}");
+        ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"STAR SCAN — {sun.Name}");
         bool sunFound = _discovery.TryGetStar(sun, out DiscoveryRecord sunRec);
         DiscoveryLine(sunFound, sunFound ? sunRec : null);
         ImGui.Separator();
+        ImGui.TextDisabled($"Catalog: #{sun.Id}");
         ImGui.Text($"Class: {sun.ClassLetter}  ({sun.Class}-type)");
         ImGui.Text($"Temperature: {sun.Temperature:0} K");
         ImGui.Text($"Luminosity: {sun.Luminosity:0.00} Lsun");
@@ -1553,7 +1589,8 @@ internal static class Program
         {
             Star s = _starPager.Nearest;
             double nLy = _starPager.NearestDistanceMeters / MathUtil.LightYear;
-            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"Nearest star — {s.Designation}");
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.9f, 0.5f, 1f), $"Nearest star — {s.Name}");
+            ImGui.TextDisabled($"Catalog: #{s.Id}");
             ImGui.Text($"Class: {s.ClassLetter}  ({s.Class}-type)");
             ImGui.Text($"Temperature: {s.Temperature:0} K");
             ImGui.Text($"Luminosity: {s.Luminosity:0.00} Lsun");
@@ -1841,11 +1878,12 @@ internal static class Program
         {
             Star s2 = _nearbySel;
             double ly = s2.Position.DistanceTo(cam) / MathUtil.LightYear;
-            ImGui.Text($"#{s2.Id}  •  {s2.ClassLetter}-class  •  {s2.Temperature:0} K  •  {ly:0.000} ly");
+            ImGui.Text($"{s2.Name}  ·  #{s2.Id}");
+            ImGui.Text($"{s2.ClassLetter}-class  •  {s2.Temperature:0} K  •  {ly:0.000} ly");
             if (ImGui.Button("Jump here"))
             {
                 _camera.Position = s2.Position.Translated(new Vector3D<double>(8.0 * MathUtil.AstronomicalUnit, 0, 0));
-                _jumpStatus = $"Jumped to star #{s2.Id} ({s2.ClassLetter}-class)";
+                _jumpStatus = $"Jumped to {s2.Name} (#{s2.Id}, {s2.ClassLetter}-class)";
             }
             ImGui.SameLine();
             if (ImGui.Button("Set as search target")) { _starSearch = s2.Id.ToString(); FindStar(); }
@@ -2009,11 +2047,12 @@ internal static class Program
         {
             Star s2 = _galaxySel;
             double ly = s2.Position.DistanceTo(_camera.Position) / MathUtil.LightYear;
-            ImGui.Text($"#{s2.Id}  •  {s2.ClassLetter}-class  •  {s2.Temperature:0} K  •  {ly:0.000} ly");
+            ImGui.Text($"{s2.Name}  ·  #{s2.Id}");
+            ImGui.Text($"{s2.ClassLetter}-class  •  {s2.Temperature:0} K  •  {ly:0.000} ly");
             if (ImGui.Button("Jump here"))
             {
                 _camera.Position = s2.Position.Translated(new Vector3D<double>(8.0 * MathUtil.AstronomicalUnit, 0, 0));
-                _jumpStatus = $"Jumped to star #{s2.Id} ({s2.ClassLetter}-class)";
+                _jumpStatus = $"Jumped to {s2.Name} (#{s2.Id}, {s2.ClassLetter}-class)";
             }
             ImGui.SameLine();
             if (ImGui.Button("Set as search target")) { _starSearch = s2.Id.ToString(); FindStar(); }

@@ -42,4 +42,9 @@ public readonly struct Star
     /// <summary>Catalog designation: the star's catalog index in decimal (the number the player
     /// searches for). Planets/moons extend this as star-planet[-moon].</summary>
     public string Designation => Id.ToString();
+
+    /// <summary>A flavourful proper name derived deterministically from <see cref="Id"/> (e.g. "Helix
+    /// Prime", "Crimson Vega"). Not guaranteed unique across the catalog — the <see cref="Id"/> is the
+    /// unique handle; the name is for display. See <see cref="Naming.StarName"/>.</summary>
+    public string Name => Naming.StarName(Id);
 }

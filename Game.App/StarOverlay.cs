@@ -82,7 +82,7 @@ public sealed class StarOverlay
     {
         double distLy = s.Position.DistanceTo(cam) / MathUtil.LightYear;
         uint hi = Col(255, 215, 90, 255); // amber — distinct from the green "nearest" marker
-        string label = $"TARGET  #{s.Id}   {distLy:0.000} ly";
+        string label = $"TARGET  {s.Name}  #{s.Id}   {distLy:0.000} ly";
 
         Vector3D<float> rel = s.Position.ToCameraRelative(cam);
         if (Project(rel, m, vp, out Vector2 screen) && OnScreen(screen, vp))
@@ -116,7 +116,7 @@ public sealed class StarOverlay
         {
             uint col = StarColor(sys.Sun, 0xE0);
             dl.AddCircle(sunScreen, 13f, col, 22, 2f);
-            dl.AddText(sunScreen + new Vector2(16, -8), col, $"SUN  {sys.Sun.ClassLetter}-class{StarCredit(sys.Sun)}");
+            dl.AddText(sunScreen + new Vector2(16, -8), col, $"{sys.Sun.Name}  ({sys.Sun.ClassLetter}-class){StarCredit(sys.Sun)}");
         }
 
         // Until the nearest planet is reasonably close, skip the planet/moon reticles entirely: from far
@@ -217,7 +217,7 @@ public sealed class StarOverlay
             double distLy = Math.Sqrt(_scratch[i].DistSq) / MathUtil.LightYear;
             uint col = StarColor(s, 0xC0);
             dl.AddCircle(screen, 9f, col, 16, 1.5f);
-            dl.AddText(screen + new Vector2(12, -8), col, $"#{s.Id}{StarCredit(s)}");
+            dl.AddText(screen + new Vector2(12, -8), col, $"{s.Name}{StarCredit(s)}");
             dl.AddText(screen + new Vector2(12, 6), Col(170, 190, 220, 200), $"{s.ClassLetter}  {distLy:0.00} ly");
         }
     }
@@ -228,7 +228,7 @@ public sealed class StarOverlay
         Star s = field.Nearest;
         double distLy = field.NearestDistanceMeters / MathUtil.LightYear;
         uint hi = Col(120, 255, 160, 255);
-        string label = $"NEAREST  #{s.Id}   {distLy:0.000} ly";
+        string label = $"NEAREST  {s.Name}  #{s.Id}   {distLy:0.000} ly";
 
         Vector3D<float> rel = s.Position.ToCameraRelative(cam);
         bool inFront = Project(rel, m, vp, out Vector2 screen) && OnScreen(screen, vp);
@@ -340,6 +340,60 @@ public sealed class StarOverlay
         Vector2 textPos = pos - ad * 26f - new Vector2(60, -10);
         textPos = Vector2.Clamp(textPos, new Vector2(8, 8), vp - new Vector2(220, 24));
         dl.AddText(textPos, col, label);
+    }
+
+    /// <summary>In intergalactic space, mark the galaxy the centre reticle is lined up with (chosen by
+    /// the caller) and read out the info you can't get from the sprite alone: its catalog id, morphology
+    /// (shape), star count and distance. Like the core/globular reticles it is projected by
+    /// <i>direction</i> (galaxies sit millions of ly away, far past the far plane).</summary>
+    public void DrawAimedGalaxyReticle(Camera camera, in Galaxy g, double distanceMeters)
+    {
+        Vector2 vp = ImGui.GetIO().DisplaySize;
+        if (vp.X < 2 || vp.Y < 2) return;
+
+        Vector3D<double> rel = g.Center.DeltaMeters(camera.Position);
+        double dist = rel.Length;
+        if (dist < 1.0) return;
+        var dir = new Vector3D<float>((float)(rel.X / dist), (float)(rel.Y / dist), (float)(rel.Z / dist));
+
+        var dl = ImGui.GetForegroundDrawList();
+        Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
+        uint col = Col(180, 205, 255, 235); // cool blue, matching the intergalactic nav tint
+
+        double mly = distanceMeters / MathUtil.LightYear / 1.0e6;
+        string distStr = mly >= 1.0 ? $"{mly:0.00} Mly" : $"{mly * 1000.0:0} kly";
+        // Multi-line so the sprite stays readable: id+name, then shape + population, then distance.
+        string label = $"GALAXY  {g.Name}\n{g.Type}  •  {StarCountStr(g.StarCount)} stars\n{distStr}";
+
+        if (Project(dir * 1.0e10f, m, vp, out Vector2 s) && OnScreen(s, vp))
+        {
+            DrawBrackets(dl, s, 13f, col);
+            dl.AddText(s + new Vector2(17f, -9f), col, label);
+            return;
+        }
+
+        // Off screen or behind: clamp an arrow to the screen edge pointing toward the galaxy.
+        var invOrientation = Quaternion<float>.Inverse(camera.Orientation);
+        Vector3D<float> viewDir = Vector3D.Transform(dir, invOrientation);
+        Vector2 ad = new(viewDir.X, -viewDir.Y);
+        if (ad.LengthSquared() < 1e-6f) ad = new Vector2(0, 1);
+        ad = Vector2.Normalize(ad);
+
+        Vector2 pos = ClampToEdge(vp * 0.5f, ad, vp, margin: 64f);
+        DrawArrow(dl, pos, ad, col);
+        Vector2 textPos = pos - ad * 26f - new Vector2(70, -10);
+        textPos = Vector2.Clamp(textPos, new Vector2(8, 8), vp - new Vector2(260, 40));
+        dl.AddText(textPos, col, label);
+    }
+
+    /// <summary>Compact star-count readout (12.3 B, 4.5 M, …) for the galaxy reticle.</summary>
+    private static string StarCountStr(double n)
+    {
+        if (n >= 1e12) return $"{n / 1e12:0.#} T";
+        if (n >= 1e9) return $"{n / 1e9:0.#} B";
+        if (n >= 1e6) return $"{n / 1e6:0.#} M";
+        if (n >= 1e3) return $"{n / 1e3:0.#} k";
+        return $"{n:0}";
     }
 
     private static bool Project(Vector3D<float> p, in Matrix4X4<float> m, Vector2 vp, out Vector2 screen)
