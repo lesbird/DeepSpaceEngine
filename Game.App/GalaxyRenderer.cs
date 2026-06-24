@@ -56,6 +56,15 @@ public sealed class GalaxyRenderer : IDisposable
     // galaxy is fully kept while you are deep inside another galaxy; fainter galaxies fade out below it.
     private const float ExtGateCue = 0.55f;
 
+    // Far-distance fade for the point sprites, so a galaxy glides in/out as you approach/recede instead
+    // of snapping on/off when its catalogue block crosses the galaxy pager's load/evict boundary. The
+    // fade must finish (galaxy fully invisible) before any block can pop in or out: the pager keeps a
+    // 7×7×7 block ring (LoadRadius 3 × 20 Mly blocks), so the nearest a block can pop is ~2 blocks =
+    // 40 Mly. Fading fully out by 35 Mly stays comfortably inside that, hiding every paging pop while
+    // keeping the deep field (~150 galaxies) intact.
+    private const float FarFadeFullLy = 2.5e7f;  // fully bright within 25 Mly
+    private const float FarFadeGoneLy = 3.5e7f;  // fully faded by 35 Mly
+
     private const float PointDomeRadius = 1.0e15f;
     private const float ImpostorRenderDist = 1.0e14f;
 
@@ -373,8 +382,10 @@ void main() {
 
                 if (isInside) continue; // point/impostor skip the galaxy you're inside
 
-                // --- Point sprite (faded out as impostor, then cloud, take over) ---
-                float pointFade = 1f - impostorMix;
+                // --- Point sprite (faded out as impostor takes over, and out again with distance so it
+                //     never pops at the pager's block boundary) ---
+                float farFade = Smoothstep(FarFadeGoneLy, FarFadeFullLy, (float)distLy);
+                float pointFade = (1f - impostorMix) * farFade;
                 if (pointFade > 0.001f && keep > 0.002f)
                 {
                     float size = Math.Clamp(MinSizePx + SizeScale * cue, MinSizePx, MaxSizePx);

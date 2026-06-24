@@ -17,8 +17,12 @@ public sealed class GalaxyCatalogPager : INearestGalaxy
 {
     // Load every block within this Chebyshev (cube) radius of the camera's block; evict past the evict
     // radius. evict > load gives a one-ring hysteresis band so a camera on a boundary doesn't thrash.
-    private const int LoadRadiusBlocks = 2;   // 5×5×5 resident around the camera — a deep galaxy field
-    private const int EvictRadiusBlocks = 3;
+    // Load radius 3 (not 2) so the nearest a block can pop in/out is ~2 blocks ≈ 40 Mly — beyond where
+    // GalaxyRenderer fades the far point sprites fully out (~35 Mly), so galaxies never snap on/off at a
+    // block boundary. Galaxies are cheap structs (only the nearest few get clouds/impostors), so the
+    // larger 7×7×7 ring is inexpensive.
+    private const int LoadRadiusBlocks = 3;   // 7×7×7 resident around the camera — a deep galaxy field
+    private const int EvictRadiusBlocks = 4;
 
     private readonly GalaxyField _field;
     private readonly double _sideMeters;

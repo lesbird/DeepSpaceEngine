@@ -1945,9 +1945,9 @@ internal static class Program
         const int PerBlockScanCap = 10000; // examine at most this many stars per block (uniform stride)
         foreach (StarCatalog block in _starPager.LoadedBlocks)
         {
-            Vector3D<double> bo = block.Origin.DeltaMeters(mapCenter); // block min corner relative to centre
-            double bs = block.SideMeters;
-            if (bo.X + bs < -halfW || bo.X > halfW || bo.Z + bs < -halfH || bo.Z > halfH) continue;
+            Vector3D<double> bc = block.Origin.DeltaMeters(mapCenter); // block centre relative to view centre (Origin is the centre, spans ±side/2)
+            double bh = block.SideMeters * 0.5;
+            if (bc.X + bh < -halfW || bc.X - bh > halfW || bc.Z + bh < -halfH || bc.Z - bh > halfH) continue;
             IReadOnlyList<Star> stars = block.Stars;
             int n = stars.Count;
             int bstride = Math.Max(1, n / PerBlockScanCap);
