@@ -950,7 +950,7 @@ internal static class Program
             ImGui.TextColored(new System.Numerics.Vector4(0.7f, 0.8f, 1f, 1f),
                 $"Intergalactic — nearest {g.Name} ({g.Type}) {mly:0.00} Mly");
         }
-        ImGui.Text($"Galaxies: {_galaxyPager.LoadedGalaxyCount} resident, {_galaxyRenderer.LastDrawn} pts, {_galaxyRenderer.LastImpostors} disks, {_galaxyRenderer.LastClouds} clouds");
+        ImGui.Text($"Galaxies: {_galaxyPager.LoadedGalaxyCount} resident, {_galaxyRenderer.LastDrawn} pts, {_galaxyRenderer.LastImpostors} disks, {_galaxyRenderer.LastClouds} clouds, {_galaxyRenderer.LastGlows} glow");
         if (_globularRenderer.LastSprites + _globularRenderer.LastResolved > 0)
             ImGui.Text($"Globulars: {_globularRenderer.LastSprites} sprites, {_globularRenderer.LastResolved} resolved");
     }
@@ -1180,11 +1180,13 @@ internal static class Program
             ImGui.SliderFloat("Impostor brightness", ref g.ImpostorBrightness, 0.2f, 4f);
             ImGui.SliderFloat("Cloud brightness", ref g.CloudBrightness, 0.2f, 4f);
             ImGui.SliderFloat("Cloud point size", ref g.CloudPointScale, 1f, 8f);
+            ImGui.Checkbox("Render body glow", ref g.GlowEnabled);
+            ImGui.SliderFloat("Glow brightness", ref g.GlowBrightness, 0.0f, 3f);
             if (ImGui.Button("Reset galaxies"))
             {
-                g.Enabled = true; g.Brightness = 1.8f; g.SizeScale = 16f; g.MinSizePx = 4f;
-                g.MaxSizePx = 28f; g.ImpostorBrightness = 1.3f; g.CloudBrightness = 1.0f;
-                g.CloudPointScale = 2.5f;
+                g.Enabled = true; g.Brightness = 1.5f; g.SizeScale = 26f; g.MinSizePx = 14f;
+                g.MaxSizePx = 34f; g.ImpostorBrightness = 1.3f; g.CloudBrightness = 1.0f;
+                g.CloudPointScale = 2.5f; g.GlowEnabled = true; g.GlowBrightness = 0.25f;
             }
         }
 

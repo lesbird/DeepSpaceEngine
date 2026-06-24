@@ -27,17 +27,20 @@ namespace Game.App;
 public sealed class GalaxyRenderer : IDisposable
 {
     public bool Enabled = true;
-    public float Brightness = 2.2f;          // point sprites
-    public float SizeScale = 22.0f;
-    public float MinSizePx = 6.0f;
-    public float MaxSizePx = 30.0f;
+    public float Brightness = 1.5f;          // point sprites
+    public float SizeScale = 26.0f;
+    public float MinSizePx = 14.0f;          // big enough that the soft falloff reads as a fuzzy blob
+    public float MaxSizePx = 34.0f;
     public float ImpostorBrightness = 1.3f;  // impostor disks
     public float CloudBrightness = 1.0f;     // volumetric clouds
     public float CloudPointScale = 2.5f;     // size multiplier on cloud points (fewer, larger = cheaper)
+    public bool GlowEnabled = true;          // nebula-style volumetric body glow
+    public float GlowBrightness = 0.25f;
 
     public int LastDrawn { get; private set; }
     public int LastImpostors { get; private set; }
     public int LastClouds { get; private set; }
+    public int LastGlows { get; private set; }
 
     // Cross-fade bands in apparent angular radius (galaxyRadius / distance):
     //   point → impostor across [RatioLo, RatioHi]; impostor → cloud across [CloudLo, CloudHi].
@@ -75,6 +78,7 @@ public sealed class GalaxyRenderer : IDisposable
 
     private const int CloudCount = 20_000;  // sample points per galaxy — few + large (via CloudPointScale) for perf
     private const int CloudCap = 1;         // only the single nearest galaxy gets a volumetric cloud
+    private const int GlowCap = 2;          // nearest galaxies that get the nebula-style body glow
 
     private const double RefStarCount = 2.0e11;
     private const double RefDistLy = 1.0e6;
@@ -102,11 +106,10 @@ out vec4 FragColor;
 void main() {
     vec2 c = gl_PointCoord * 2.0 - 1.0;
     float r2 = dot(c, c);
-    // Fuzzy galaxy: a soft Gaussian core plus a wide low falloff halo, so a distant galaxy reads as a
-    // diffuse smudge rather than a hard pixel. Low exponents = soft, bloomy edge out to the sprite rim.
-    float core = exp(-r2 * 3.2);
-    float halo = exp(-r2 * 0.9);
-    float a = (core + 0.45 * halo) * smoothstep(1.0, 0.05, r2);
+    // Fuzzy galaxy: a single wide Gaussian that fades all the way to the rim, so a distant galaxy reads
+    // as a diffuse smudge with no hard edge. The low exponent keeps the centre from collapsing to a
+    // single saturated pixel (which is what made it look like a sharp point), spreading the light out.
+    float a = exp(-r2 * 1.7) * smoothstep(1.0, 0.0, r2);
     FragColor = vec4(vColor * (vBright * uBrightness), 1.0) * a;
 }";
 
@@ -192,12 +195,64 @@ void main() {
     FragColor = vec4(vColor * uBrightness, 1.0) * (a * vFade);
 }";
 
+    // The galaxy body glow: a large additive camera-facing fBm billboard (the nebula technique), one per
+    // GalaxyGlow puff. Same wide projection / depth-off regime as the cloud, so a whole galaxy fits and
+    // the puffs composite as soft overlapping gas. Each puff fades as the camera passes inside it.
+    private const string GlowVert = @"#version 410 core
+uniform mat4 uViewProj;
+uniform vec3 uCenter;   // puff centre, camera-relative (m)
+uniform vec3 uRight;    // camera right (world)
+uniform vec3 uUp;       // camera up (world)
+uniform float uRadius;  // m
+out vec2 vUv;
+void main() {
+    vec2 corners[6] = vec2[6](vec2(-1.0,-1.0), vec2(1.0,-1.0), vec2(1.0,1.0),
+                              vec2(-1.0,-1.0), vec2(1.0,1.0), vec2(-1.0,1.0));
+    vec2 c = corners[gl_VertexID];
+    vUv = c;
+    vec3 world = uCenter + (c.x * uRight + c.y * uUp) * uRadius;
+    gl_Position = uViewProj * vec4(world, 1.0);
+}";
+
+    private const string GlowFrag = @"#version 410 core
+in vec2 vUv;
+uniform vec3 uColor;
+uniform float uSeed;
+uniform float uIntensity;
+uniform float uCore;     // 0 = wispy disk cloud, 1 = smooth concentrated bulge
+out vec4 FragColor;
+float h(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float vnoise(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(h(i + vec3(0,0,0)), h(i + vec3(1,0,0)), f.x),
+                   mix(h(i + vec3(0,1,0)), h(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(h(i + vec3(0,0,1)), h(i + vec3(1,0,1)), f.x),
+                   mix(h(i + vec3(0,1,1)), h(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm(vec3 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { s += a * vnoise(p); p *= 2.07; a *= 0.5; } return s; }
+void main() {
+    float r = length(vUv);
+    if (r > 1.0) discard;
+    // Radial falloff: the bulge (high uCore) stays concentrated, the disk wisps reach softly to the rim.
+    float edge = 1.0 - smoothstep(0.05, 1.0, r);
+    edge = pow(edge, mix(1.4, 2.6, uCore));
+    vec3 q = vec3(vUv * 2.2, uSeed);
+    float cloud = fbm(q) * 0.6 + fbm(q * 3.1 + 5.0) * 0.4;
+    cloud = clamp(cloud * 1.35 - 0.22, 0.0, 1.0);
+    float body = mix(cloud, 0.85, uCore);     // bulge fills in; disk keeps the gaps dark
+    float a = edge * body;
+    a *= a;
+    FragColor = vec4(uColor * uIntensity * a, 1.0); // premultiplied; additive by the caller
+}";
+
     private readonly GL _gl;
     private readonly Shader _pointShader;
     private readonly Shader _impostorShader;
     private readonly Shader _cloudShader;
+    private readonly Shader _glowShader;
     private readonly uint _pointVao, _pointVbo;
     private readonly uint _impostorVao;
+    private readonly uint _glowVao;
     private float[] _data = new float[FloatsPerPoint * 64];
 
     private struct Impostor
@@ -216,6 +271,16 @@ void main() {
     }
     private readonly List<CloudJob> _cloudJobs = new();
 
+    private struct GlowJob
+    {
+        public Galaxy Galaxy;
+        public Vector3D<float> Rel;  // galaxy centre relative to camera (m)
+        public double DistM;
+        public float Alpha;
+    }
+    private readonly List<GlowJob> _glowJobs = new();
+    private readonly Dictionary<ulong, GalaxyGlowPuff[]> _glowPuffs = new();
+
     private struct CloudVbo { public uint Vao, Vbo; public int Count; }
     private readonly Dictionary<ulong, CloudVbo> _clouds = new();
     private readonly HashSet<ulong> _cloudPending = new();
@@ -229,6 +294,8 @@ void main() {
         _pointShader = new Shader(gl, PointVert, PointFrag);
         _impostorShader = new Shader(gl, ImpostorVert, ImpostorFrag);
         _cloudShader = new Shader(gl, CloudVert, CloudFrag);
+        _glowShader = new Shader(gl, GlowVert, GlowFrag);
+        _glowVao = gl.GenVertexArray(); // empty; the quad comes from gl_VertexID
 
         _pointVao = gl.GenVertexArray();
         _pointVbo = gl.GenBuffer();
@@ -250,7 +317,7 @@ void main() {
 
     public unsafe void Render(Camera camera, GalaxyCatalogPager galaxies)
     {
-        LastDrawn = LastImpostors = LastClouds = 0;
+        LastDrawn = LastImpostors = LastClouds = LastGlows = 0;
         if (!Enabled) return;
 
         IntegrateReadyClouds();
@@ -270,6 +337,7 @@ void main() {
         int n = 0;
         _impostors.Clear();
         _cloudJobs.Clear();
+        _glowJobs.Clear();
         foreach (GalaxyCatalog block in galaxies.LoadedBlocks)
             foreach (Galaxy g in block.Galaxies)
             {
@@ -298,6 +366,10 @@ void main() {
                 // --- Cloud (renders for the galaxy you're inside too, near-faded) ---
                 if (cloudMix > 0.001f)
                     _cloudJobs.Add(new CloudJob { Galaxy = g, Rel = relF, DistM = distM, Alpha = cloudMix * keep });
+
+                // --- Volumetric body glow (nebula-style); fades in over the same approach band ---
+                if (GlowEnabled && cloudMix > 0.001f)
+                    _glowJobs.Add(new GlowJob { Galaxy = g, Rel = relF, DistM = distM, Alpha = cloudMix * keep });
 
                 if (isInside) continue; // point/impostor skip the galaxy you're inside
 
@@ -331,7 +403,11 @@ void main() {
                 }
             }
 
-        if (n == 0 && _impostors.Count == 0 && _cloudJobs.Count == 0) { EvictUnusedClouds(); return; }
+        if (n == 0 && _impostors.Count == 0 && _cloudJobs.Count == 0 && _glowJobs.Count == 0)
+        {
+            EvictUnusedClouds();
+            return;
+        }
 
         // Additive, depth-independent — same regime as the backdrop dome / near-field star sprites.
         _gl.Enable(EnableCap.Blend);
@@ -382,6 +458,7 @@ void main() {
             LastImpostors = count;
         }
 
+        RenderGlow(camera);   // galaxy body gas first, so the cloud star points read embedded in it
         RenderClouds(camera);
 
         _gl.BindVertexArray(0);
@@ -389,6 +466,59 @@ void main() {
         _gl.Disable(EnableCap.Blend);
 
         EvictUnusedClouds();
+    }
+
+    private void RenderGlow(Camera camera)
+    {
+        if (_glowJobs.Count == 0) return;
+
+        // Nearest GlowCap galaxies only; each is a cluster of large fBm billboards (the nebula technique).
+        _glowJobs.Sort((a, b) => a.DistM.CompareTo(b.DistM));
+
+        Matrix4X4<float> vp = camera.ViewMatrix *
+            MatrixHelper.PerspectiveGL(camera.FovRadians, camera.AspectRatio, CloudNear, CloudFar);
+
+        bool shaderReady = false;
+        int galaxies = 0, puffsDrawn = 0;
+        for (int j = 0; j < _glowJobs.Count && galaxies < GlowCap; j++)
+        {
+            GlowJob job = _glowJobs[j];
+            if (!_glowPuffs.TryGetValue(job.Galaxy.Id, out GalaxyGlowPuff[]? puffs))
+                _glowPuffs[job.Galaxy.Id] = puffs = GalaxyGlow.ForGalaxy(job.Galaxy);
+
+            if (!shaderReady)
+            {
+                _glowShader.Use();
+                _glowShader.SetMatrix("uViewProj", vp);
+                _glowShader.SetVector3("uRight", camera.Right);
+                _glowShader.SetVector3("uUp", camera.Up);
+                _gl.BindVertexArray(_glowVao);
+                shaderReady = true;
+            }
+
+            foreach (GalaxyGlowPuff p in puffs)
+            {
+                var center = new Vector3D<float>(job.Rel.X + p.Offset.X, job.Rel.Y + p.Offset.Y, job.Rel.Z + p.Offset.Z);
+                // Fade the puff as the camera moves inside it, so you drift through soft gas (not a wall).
+                // Distance in DOUBLE — a ~1e21 m component squared overflows float (galaxy-scale hazard).
+                double cx = center.X, cy = center.Y, cz = center.Z;
+                double dist = Math.Sqrt(cx * cx + cy * cy + cz * cz);
+                float fade = (float)Math.Clamp(dist / p.RadiusMeters, 0.10, 1.0);
+                _glowShader.SetVector3("uCenter", center);
+                _glowShader.SetFloat("uRadius", p.RadiusMeters);
+                _glowShader.SetVector3("uColor", p.Color);
+                _glowShader.SetFloat("uSeed", p.Seed);
+                _glowShader.SetFloat("uCore", p.Core);
+                _glowShader.SetFloat("uIntensity", GlowBrightness * p.Brightness * job.Alpha * fade);
+                _gl.DrawArrays(PrimitiveType.Triangles, 0, 6);
+                puffsDrawn++;
+            }
+            galaxies++;
+        }
+        LastGlows = puffsDrawn;
+
+        // Puff arrays are tiny; bound the cache across a long session of galaxy-hopping (cheap to rebuild).
+        if (_glowPuffs.Count > 256) _glowPuffs.Clear();
     }
 
     private void RenderClouds(Camera camera)
@@ -519,9 +649,11 @@ void main() {
         _pointShader.Dispose();
         _impostorShader.Dispose();
         _cloudShader.Dispose();
+        _glowShader.Dispose();
         _gl.DeleteBuffer(_pointVbo);
         _gl.DeleteVertexArray(_pointVao);
         _gl.DeleteVertexArray(_impostorVao);
+        _gl.DeleteVertexArray(_glowVao);
         foreach (CloudVbo c in _clouds.Values) { _gl.DeleteBuffer(c.Vbo); _gl.DeleteVertexArray(c.Vao); }
     }
 }
