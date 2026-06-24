@@ -302,6 +302,46 @@ public sealed class StarOverlay
         }
     }
 
+    /// <summary>Mark the centre of the galaxy you're inside — the supermassive black hole — so you can
+    /// fly to it. Like the globular reticle the core is projected by <i>direction</i> (it can be tens of
+    /// thousands of ly away, past the far plane); when it's off screen an edge arrow points the way.</summary>
+    public void DrawGalaxyCenterReticle(Camera camera, in UniversePosition center)
+    {
+        Vector2 vp = ImGui.GetIO().DisplaySize;
+        if (vp.X < 2 || vp.Y < 2) return;
+
+        Vector3D<double> rel = center.DeltaMeters(camera.Position);
+        double dist = rel.Length;
+        if (dist < 1.0) return; // already at the core
+        var dir = new Vector3D<float>((float)(rel.X / dist), (float)(rel.Y / dist), (float)(rel.Z / dist));
+
+        var dl = ImGui.GetForegroundDrawList();
+        Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
+        uint col = Col(255, 120, 140, 235); // hot magenta-red — the SMBH core, distinct from gold/green
+        double distLy = dist / MathUtil.LightYear;
+        string label = distLy >= 1000 ? $"CORE  {distLy / 1000.0:0.0} kly" : $"CORE  {distLy:0} ly";
+
+        if (Project(dir * 1.0e10f, m, vp, out Vector2 s) && OnScreen(s, vp))
+        {
+            DrawBrackets(dl, s, 11f, col);
+            dl.AddText(s + new Vector2(15f, -8f), col, label);
+            return;
+        }
+
+        // Off screen or behind: clamp an arrow to the screen edge pointing toward the core.
+        var invOrientation = Quaternion<float>.Inverse(camera.Orientation);
+        Vector3D<float> viewDir = Vector3D.Transform(dir, invOrientation);
+        Vector2 ad = new(viewDir.X, -viewDir.Y);
+        if (ad.LengthSquared() < 1e-6f) ad = new Vector2(0, 1);
+        ad = Vector2.Normalize(ad);
+
+        Vector2 pos = ClampToEdge(vp * 0.5f, ad, vp, margin: 64f);
+        DrawArrow(dl, pos, ad, col);
+        Vector2 textPos = pos - ad * 26f - new Vector2(60, -10);
+        textPos = Vector2.Clamp(textPos, new Vector2(8, 8), vp - new Vector2(220, 24));
+        dl.AddText(textPos, col, label);
+    }
+
     private static bool Project(Vector3D<float> p, in Matrix4X4<float> m, Vector2 vp, out Vector2 screen)
     {
         // Matches the GPU path: clip = (p,1) * (view*proj) in Silk's row-vector convention.

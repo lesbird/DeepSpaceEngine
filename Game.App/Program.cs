@@ -724,6 +724,9 @@ internal static class Program
         {
             _overlay.Draw(_camera, _starPager, _systemManager, _discovery, _hasSearchTarget ? _searchTarget : null);
             _overlay.DrawGlobularReticles(_camera, _globularRenderer.Marks);
+            // A reticle on the galaxy core (its supermassive black hole) so you can fly to it.
+            if (_galaxyPager.IsInside)
+                _overlay.DrawGalaxyCenterReticle(_camera, _galaxyPager.Containing.Center);
             DrawSpeedOverlay();
             DrawHud();
             DrawTuning();
