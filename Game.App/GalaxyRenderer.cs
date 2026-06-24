@@ -32,6 +32,10 @@ public sealed class GalaxyRenderer : IDisposable
     public float MinSizePx = 14.0f;          // big enough that the soft falloff reads as a fuzzy blob
     public float MaxSizePx = 34.0f;
     public float ImpostorBrightness = 1.3f;  // impostor disks
+    // Volumetric resolved-star cloud. Off by default: inside a galaxy it's misleading (the points look
+    // like stars you can fly to, but they're decorative), and it's the heaviest galaxy LOD tier. The
+    // body glow already conveys the galaxy's shape/brightness at a distance.
+    public bool CloudEnabled = false;
     public float CloudBrightness = 1.0f;     // volumetric clouds
     public float CloudPointScale = 2.5f;     // size multiplier on cloud points (fewer, larger = cheaper)
     public bool GlowEnabled = true;          // nebula-style volumetric body glow
@@ -62,8 +66,11 @@ public sealed class GalaxyRenderer : IDisposable
     // 7×7×7 block ring (LoadRadius 3 × 20 Mly blocks), so the nearest a block can pop is ~2 blocks =
     // 40 Mly. Fading fully out by 35 Mly stays comfortably inside that, hiding every paging pop while
     // keeping the deep field (~150 galaxies) intact.
-    private const float FarFadeFullLy = 2.5e7f;  // fully bright within 25 Mly
-    private const float FarFadeGoneLy = 3.5e7f;  // fully faded by 35 Mly
+    // Distant galaxies stay visible as fuzzy point sprites out to ~56 Mly, fading from FarFadeFull to
+    // FarFadeGone. FarFadeGone sits just inside the galaxy pager's pop-in distance (~60 Mly at load
+    // radius 4) so a galaxy is already invisible before its block can stream in/out — no snapping.
+    private const float FarFadeFullLy = 4.4e7f;  // fully bright within 44 Mly
+    private const float FarFadeGoneLy = 5.6e7f;  // fully faded by 56 Mly
 
     private const float PointDomeRadius = 1.0e15f;
     private const float ImpostorRenderDist = 1.0e14f;
@@ -254,11 +261,28 @@ void main() {
     FragColor = vec4(uColor * uIntensity * a, 1.0); // premultiplied; additive by the caller
 }";
 
+    // Composite: a full-screen triangle that adds the half-res glow buffer onto the scene.
+    private const string GlowCompositeVert = @"#version 410 core
+out vec2 vUv;
+void main() {
+    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);
+    vUv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}";
+    private const string GlowCompositeFrag = @"#version 410 core
+in vec2 vUv;
+uniform sampler2D uTex;
+out vec4 FragColor;
+void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend supplied by the caller
+";
+
     private readonly GL _gl;
     private readonly Shader _pointShader;
     private readonly Shader _impostorShader;
     private readonly Shader _cloudShader;
     private readonly Shader _glowShader;
+    private readonly Shader _glowComposite;
+    private readonly ColorTarget _glowHalf;
     private readonly uint _pointVao, _pointVbo;
     private readonly uint _impostorVao;
     private readonly uint _glowVao;
@@ -304,6 +328,8 @@ void main() {
         _impostorShader = new Shader(gl, ImpostorVert, ImpostorFrag);
         _cloudShader = new Shader(gl, CloudVert, CloudFrag);
         _glowShader = new Shader(gl, GlowVert, GlowFrag);
+        _glowComposite = new Shader(gl, GlowCompositeVert, GlowCompositeFrag);
+        _glowHalf = new ColorTarget(gl);
         _glowVao = gl.GenVertexArray(); // empty; the quad comes from gl_VertexID
 
         _pointVao = gl.GenVertexArray();
@@ -324,7 +350,7 @@ void main() {
         _impostorVao = gl.GenVertexArray(); // empty; vertices from gl_VertexID
     }
 
-    public unsafe void Render(Camera camera, GalaxyCatalogPager galaxies)
+    public unsafe void Render(Camera camera, GalaxyCatalogPager galaxies, uint sceneFbo, int sceneW, int sceneH)
     {
         LastDrawn = LastImpostors = LastClouds = LastGlows = 0;
         if (!Enabled) return;
@@ -373,7 +399,7 @@ void main() {
                 bool isInside = exclude is { } ex && g.Id == ex;
 
                 // --- Cloud (renders for the galaxy you're inside too, near-faded) ---
-                if (cloudMix > 0.001f)
+                if (CloudEnabled && cloudMix > 0.001f)
                     _cloudJobs.Add(new CloudJob { Galaxy = g, Rel = relF, DistM = distM, Alpha = cloudMix * keep });
 
                 // --- Volumetric body glow (nebula-style); fades in over the same approach band ---
@@ -469,7 +495,7 @@ void main() {
             LastImpostors = count;
         }
 
-        RenderGlow(camera);   // galaxy body gas first, so the cloud star points read embedded in it
+        RenderGlow(camera, sceneFbo, sceneW, sceneH); // galaxy body gas first, so cloud points read embedded in it
         RenderClouds(camera);
 
         _gl.BindVertexArray(0);
@@ -479,12 +505,23 @@ void main() {
         EvictUnusedClouds();
     }
 
-    private void RenderGlow(Camera camera)
+    private void RenderGlow(Camera camera, uint sceneFbo, int sceneW, int sceneH)
     {
-        if (_glowJobs.Count == 0) return;
+        if (_glowJobs.Count == 0 || sceneW <= 0 || sceneH <= 0) return;
 
         // Nearest GlowCap galaxies only; each is a cluster of large fBm billboards (the nebula technique).
+        // These are big, screen-filling, additive noise quads — heavy overdraw, the dominant galaxy cost
+        // inside a galaxy. Render them into a half-res buffer (¼ the pixels) and composite up; the glow is
+        // soft so the upscale is invisible.
         _glowJobs.Sort((a, b) => a.DistM.CompareTo(b.DistM));
+
+        int halfW = Math.Max(1, sceneW / 2), halfH = Math.Max(1, sceneH / 2);
+        _glowHalf.Resize(halfW, halfH);
+        _glowHalf.Bind();
+        Span<float> prevClear = stackalloc float[4];
+        _gl.GetFloat(GetPName.ColorClearValue, prevClear); // the scene's clear tint — restore it after
+        _gl.ClearColor(0f, 0f, 0f, 0f);
+        _gl.Clear((uint)ClearBufferMask.ColorBufferBit);
 
         Matrix4X4<float> vp = camera.ViewMatrix *
             MatrixHelper.PerspectiveGL(camera.FovRadians, camera.AspectRatio, CloudNear, CloudFar);
@@ -527,6 +564,19 @@ void main() {
             galaxies++;
         }
         LastGlows = puffsDrawn;
+
+        // Composite the half-res glow additively onto the scene at full resolution, then restore the scene
+        // FBO/viewport/clear-tint so the cloud pass (and everything after) continues as before.
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, sceneFbo);
+        _gl.Viewport(0, 0, (uint)sceneW, (uint)sceneH);
+        _glowComposite.Use();
+        _gl.ActiveTexture(TextureUnit.Texture0);
+        _gl.BindTexture(TextureTarget.Texture2D, _glowHalf.ColorTexture);
+        _glowComposite.SetInt("uTex", 0);
+        _gl.BindVertexArray(_glowVao);
+        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        _gl.BindTexture(TextureTarget.Texture2D, 0);
+        _gl.ClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
 
         // Puff arrays are tiny; bound the cache across a long session of galaxy-hopping (cheap to rebuild).
         if (_glowPuffs.Count > 256) _glowPuffs.Clear();
@@ -661,6 +711,8 @@ void main() {
         _impostorShader.Dispose();
         _cloudShader.Dispose();
         _glowShader.Dispose();
+        _glowComposite.Dispose();
+        _glowHalf.Dispose();
         _gl.DeleteBuffer(_pointVbo);
         _gl.DeleteVertexArray(_pointVao);
         _gl.DeleteVertexArray(_impostorVao);

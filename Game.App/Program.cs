@@ -583,10 +583,10 @@ internal static class Program
         _backdrop.Render(_camera);
         // Other galaxies as bright point sprites (the farthest LOD tier) — additive, direction-only,
         // over the painted backdrop. Skips the galaxy we're inside (its stars stream via the catalog).
-        _galaxyRenderer.Render(_camera, _galaxyPager);
+        _galaxyRenderer.Render(_camera, _galaxyPager, _sceneFbo.Fbo, _sceneFbo.Width, _sceneFbo.Height);
         // Nebulae over the backdrop but under the catalog stars — additive, so the stars that fall inside a
         // nebula read as points embedded in its glow.
-        _nebulaRenderer.Render(_camera, _nebulaField);
+        _nebulaRenderer.Render(_camera, _nebulaField, _sceneFbo.Fbo, _sceneFbo.Width, _sceneFbo.Height);
         // Sync GPU buffers to the resident lattice blocks, then draw them all — skipping the active
         // sun (the system pass renders it precisely; its catalog dot would otherwise sit slightly off
         // when viewed up close).
@@ -769,8 +769,10 @@ internal static class Program
 
         string speed = $"Speed {FormatSpeed(_controller.ActualSpeed)}";
         string target = $"Target {FormatSpeed(_controller.DesiredSpeed)}";
-        string fps = $"FPS {_fps:0}";
-        string line = $"{speed}     {target}     {fps}";
+        double ms = _fps > 0 ? 1000.0 / _fps : 0;
+        string fps = $"FPS {_fps:0} ({ms:0.0} ms)";
+        string res = $"{_sceneFbo.Width}x{_sceneFbo.Height}";
+        string line = $"{speed}     {target}     {fps}     {res}";
 
         var dl = ImGui.GetForegroundDrawList();
         System.Numerics.Vector2 size = ImGui.CalcTextSize(line);
@@ -1180,6 +1182,7 @@ internal static class Program
             // many read as points vs. fade into the background haze. The lattice is effectively
             // unbounded — blocks page in/out as you fly.
             ImGui.TextDisabled($"{_starPager.LoadedStarCount:N0} stars in {_starPager.LoadedBlockCount} blocks ({StarCatalog.BlockSideLy:0} ly each)");
+            ImGui.TextDisabled($"drawn: {_starRenderer.LastDrawn:N0} stars in {_starRenderer.LastBlocksDrawn} blocks (frustum + distance LOD)");
             ImGui.SliderFloat("Brightness", ref _starRenderer.CatBrightScale, 0.1f, 5f);
             // Lower gamma = flatter falloff = distant stars stay visible (more, fainter points).
             ImGui.SliderFloat("Falloff (gamma)", ref _starRenderer.CatGamma, 0.12f, 0.6f);
@@ -1197,6 +1200,7 @@ internal static class Program
             ImGui.SliderFloat("Point min px", ref g.MinSizePx, 1f, 12f);
             ImGui.SliderFloat("Point max px", ref g.MaxSizePx, 8f, 64f);
             ImGui.SliderFloat("Impostor brightness", ref g.ImpostorBrightness, 0.2f, 4f);
+            ImGui.Checkbox("Render galaxy cloud", ref g.CloudEnabled);
             ImGui.SliderFloat("Cloud brightness", ref g.CloudBrightness, 0.2f, 4f);
             ImGui.SliderFloat("Cloud point size", ref g.CloudPointScale, 1f, 8f);
             ImGui.Checkbox("Render body glow", ref g.GlowEnabled);
@@ -1204,8 +1208,8 @@ internal static class Program
             if (ImGui.Button("Reset galaxies"))
             {
                 g.Enabled = true; g.Brightness = 1.5f; g.SizeScale = 26f; g.MinSizePx = 14f;
-                g.MaxSizePx = 34f; g.ImpostorBrightness = 1.3f; g.CloudBrightness = 1.0f;
-                g.CloudPointScale = 2.5f; g.GlowEnabled = true; g.GlowBrightness = 0.25f;
+                g.MaxSizePx = 34f; g.ImpostorBrightness = 1.3f; g.CloudEnabled = false;
+                g.CloudBrightness = 1.0f; g.CloudPointScale = 2.5f; g.GlowEnabled = true; g.GlowBrightness = 0.25f;
             }
         }
 

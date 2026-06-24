@@ -17,6 +17,7 @@ public sealed class SceneFramebuffer : IDisposable
     public int Width { get; private set; }
     public int Height { get; private set; }
     public uint DepthTexture => _depthTex;
+    public uint Fbo => _fbo;
 
     public SceneFramebuffer(GL gl) => _gl = gl;
 

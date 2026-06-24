@@ -148,6 +148,7 @@ void main() {
     public float MaxPixelSize = 160f;
 
     public int LastDrawn { get; private set; }
+    public int LastBlocksDrawn { get; private set; }
 
     public unsafe StarRenderer(GL gl)
     {
@@ -300,9 +301,20 @@ void main() {
         _catBlocks[block.BlockCoord] = new CatBlock(vao, vbo, stars.Count, block.Origin, _now);
     }
 
-    /// <summary>Draw every resident block as apparent-brightness point sprites. The active system's
-    /// sun (by global id) is skipped in its own block: up close, single-precision relative-to-camera
-    /// puts its dot visibly off from its precisely-rendered sphere, so the system pass owns it.</summary>
+    // Distance LOD: blocks within NearFullLy of the camera draw all their stars; beyond that, a block
+    // draws a shrinking fraction (down to MinDrawFrac) — far blocks subtend a tiny screen area where
+    // their stars merge into an unresolved haze, so the dropped ones are invisible. Stars are baked in
+    // generation order with independent positions/brightness, so drawing the front prefix is an unbiased
+    // thinning, and it's stable frame-to-frame (no twinkle).
+    private const double NearFullLy = 700.0;
+    private const double MinDrawFrac = 0.20;
+
+    /// <summary>Draw the resident blocks as apparent-brightness point sprites, frustum-culled and
+    /// distance-thinned: off-screen blocks are skipped entirely and far blocks draw fewer stars, so a
+    /// dense region (tens of millions of resident stars) doesn't pay to submit/overdraw every one each
+    /// frame. The active system's sun (by global id) is skipped in its own block: up close, single-
+    /// precision relative-to-camera puts its dot visibly off from its precisely-rendered sphere, so the
+    /// system pass owns it (that block is always near, so it's never culled or thinned).</summary>
     public void RenderCatalog(Camera camera, ulong? excludeId = null)
     {
         if (_catShader == null || _catBlocks.Count == 0) return;
@@ -326,11 +338,23 @@ void main() {
         _catShader.SetFloat("uMinSize", CatMinSize);
         _catShader.SetFloat("uMaxSize", CatMaxSize);
 
-        int drawn = 0;
+        BuildFrustum(viewProj);
+        double ly = MathUtil.LightYear;
+        // Bounding-sphere radius of a 350 ly block (half-diagonal = side·√3/2).
+        float blockRadiusM = (float)(StarCatalog.BlockSideLy * ly * 0.8660254);
+
+        int drawn = 0, blocksDrawn = 0;
         foreach ((Vector3D<long> coord, CatBlock b) in _catBlocks)
         {
+            bool isExclude = exLocal >= 0 && exLocal < b.Count && coord == exBlock;
+
             // Camera relative to this block's origin, split hi/lo to match the baked star offsets.
             Vector3D<double> dcam = camera.Position.DeltaMeters(b.Origin);
+            // Frustum cull: the block centre relative to the camera is -dcam (camera sits at the view
+            // origin). Never cull the block holding the active sun (it's near anyway).
+            if (!isExclude && SphereOutsideFrustum((float)-dcam.X, (float)-dcam.Y, (float)-dcam.Z, blockRadiusM))
+                continue;
+
             var camHi = new Vector3D<float>((float)dcam.X, (float)dcam.Y, (float)dcam.Z);
             var camLo = new Vector3D<float>((float)(dcam.X - camHi.X), (float)(dcam.Y - camHi.Y), (float)(dcam.Z - camHi.Z));
             _catShader.SetVector3("uCamRelHi", camHi);
@@ -338,9 +362,14 @@ void main() {
             // Temporal fade-in: ramp this block's stars up over CatFadeInSeconds after it streamed in.
             float t = (float)Math.Clamp((_now - b.UploadTime) / CatFadeInSeconds, 0.0, 1.0);
             _catShader.SetFloat("uBlockFade", t * t * (3f - 2f * t)); // smoothstep
-            _gl.BindVertexArray(b.Vao);
 
-            if (exLocal >= 0 && exLocal < b.Count && coord == exBlock)
+            // Distance thinning: draw the front prefix of the block's stars.
+            double distLy = dcam.Length / ly;
+            double frac = isExclude ? 1.0 : Math.Clamp(NearFullLy / Math.Max(distLy, 1.0), MinDrawFrac, 1.0);
+            int drawCount = frac >= 1.0 ? b.Count : Math.Max(1, (int)(b.Count * frac));
+
+            _gl.BindVertexArray(b.Vao);
+            if (isExclude)
             {
                 // Draw the two spans around the excluded star (drawn precisely by the system pass).
                 if (exLocal > 0) _gl.DrawArrays(PrimitiveType.Points, 0, (uint)exLocal);
@@ -350,15 +379,46 @@ void main() {
             }
             else
             {
-                _gl.DrawArrays(PrimitiveType.Points, 0, (uint)b.Count);
-                drawn += b.Count;
+                _gl.DrawArrays(PrimitiveType.Points, 0, (uint)drawCount);
+                drawn += drawCount;
             }
+            blocksDrawn++;
         }
         _gl.BindVertexArray(0);
 
         _gl.DepthMask(true);
         _gl.Disable(EnableCap.Blend);
         LastDrawn = drawn;
+        LastBlocksDrawn = blocksDrawn;
+    }
+
+    // Six camera-relative frustum planes (Nx,Ny,Nz · p + D, with Len = |N| precomputed) extracted from
+    // the view-projection in Silk's row-vector convention (clip = p · M). A block is culled when its
+    // bounding sphere lies fully outside any plane.
+    private struct Plane { public float Nx, Ny, Nz, D, Len; }
+    private readonly Plane[] _planes = new Plane[6];
+
+    private void BuildFrustum(in Matrix4X4<float> m)
+    {
+        SetPlane(0, m.M11 + m.M14, m.M21 + m.M24, m.M31 + m.M34, m.M41 + m.M44); // left
+        SetPlane(1, m.M14 - m.M11, m.M24 - m.M21, m.M34 - m.M31, m.M44 - m.M41); // right
+        SetPlane(2, m.M12 + m.M14, m.M22 + m.M24, m.M32 + m.M34, m.M42 + m.M44); // bottom
+        SetPlane(3, m.M14 - m.M12, m.M24 - m.M22, m.M34 - m.M32, m.M44 - m.M42); // top
+        SetPlane(4, m.M13 + m.M14, m.M23 + m.M24, m.M33 + m.M34, m.M43 + m.M44); // near
+        SetPlane(5, m.M14 - m.M13, m.M24 - m.M23, m.M34 - m.M33, m.M44 - m.M43); // far
+    }
+
+    private void SetPlane(int i, float a, float b, float c, float d)
+        => _planes[i] = new Plane { Nx = a, Ny = b, Nz = c, D = d, Len = MathF.Sqrt(a * a + b * b + c * c) };
+
+    private bool SphereOutsideFrustum(float cx, float cy, float cz, float r)
+    {
+        for (int i = 0; i < 6; i++)
+        {
+            Plane p = _planes[i];
+            if (p.Nx * cx + p.Ny * cy + p.Nz * cz + p.D < -r * p.Len) return true; // fully beyond this plane
+        }
+        return false;
     }
 
     private void EnsureCapacity(int starCount)
