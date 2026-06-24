@@ -124,6 +124,14 @@ internal static class Program
     private static readonly List<Star> _mapChain = new(); // in-range stars in greedy nearest-neighbour order
     private static bool _mapChainValid;                  // recompute the chain when the focus moves
     private static float _mapRangeLy = 10f;              // 3D map shows stars within this radius of the focus (slider)
+    private static bool _prevU;                          // 'U' toggles the universe map
+    private static bool _universeMapVisible;             // 2D top-down universe map (galaxies) overlay
+    private static double _universeMpp = 0.2e6 * MathUtil.LightYear; // universe-map scale (m/px) ≈ 0.2 Mly/px
+    private static Vector3D<double> _universePan;        // map-centre offset from the camera (m, XZ plane)
+    private static Galaxy _universeSel;                  // selected galaxy (valid when _universeHasSel)
+    private static bool _universeHasSel;
+    private static float _universeDragPx;                // drag accumulated this press (click vs pan)
+    private static readonly List<(System.Numerics.Vector2 pos, float r, uint col, Galaxy g)> _universeDots = new();
     private static bool _mapPressed;                     // a left-press is in progress on the map background
     private static float _mapDragPx;                     // accumulated drag this press (distinguishes click from orbit)
     private static bool _mapClick;                       // a click (not a drag) was released this frame
@@ -418,6 +426,8 @@ internal static class Program
             else _galaxyMapVisible = !_galaxyMapVisible;
             Blip();
         }
+        // 'U' opens the universe map — the galaxies of the cosmic lattice, fly between them.
+        if (Edge(Key.U, ref _prevU)) { _universeMapVisible = !_universeMapVisible; Blip(); }
 
         // 'H' hides/shows the whole HUD (reticles + all panels) for a clean view / screenshots.
         if (Edge(Key.H, ref _prevH)) _hudVisible = !_hudVisible;
@@ -734,6 +744,7 @@ internal static class Program
             DrawSystemMap();
             DrawNearbyMap();
             DrawGalaxyMap();
+            DrawUniverseMap();
         }
         _imgui.Render();
 
@@ -847,6 +858,8 @@ internal static class Program
 
         ImGui.Separator();
         ImGui.Text("Travel to galaxy:");
+        ImGui.SameLine();
+        ImGui.TextDisabled("(press U for the universe map)");
         GatherNearbyGalaxies(6);
         if (_nearbyGalaxies.Count == 0)
             ImGui.TextDisabled("  (none resident)");
@@ -2019,6 +2032,128 @@ internal static class Program
             _mapFocusStarId = 0;
             _mapChainValid = false;
             SetMouseCaptured(false); // free the cursor to drag-orbit + use the panel
+        }
+        ImGui.End();
+    }
+
+    /// <summary>The universe map: a 2D top-down (XZ) plot of the galaxies in the resident cosmic lattice
+    /// (<see cref="GalaxyCatalogPager"/>), so you can see neighbouring galaxies and fly to one. Each galaxy
+    /// is a soft disk sized to its real radius (floored so it stays clickable), tinted by its colour; the
+    /// galaxy you're inside is ringed. Drag to pan, wheel to zoom; click to select, then "Jump here"
+    /// (<see cref="GoToGalaxy"/>). The galaxy-tier analogue of <see cref="DrawGalaxyMap"/>.</summary>
+    private static void DrawUniverseMap()
+    {
+        if (!_universeMapVisible) return;
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(640, 700), ImGuiCond.FirstUseEver);
+        if (!ImGui.Begin("Universe map  [U]", ref _universeMapVisible, ImGuiWindowFlags.NoNav))
+        {
+            ImGui.End();
+            return;
+        }
+
+        var io = ImGui.GetIO();
+        System.Numerics.Vector2 canvasPos = ImGui.GetCursorScreenPos();
+        System.Numerics.Vector2 avail = ImGui.GetContentRegionAvail();
+        float ch = MathF.Max(120f, avail.Y - 116f); // reserve the bottom for footer + info
+        var size = new System.Numerics.Vector2(avail.X, ch);
+        ImGui.InvisibleButton("##universecanvas", size);
+        bool hovered = ImGui.IsItemHovered();
+
+        var dl = ImGui.GetWindowDrawList();
+        var c1 = canvasPos + size;
+        var canvasCenter = canvasPos + size * 0.5f;
+        dl.PushClipRect(canvasPos, c1, true);
+        dl.AddRectFilled(canvasPos, c1, Col(0.01f, 0.01f, 0.03f));
+
+        // Zoom on the wheel, pan on a left-drag (a press that barely moves counts as a click → select).
+        double Ly = MathUtil.LightYear;
+        if (hovered && io.MouseWheel != 0f)
+            _universeMpp = Math.Clamp(_universeMpp * Math.Pow(1.2, -io.MouseWheel),
+                0.01e6 * Ly, 8.0e6 * Ly); // 0.01–8 Mly per pixel
+        if (ImGui.IsItemActivated()) _universeDragPx = 0f;
+        if (ImGui.IsItemActive() && (io.MouseDelta.X != 0f || io.MouseDelta.Y != 0f))
+        {
+            _universeDragPx += MathF.Abs(io.MouseDelta.X) + MathF.Abs(io.MouseDelta.Y);
+            _universePan = new Vector3D<double>(
+                _universePan.X - io.MouseDelta.X * _universeMpp, 0,
+                _universePan.Z - io.MouseDelta.Y * _universeMpp);
+        }
+        bool click = ImGui.IsItemDeactivated() && _universeDragPx < 4f;
+
+        double mpp = _universeMpp;
+        UniversePosition mapCenter = _camera.Position.Translated(_universePan);
+        double halfW = size.X * 0.5 * mpp, halfH = ch * 0.5 * mpp;
+
+        System.Numerics.Vector2 ToScreen(in Vector3D<double> relMeters) =>
+            canvasCenter + new System.Numerics.Vector2((float)(relMeters.X / mpp), (float)(relMeters.Z / mpp));
+
+        // Collect in-view galaxies from the resident lattice blocks (sparse — a linear scan is cheap).
+        _universeDots.Clear();
+        ulong inside = _galaxyPager.IsInside ? _galaxyPager.Containing.Id : 0;
+        foreach (GalaxyCatalog block in _galaxyPager.LoadedBlocks)
+            foreach (Galaxy g in block.Galaxies)
+            {
+                Vector3D<double> d = g.Center.DeltaMeters(mapCenter);
+                if (d.X < -halfW || d.X > halfW || d.Z < -halfH || d.Z > halfH) continue;
+                // Disk radius = true galaxy radius in px, floored so it stays visible/clickable when zoomed out.
+                float rpx = (float)(g.RadiusMeters / mpp);
+                float r = Math.Clamp(rpx, 3f, 26f);
+                uint col = Col(MathF.Max(g.Color.X, 0.25f), MathF.Max(g.Color.Y, 0.25f), MathF.Max(g.Color.Z, 0.25f));
+                _universeDots.Add((ToScreen(d), r, col, g));
+            }
+
+        // Draw galaxies as soft tinted disks and hit-test against the mouse.
+        Galaxy hitG = default;
+        bool hasHit = false;
+        float hitD = 8f;
+        foreach (var (p, r, col, g) in _universeDots)
+        {
+            dl.AddCircleFilled(p, r, Col(g.Color.X, g.Color.Y, g.Color.Z, 0.22f), 24);
+            dl.AddCircle(p, r, col, 24, 1.5f);
+            if (g.Id == inside) dl.AddCircle(p, r + 3f, Col(0.45f, 1f, 0.7f), 24, 2f); // the galaxy you're in
+            if (hovered)
+            {
+                float dd = System.Numerics.Vector2.Distance(io.MousePos, p);
+                if (dd < hitD + r) { hitD = dd; hitG = g; hasHit = true; }
+            }
+        }
+
+        // Label the hovered + selected galaxies (labelling them all would clutter the field).
+        if (hasHit) dl.AddText(ToScreen(hitG.Center.DeltaMeters(mapCenter)) + new System.Numerics.Vector2(10, -6),
+            Col(1f, 1f, 1f), $"{hitG.Name} ({hitG.Type})");
+        if (_universeHasSel)
+            dl.AddCircle(ToScreen(_universeSel.Center.DeltaMeters(mapCenter)), 7f, Col(1f, 1f, 1f), 24, 2f);
+
+        // Camera "you are here" crosshair (sits on the galaxy you're in, since your offset is sub-pixel here).
+        System.Numerics.Vector2 me = ToScreen(_camera.Position.DeltaMeters(mapCenter));
+        dl.AddLine(me - new System.Numerics.Vector2(8, 0), me + new System.Numerics.Vector2(8, 0), Col(0.4f, 1f, 0.6f));
+        dl.AddLine(me - new System.Numerics.Vector2(0, 8), me + new System.Numerics.Vector2(0, 8), Col(0.4f, 1f, 0.6f));
+        dl.PopClipRect();
+
+        if (click) { _universeHasSel = hasHit; if (hasHit) _universeSel = hitG; }
+
+        // Footer + selection info.
+        double acrossMly = size.X * mpp / Ly / 1.0e6;
+        ImGui.TextDisabled($"view {acrossMly:0.0} Mly across  •  {_universeDots.Count:n0} galaxies in view  •  drag = pan, wheel = zoom");
+        if (ImGui.Button("Center on me")) _universePan = default;
+        ImGui.SameLine();
+        if (ImGui.Button("Reset zoom")) _universeMpp = 0.2e6 * Ly;
+
+        ImGui.Separator();
+        if (_universeHasSel)
+        {
+            Galaxy g2 = _universeSel;
+            double mly = g2.Center.DistanceTo(_camera.Position) / Ly / 1.0e6;
+            ImGui.Text($"{g2.Name}  •  {g2.Type}  •  {g2.RadiusLy / 1000.0:0.0} kly radius  •  {g2.StarCount:0.0e0} stars");
+            if (g2.Id == inside)
+                ImGui.TextDisabled("you are inside this galaxy");
+            else
+                ImGui.Text($"distance: {mly:0.00} Mly");
+            if (ImGui.Button("Jump here")) { Blip(); GoToGalaxy(g2); }
+        }
+        else
+        {
+            ImGui.TextDisabled("click a galaxy to select it");
         }
         ImGui.End();
     }
