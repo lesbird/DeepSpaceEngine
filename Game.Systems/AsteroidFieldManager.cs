@@ -25,6 +25,9 @@ public sealed class AsteroidFieldManager
     private readonly Dictionary<Vector3D<long>, AsteroidField?> _cache = new();
     private readonly List<Vector3D<long>> _evictScratch = new();
 
+    private Vector3D<long> _lastCamCell;
+    private bool _hasLastCell;
+
     /// <summary>Clusters whose centre is within the current render bubble (rebuilt each Update).</summary>
     public readonly List<AsteroidField> Visible = new();
 
@@ -63,6 +66,21 @@ public sealed class AsteroidFieldManager
     {
         Visible.Clear();
         Vector3D<long> camCell = CellOf(camera);
+
+        // Speed gate: if the camera jumped more than the whole visible bubble since last frame, it's
+        // travelling far faster than any 0.5-ly cluster could be seen or visited (e.g. intergalactic
+        // warp at Mly/s). Generating a cluster costs thousands of rocks each, so 125 fresh cells/frame
+        // would burn ~5 ms on the main thread for clusters that whip past invisibly. Skip until the
+        // motion-per-frame drops back within reach; Visible stays empty (nothing's resolvable anyway).
+        if (_hasLastCell)
+        {
+            long jump = Math.Max(Math.Abs(camCell.X - _lastCamCell.X),
+                        Math.Max(Math.Abs(camCell.Y - _lastCamCell.Y), Math.Abs(camCell.Z - _lastCamCell.Z)));
+            if (jump > radiusCells) { _lastCamCell = camCell; _hasLastCell = true; return; }
+        }
+        _lastCamCell = camCell;
+        _hasLastCell = true;
+
         double bubble = (radiusCells + 1) * CellSizeMeters;
 
         for (long dx = -radiusCells; dx <= radiusCells; dx++)
