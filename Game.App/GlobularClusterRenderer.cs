@@ -119,7 +119,7 @@ void main() {
     private struct CloudVbo { public uint Vao, Vbo; public int Count; }
     private readonly Dictionary<ulong, CloudVbo> _clouds = new();
     private readonly HashSet<ulong> _pending = new();
-    private readonly ConcurrentQueue<(ulong id, float[] data)> _ready = new();
+    private readonly ConcurrentQueue<(ulong id, float[]? data)> _ready = new();
     private readonly HashSet<ulong> _keep = new();
     private readonly List<ulong> _evict = new();
 
@@ -261,14 +261,23 @@ void main() {
         if (_pending.Contains(c.Id) || _clouds.ContainsKey(c.Id)) return;
         _pending.Add(c.Id);
         GlobularCluster cc = c;
-        Task.Run(() => _ready.Enqueue((cc.Id, GlobularClusters.Stars(cc))));
+        Task.Run(() =>
+        {
+            // On failure, enqueue a null payload so IntegrateReady clears _pending
+            // and the cluster can be retried — otherwise it would be stuck forever.
+            float[]? data = null;
+            try { data = GlobularClusters.Stars(cc); }
+            catch { /* swallowed below; null payload triggers a retry */ }
+            _ready.Enqueue((cc.Id, data));
+        });
     }
 
     private unsafe void IntegrateReady()
     {
-        while (_ready.TryDequeue(out (ulong id, float[] data) item))
+        while (_ready.TryDequeue(out (ulong id, float[]? data) item))
         {
             _pending.Remove(item.id);
+            if (item.data == null) continue;          // generation failed — retry on a later frame
             if (_clouds.ContainsKey(item.id)) continue;
             uint vao = _gl.GenVertexArray();
             uint vbo = _gl.GenBuffer();

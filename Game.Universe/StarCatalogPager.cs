@@ -29,7 +29,7 @@ public sealed class StarCatalogPager : INearestStar
 
     private readonly Dictionary<Vector3D<long>, StarCatalog> _loaded = new();
     private readonly HashSet<Vector3D<long>> _pending = new();
-    private readonly ConcurrentQueue<StarCatalog> _ready = new();
+    private readonly ConcurrentQueue<(Vector3D<long> coord, StarCatalog? block)> _ready = new();
     private readonly List<Vector3D<long>> _evictScratch = new();
 
     /// <summary>Stars within the track radius of the camera (rebuilt each <see cref="Update"/>).</summary>
@@ -82,10 +82,10 @@ public sealed class StarCatalogPager : INearestStar
     public void Update(in UniversePosition camera, double trackRadiusMeters)
     {
         // Integrate any blocks that finished baking since last frame.
-        while (_ready.TryDequeue(out StarCatalog block))
+        while (_ready.TryDequeue(out (Vector3D<long> coord, StarCatalog? block) item))
         {
-            _pending.Remove(block.BlockCoord);
-            _loaded[block.BlockCoord] = block;
+            _pending.Remove(item.coord);                 // clear even on failure so the block can retry
+            if (item.block != null) _loaded[item.coord] = item.block;
         }
 
         Vector3D<long> camBlock = BlockCoordOf(camera);
@@ -112,7 +112,17 @@ public sealed class StarCatalogPager : INearestStar
             UniversePosition center = UniversePosition.FromMeters(
                 c.X * _sideMeters, c.Y * _sideMeters, c.Z * _sideMeters);
             bool has = _galaxies.TryGetGalaxyForBlock(center, _blockBoundingRadius, out Galaxy g);
-            Task.Run(() => _ready.Enqueue(has ? new StarCatalog(g, c) : new StarCatalog(c)));
+            bool hasGalaxy = has;
+            Galaxy galaxy = g;
+            Task.Run(() =>
+            {
+                // On failure, enqueue a null block so the drain loop clears _pending and the
+                // block can be retried next frame — otherwise it would stay pending forever.
+                StarCatalog? block = null;
+                try { block = hasGalaxy ? new StarCatalog(galaxy, c) : new StarCatalog(c); }
+                catch { /* null block triggers a retry */ }
+                _ready.Enqueue((c, block));
+            });
         }
 
         // Evict blocks that have drifted past the evict radius (Chebyshev distance in blocks).

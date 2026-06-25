@@ -1582,7 +1582,8 @@ internal static class Program
         if (!_libraryOpen) return;
 
         ImGui.SetNextWindowPos(new System.Numerics.Vector2(360, 60), ImGuiCond.FirstUseEver);
-        ImGui.SetNextWindowSize(new System.Numerics.Vector2(600, 480), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(980, 520), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSizeConstraints(new System.Numerics.Vector2(720, 240), new System.Numerics.Vector2(float.MaxValue, float.MaxValue));
         ImGui.Begin("Discovery Library  [L]", ref _libraryOpen, ImGuiWindowFlags.NoNav);
 
         if (!_discoveryConfig.Enabled)
@@ -1632,10 +1633,10 @@ internal static class Program
         if (ImGui.BeginTable("discoveries", 5, flags))
         {
             ImGui.TableSetupColumn("##go", ImGuiTableColumnFlags.WidthFixed, 52f);
-            ImGui.TableSetupColumn("Object", ImGuiTableColumnFlags.WidthStretch, 0.36f);
-            ImGui.TableSetupColumn("Designation", ImGuiTableColumnFlags.WidthStretch, 0.30f);
-            ImGui.TableSetupColumn("Discoverer", ImGuiTableColumnFlags.WidthStretch, 0.20f);
-            ImGui.TableSetupColumn("UTC", ImGuiTableColumnFlags.WidthStretch, 0.14f);
+            ImGui.TableSetupColumn("Object", ImGuiTableColumnFlags.WidthStretch, 0.40f);
+            ImGui.TableSetupColumn("Designation", ImGuiTableColumnFlags.WidthStretch, 0.34f);
+            ImGui.TableSetupColumn("Discoverer", ImGuiTableColumnFlags.WidthStretch, 0.13f);
+            ImGui.TableSetupColumn("UTC", ImGuiTableColumnFlags.WidthFixed, 88f);
             ImGui.TableSetupScrollFreeze(0, 1);
             ImGui.TableHeadersRow();
 
