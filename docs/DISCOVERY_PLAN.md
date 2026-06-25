@@ -22,13 +22,14 @@ knowing anything about geometry — an object's identity is just a string id.
 All ids are **strings**, both on the wire and in MySQL (`VARCHAR`). No integers, so there is
 no 64-bit / JavaScript `2^53` precision concern anywhere.
 
-- **Star id** = the star's catalog id as a **decimal string** — exactly what the HUD already
-  shows (`Star.Id.ToString()`, the `#…` value on reticles / panels) → e.g. `12407198355`.
-  No HUD change needed: the value you see *is* the discovery id.
-- **Planet id** = `"{starId}-{PP}"`, `PP` = the planet's index in `SolarSystem.Planets`,
-  zero-padded to 2 digits → `12407198355-02`.
-- **Moon id** = `"{starId}-{PP}-{MM}"`, `MM` = the moon's index in `Planet.Moons`,
-  zero-padded → `12407198355-02-03`.
+- **Star id** = `"{galaxyId}-{starId}"` — the containing galaxy's id and the star's catalog id, both
+  decimal → e.g. `12345-12407198355`. The galaxy id prefixes the star id because `Star.Id` is only
+  unique *within* a galaxy (the star-lattice block field wraps at galaxy-to-galaxy distances); a galaxy
+  id is globally unique, so the pair is too.
+- **Planet id** = `"{galaxyId}-{starId}-{PP}"`, `PP` = the planet's index in `SolarSystem.Planets`,
+  zero-padded to 2 digits → `12345-12407198355-02`.
+- **Moon id** = `"{galaxyId}-{starId}-{PP}-{MM}"`, `MM` = the moon's index in `Planet.Moons`,
+  zero-padded → `12345-12407198355-02-03`.
 
 Indices are **0-based array positions** (deterministic generation order, identical for all
 players). One helper produces these so client and server never disagree:
@@ -60,9 +61,9 @@ A tiny LAMP app. No framework; PDO with prepared statements throughout.
 ```sql
 CREATE TABLE discoveries (
   id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  object_id     VARCHAR(32)  NOT NULL,                -- '12407198355' | '…-02' | '…-02-03'
+  object_id     VARCHAR(64)  NOT NULL,                -- '12345-56789' | '…-00' | '…-00-03'
   kind          ENUM('star','planet','moon') NOT NULL,
-  star_id       VARCHAR(20)  NOT NULL,                -- the decimal star id (grouping / by-system views)
+  star_id       VARCHAR(48)  NOT NULL,                -- system root '{galaxyId}-{starId}' (grouping / by-system views)
   designation   VARCHAR(96)  NOT NULL DEFAULT '',
   discoverer    VARCHAR(64)  NOT NULL,
   discovered_at DATETIME     NOT NULL,
@@ -95,23 +96,23 @@ it deters casual abuse, nothing more. Rate-limit by IP if needed.)
 **`POST /api/discover.php`** — request body (all strings):
 
 ```json
-{ "objectId": "12407198355-02", "kind": "planet",
-  "starId": "12407198355", "designation": "Kepler-7f", "discoverer": "Ada",
+{ "objectId": "12345-12407198355-02", "kind": "planet",
+  "starId": "12345-12407198355", "designation": "Kepler-7f", "discoverer": "Ada",
   "meta": { "type": "Ocean", "tempK": 288, "hasAtmosphere": true } }
 ```
 
 Server logic (PDO):
-1. Validate `kind` against the enum; `objectId` matches `/^\d{1,20}(-\d{2}){0,2}$/`;
-   `starId` matches `/^\d{1,20}$/` and equals `objectId`'s first segment; `discoverer`
-   non-empty (≤64 chars); API key matches.
+1. Validate `kind` against the enum; `objectId` matches `/^\d{1,20}-\d{1,20}(-\d{2}){0,2}$/`;
+   `starId` matches `/^\d{1,20}-\d{1,20}$/` and equals `objectId`'s `{galaxyId}-{starId}` root (first
+   two segments); `discoverer` non-empty (≤64 chars); API key matches.
 2. `INSERT ... ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)` (no-op touch so the row id is returned), or `INSERT IGNORE` then `SELECT`.
 3. `SELECT` the row by `object_id` and return it.
 
 Response (`200`) — the authoritative record:
 
 ```json
-{ "objectId": "12407198355-02", "kind": "planet",
-  "starId": "12407198355", "designation": "Kepler-7f", "discoverer": "Ada",
+{ "objectId": "12345-12407198355-02", "kind": "planet",
+  "starId": "12345-12407198355", "designation": "Kepler-7f", "discoverer": "Ada",
   "discoveredAt": "2026-06-22T18:04:11Z", "isNew": false }
 ```
 
@@ -225,6 +226,12 @@ Reusing the existing `Edge`/`_prev*` idiom already in the update loop:
   (`AirlessEnvShell` is one constant — surface it in the Discovery config if you want it
   tunable. Choosing it near typical atmosphere heights keeps the "enter the environment"
   altitude consistent between airless and atmospheric worlds.)
+
+- **Scanning** — when the scanner panel (`F`) is open and a body is within scan range
+  (`radius × ScanRangeRadii`, far wider than the environment shell), `DrawScanner` calls
+  `_discovery.ReportBody(sys, target, meta)` for the body it reads out. So a world can be
+  discovered from scanner distance without descending. `ReportBody` is idempotent, so the
+  per-frame call no-ops once the object is known — no edge key needed.
 
 ### 2.4 HUD display
 

@@ -172,6 +172,7 @@ dotnet run --project Game.App      # launch the engine
 | `,` / `.` | Orbit time-lapse slower / faster |
 | `P` | Pause / resume orbital time |
 | `F` | Toggle the body scanner panel |
+| `L` | Toggle the discovery library (the full list of known discoveries) |
 | `M` | Toggle the system map (top-down schematic of the active system) |
 | `N` | Toggle the galaxy map (2D chart of nearby stars; "Open 3D view" for a navigable 3-D neighbourhood) |
 | `U` | Toggle the universe map (2D chart of the galaxies; click a galaxy to *Jump here*) |
@@ -263,6 +264,8 @@ stars/galaxies in as you roam past it is a follow-up.)
 **Scanner.** Press `F` to toggle a scanner panel that reads out the nearest body once you're in
 range — class, radius, surface gravity, temperature, hydrosphere, surface pressure, and
 atmosphere/surface composition (works for planets and moons alike), with habitable worlds flagged.
+Scanning a body in range also **discovers** it (if discovery reporting is on) — you don't have to
+descend to claim it; the find shows up credited in the scanner, on its reticle, and in the library (`L`).
 The composition is the **same data that drives the atmosphere's appearance**, so the sky you see
 matches the gases (and pressure) the scanner reports. When **no body is in scan range** the panel
 widens out: inside a system it reports the **star and its system** (spectral class, temperature,

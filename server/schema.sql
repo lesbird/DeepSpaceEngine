@@ -5,11 +5,15 @@
 --
 -- Apply with:  mysql -u <user> -p <database> < schema.sql
 
+-- Ids are '{galaxyId}-{starId}[-PP[-MM]]'. The galaxy id prefixes the star id because a star id is
+-- only unique within its galaxy; galaxy + star ids are each up to 20 digits, so the fields are sized
+-- for the longest moon id ("g-s-PP-MM" ≈ 47 chars) with headroom.
+
 CREATE TABLE IF NOT EXISTS discoveries (
   id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  object_id     VARCHAR(32)  CHARACTER SET ascii NOT NULL,   -- '12407198355' | '…-02' | '…-02-03'
+  object_id     VARCHAR(64)  CHARACTER SET ascii NOT NULL,   -- '12345-56789' | '…-00' | '…-00-03'
   kind          ENUM('star','planet','moon') NOT NULL,
-  star_id       VARCHAR(20)  CHARACTER SET ascii NOT NULL,   -- decimal star id (grouping / by-system views)
+  star_id       VARCHAR(48)  CHARACTER SET ascii NOT NULL,   -- system root '{galaxyId}-{starId}' (grouping / by-system views)
   designation   VARCHAR(96)  NOT NULL DEFAULT '',
   discoverer    VARCHAR(64)  NOT NULL,
   discovered_at DATETIME     NOT NULL,                        -- stored in UTC
@@ -18,3 +22,8 @@ CREATE TABLE IF NOT EXISTS discoveries (
   KEY idx_discoverer (discoverer),
   KEY idx_star (star_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Star ids became galaxy-prefixed after the initial schema. To upgrade an existing database, widen
+-- the id columns in place (old unprefixed rows, if any, remain valid but won't match new ids):
+--   ALTER TABLE discoveries MODIFY object_id VARCHAR(64) CHARACTER SET ascii NOT NULL,
+--                           MODIFY star_id   VARCHAR(48) CHARACTER SET ascii NOT NULL;

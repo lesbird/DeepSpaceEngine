@@ -8,31 +8,35 @@ namespace Game.Systems.Discovery;
 /// and moons in the same order — so these ids are stable across clients without the server knowing
 /// any geometry.
 ///
-///   star   = decimal <see cref="Star.Id"/>            e.g. "12407198355"
-///   planet = "{starId}-{PP}"  (PP = index in Planets) e.g. "12407198355-02"
-///   moon   = "{starId}-{PP}-{MM}" (MM = index in Moons) e.g. "12407198355-02-03"
+///   star   = "{galaxyId}-{starId}"               e.g. "12345-56789"
+///   planet = "{galaxyId}-{starId}-{PP}"          e.g. "12345-56789-00"
+///   moon   = "{galaxyId}-{starId}-{PP}-{MM}"     e.g. "12345-56789-00-03"
 ///
+/// The galaxy id prefixes the star id because <see cref="Star.Id"/> is only unique <i>within</i> a
+/// galaxy: the star-lattice block field (<see cref="StarId"/>) wraps at a few Mly, so two stars in
+/// different galaxies can share an id — but a galaxy id is globally unique, so the pair is too.
 /// Indices are 0-based generation order, zero-padded to two digits.
 /// </summary>
 public static class ObjectId
 {
-    public static string Star(in Star s) => s.Id.ToString();
-    public static string Planet(in Star s, int planetIndex) => $"{s.Id}-{planetIndex:D2}";
-    public static string Moon(in Star s, int planetIndex, int moonIndex) => $"{s.Id}-{planetIndex:D2}-{moonIndex:D2}";
+    public static string Star(ulong galaxyId, in Star s) => $"{galaxyId}-{s.Id}";
+    public static string Planet(ulong galaxyId, in Star s, int planetIndex) => $"{galaxyId}-{s.Id}-{planetIndex:D2}";
+    public static string Moon(ulong galaxyId, in Star s, int planetIndex, int moonIndex) =>
+        $"{galaxyId}-{s.Id}-{planetIndex:D2}-{moonIndex:D2}";
 
     /// <summary>
-    /// Resolve a body in the active system to its (id, kind). Matches by reference (the instances
-    /// the system manager hands out), falling back to <see cref="CelestialBody.Seed"/>. Returns
-    /// false if the body isn't part of this system.
+    /// Resolve a body in the active system to its (id, kind), prefixed by <paramref name="galaxyId"/>.
+    /// Matches by reference (the instances the system manager hands out), falling back to
+    /// <see cref="CelestialBody.Seed"/>. Returns false if the body isn't part of this system.
     /// </summary>
-    public static bool TryFor(SolarSystem sys, CelestialBody body, out string id, out string kind)
+    public static bool TryFor(ulong galaxyId, SolarSystem sys, CelestialBody body, out string id, out string kind)
     {
         for (int pi = 0; pi < sys.Planets.Length; pi++)
         {
             Planet p = sys.Planets[pi];
             if (ReferenceEquals(p, body) || p.Seed == body.Seed)
             {
-                id = Planet(sys.Sun, pi);
+                id = Planet(galaxyId, sys.Sun, pi);
                 kind = "planet";
                 return true;
             }
@@ -41,7 +45,7 @@ public static class ObjectId
                 Moon m = p.Moons[mi];
                 if (ReferenceEquals(m, body) || m.Seed == body.Seed)
                 {
-                    id = Moon(sys.Sun, pi, mi);
+                    id = Moon(galaxyId, sys.Sun, pi, mi);
                     kind = "moon";
                     return true;
                 }

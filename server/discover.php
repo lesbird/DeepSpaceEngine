@@ -29,23 +29,26 @@ $discoverer  = trim((string)($in['discoverer'] ?? ''));
 $meta        = array_key_exists('meta', $in) ? $in['meta'] : null;
 
 // --- Validation -----------------------------------------------------------------
+// Ids are '{galaxyId}-{starId}[-PP[-MM]]'; the galaxy id prefixes the star id (a star id is only
+// unique within its galaxy). starId is the system root: the first two segments, '{galaxyId}-{starId}'.
 if (!in_array($kind, ['star', 'planet', 'moon'], true)) {
     send_error(400, 'Bad kind.');
 }
-if (!preg_match('/^\d{1,20}(-\d{2}){0,2}$/', $objectId)) {
+if (!preg_match('/^\d{1,20}-\d{1,20}(-\d{2}){0,2}$/', $objectId)) {
     send_error(400, 'Bad objectId.');
 }
-if (!preg_match('/^\d{1,20}$/', $starId)) {
+if (!preg_match('/^\d{1,20}-\d{1,20}$/', $starId)) {
     send_error(400, 'Bad starId.');
 }
-// starId must be the first segment of objectId.
-$firstSegment = explode('-', $objectId)[0];
-if ($firstSegment !== $starId) {
-    send_error(400, 'starId must be the first segment of objectId.');
+// starId must be the first two segments of objectId (the galaxy + star root).
+$segments = explode('-', $objectId);
+$root     = $segments[0] . '-' . $segments[1];
+if ($root !== $starId) {
+    send_error(400, 'starId must be the "{galaxyId}-{starId}" root of objectId.');
 }
-// kind must match the id shape: star = 0 dashes, planet = 1, moon = 2.
+// kind must match the id shape: star = 1 dash, planet = 2, moon = 3.
 $dashes   = substr_count($objectId, '-');
-$expected = $kind === 'star' ? 0 : ($kind === 'planet' ? 1 : 2);
+$expected = $kind === 'star' ? 1 : ($kind === 'planet' ? 2 : 3);
 if ($dashes !== $expected) {
     send_error(400, 'kind does not match objectId shape.');
 }

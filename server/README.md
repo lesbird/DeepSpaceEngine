@@ -49,23 +49,25 @@ Assuming `php -S 127.0.0.1:8080` and `api_key = testkey`:
 BASE=http://127.0.0.1:8080
 KEY=testkey
 
+# Object ids are '{galaxyId}-{starId}[-PP[-MM]]'; starId is the '{galaxyId}-{starId}' root.
+
 # Report a star — expect isNew:true
 curl -s -X POST $BASE/discover.php -H "X-Api-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"objectId":"12407198355","kind":"star","starId":"12407198355",
-       "designation":"12407198355","discoverer":"Ada",
+  -d '{"objectId":"12345-12407198355","kind":"star","starId":"12345-12407198355",
+       "designation":"Helix Prime","discoverer":"Ada",
        "meta":{"class":"G","tempK":5800}}'
 
 # Report the SAME star as a different player — expect isNew:false, discoverer still "Ada"
 curl -s -X POST $BASE/discover.php -H "X-Api-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"objectId":"12407198355","kind":"star","starId":"12407198355",
-       "designation":"12407198355","discoverer":"Bob"}'
+  -d '{"objectId":"12345-12407198355","kind":"star","starId":"12345-12407198355",
+       "designation":"Helix Prime","discoverer":"Bob"}'
 
 # Report a planet and a moon
 curl -s -X POST $BASE/discover.php -H "X-Api-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"objectId":"12407198355-02","kind":"planet","starId":"12407198355",
+  -d '{"objectId":"12345-12407198355-02","kind":"planet","starId":"12345-12407198355",
        "designation":"Kepler-7f","discoverer":"Ada","meta":{"type":"Ocean","hasAtmosphere":true}}'
 curl -s -X POST $BASE/discover.php -H "X-Api-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"objectId":"12407198355-02-03","kind":"moon","starId":"12407198355",
+  -d '{"objectId":"12345-12407198355-02-03","kind":"moon","starId":"12345-12407198355",
        "designation":"Kepler-7f III","discoverer":"Ada","meta":{"hasAtmosphere":false}}'
 
 # List everything
@@ -74,7 +76,7 @@ curl -s $BASE/discoveries.php
 # Auth + validation failures
 curl -s -X POST $BASE/discover.php -H 'Content-Type: application/json' -d '{}'          # 401 (no key)
 curl -s -X POST $BASE/discover.php -H "X-Api-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"objectId":"12407198355-2","kind":"planet","starId":"12407198355","discoverer":"X"}'  # 400 (PP not 2 digits)
+  -d '{"objectId":"12345-12407198355-2","kind":"planet","starId":"12345-12407198355","discoverer":"X"}'  # 400 (PP not 2 digits)
 ```
 
 Expected: the second star POST returns `"isNew":false` with `"discoverer":"Ada"` (first
@@ -88,20 +90,22 @@ finder kept); `discoveries.php` lists 3 objects; the bad requests return `401`/`
 Request body (all ids are strings):
 
 ```json
-{ "objectId": "12407198355-02", "kind": "planet",
-  "starId": "12407198355", "designation": "Kepler-7f", "discoverer": "Ada",
+{ "objectId": "12345-12407198355-02", "kind": "planet",
+  "starId": "12345-12407198355", "designation": "Kepler-7f", "discoverer": "Ada",
   "meta": { "type": "Ocean", "tempK": 288, "hasAtmosphere": true } }
 ```
 
-- `kind` ∈ `star | planet | moon`; must match the id shape (0 / 1 / 2 dash-segments).
-- `objectId` matches `^\d{1,20}(-\d{2}){0,2}$`; `starId` matches `^\d{1,20}$` and equals the
-  first segment of `objectId`.
+- Ids are `{galaxyId}-{starId}[-PP[-MM]]` — the galaxy id prefixes the star id, which is only unique
+  within its galaxy.
+- `kind` ∈ `star | planet | moon`; must match the id shape (1 / 2 / 3 dashes for star / planet / moon).
+- `objectId` matches `^\d{1,20}-\d{1,20}(-\d{2}){0,2}$`; `starId` matches `^\d{1,20}-\d{1,20}$` and
+  equals the `{galaxyId}-{starId}` root (first two segments) of `objectId`.
 - `discoverer` 1–64 chars; `designation` truncated to 96; `meta` is free-form JSON or omitted.
 
 Response `200` — the authoritative record:
 
 ```json
-{ "objectId":"12407198355-02", "kind":"planet", "starId":"12407198355",
+{ "objectId":"12345-12407198355-02", "kind":"planet", "starId":"12345-12407198355",
   "designation":"Kepler-7f", "discoverer":"Ada",
   "discoveredAt":"2026-06-22T18:04:11Z", "isNew": false }
 ```
@@ -118,7 +122,7 @@ ISO-8601. Optional `?since=2026-06-22T00:00:00Z` returns only newer rows.
 
 A server-rendered HTML page: totals per kind, a **top-discoverers** leaderboard, and the
 latest 500 discoveries (newest first). Click a discoverer to filter to their finds; filter a
-system with `?star=<starId>`. Times shown in UTC. Visit `http://<host>/` (or
+system with `?star=<galaxyId>-<starId>`. Times shown in UTC. Visit `http://<host>/` (or
 `http://127.0.0.1:8080/` under the built-in server).
 
 ## Notes

@@ -569,7 +569,7 @@ Tuning ▸ Audio panel. Music is skipped in `--smoke` runs.
 
 ### 9.2 OnUpdate(dt) — simulation
 
-Edge-detected key toggles (Tab capture, F scanner, R rover, H HUD, P grid, M/N
+Edge-detected key toggles (Tab capture, F scanner, L discovery library, R rover, H HUD, P grid, M/N
 maps, B/J jumps, Space pause, `,`/`.` time-lapse) → if not driving/orbiting,
 `_galaxyPager.Update(camera)` (then rebuild nebulae + globular clusters if the host galaxy changed) →
 `_controller.Update(dt)` → `_starPager.Update` → `_asteroidFields.Update` →
@@ -694,7 +694,9 @@ status line, a **travel-to-galaxy** list, find-star box, drawn-vs-resident star 
 **Render galaxy cloud** toggle — and **Globular clusters** sections and the **Audio** panel: master/music/
 sfx volume, music on/off, Test-SFX — see §6), `DrawScanner` (body / star / sector readout, F, which now
 **appends a host-galaxy section** — name, type, radius, star count, core distance — whenever inside a
-galaxy), `DrawSystemMap` (top-down system, M, with nebula disks and click-to-travel),
+galaxy), `DrawDiscoveryLibrary` (**L** — a sortable table of every known discovery from
+`DiscoveryService.Snapshot()`, with a *Mine only* filter and per-kind counts), `DrawSystemMap`
+(top-down system, M, with nebula disks and click-to-travel),
 `DrawGalaxyMap`/3D neighbourhood (N), and `DrawUniverseMap` (top-down chart of the **galaxies**, U,
 click-to-jump via `GoToGalaxy`).
 
@@ -712,13 +714,17 @@ geometry. **Opt-in** (off by default; enable + name + server URL in Tuning ▸ D
 Strings, decimal, matching what the HUD shows:
 
 ```
-star   = Star.Id                         "12407198355"
-planet = "{starId}-{PP}"  (0-based idx)  "12407198355-02"
-moon   = "{starId}-{PP}-{MM}"            "12407198355-02-03"
+star   = "{galaxyId}-{starId}"               "12345-56789"
+planet = "{galaxyId}-{starId}-{PP}"          "12345-56789-00"
+moon   = "{galaxyId}-{starId}-{PP}-{MM}"     "12345-56789-00-03"
 ```
 
-`ObjectId.TryFor(sys, body)` resolves a `CelestialBody` to its `(id, kind)` by locating it in
-the active system's `Planets`/`Moons`.
+The galaxy id prefixes the star id because `Star.Id` is only unique *within* a galaxy — the
+star-lattice block field (`StarId`, 14 bits/axis ≈ ±2.9 Mly) wraps at galaxy-to-galaxy distances, so
+two stars in different galaxies can share an id; a galaxy id is globally unique, so the pair is too.
+`ObjectId.Star/Planet/Moon(galaxyId, …)` and `ObjectId.TryFor(galaxyId, sys, body)` take the galaxy id
+explicitly; `DiscoveryService.CurrentGalaxyId` (set each frame from the galaxy pager — the galaxy that
+contains every star you can report or credit) supplies it, so the overlay/scanner lookups stay unchanged.
 
 ### 10.2 Client (`Game.Systems/Discovery/`)
 
@@ -737,13 +743,16 @@ the active system's `Planets`/`Moons`.
 - **DiscoveryConfig** → `discovery.json` (gitignored; Enabled / PlayerName / ServerUrl / ApiKey),
   edited in the Tuning ▸ Discovery panel (toggle, fields, Save, Test connection, Re-sync, sync
   status).
-- **Edge detection** (`Program.ReportDiscoveries`, each frame when enabled): **system entry** →
-  `ReportStar` when `ActiveStarId` changes; **environment entry** → `ReportBody` once the nearest
-  surfaced body's altitude drops below its shell `radius × (HasAtmosphere ? AtmosphereHeight :
-  AirlessEnvShell=0.05)` — so airless worlds discover on entry too — with `> 1.2×` hysteresis.
-  Both attach display `meta` (class/type/temp).
+- **Triggers**: **system entry** → `ReportStar` when `ActiveStarId` changes (`Program.ReportDiscoveries`,
+  each frame); **environment entry** → `ReportBody` once the nearest surfaced body's altitude drops below
+  its shell `radius × (HasAtmosphere ? AtmosphereHeight : AirlessEnvShell=0.05)` — so airless worlds
+  discover on entry too — with `> 1.2×` hysteresis; **scanning** → `DrawScanner` reports the body it's
+  reading out whenever one is within scan range (`radius × ScanRangeRadii`), so you can discover a world
+  from scanner distance without descending. All attach display `meta` (class/type/temp); `ReportBody`
+  is idempotent, so the repeated per-frame scan call no-ops once the object is known.
 - **HUD credit** — `StarOverlay` reticles append `by {name}`; `DrawScanner` and the `DrawHud`
-  system header show `Discovered by {name} on {date}` / `Undiscovered`.
+  system header show `Discovered by {name} on {date}` / `Undiscovered`. The **discovery library** (`L`,
+  `DrawDiscoveryLibrary`) lists every known discovery (`DiscoveryService.Snapshot()`).
 
 ### 10.4 Server (`server/`, PHP + MySQL)
 

@@ -3,7 +3,7 @@
 //
 // Server-rendered: PHP reads the DB and prints the page, so there's no client-side
 // JavaScript and the decimal string ids show exactly as stored. Open (no API key).
-// Optional filters: ?star=<starId>  and/or  ?discoverer=<name>.
+// Optional filters: ?star=<galaxyId>-<starId>  and/or  ?discoverer=<name>.
 
 declare(strict_types=1);
 require __DIR__ . '/db.php'; // for config()
@@ -32,7 +32,8 @@ $KIND_BADGE = [
 ];
 
 // Optional filters.
-$fStar = isset($_GET['star']) && preg_match('/^\d{1,20}$/', $_GET['star']) ? $_GET['star'] : null;
+// star filter is the '{galaxyId}-{starId}' system root.
+$fStar = isset($_GET['star']) && preg_match('/^\d{1,20}-\d{1,20}$/', $_GET['star']) ? $_GET['star'] : null;
 $fDisc = isset($_GET['discoverer']) && $_GET['discoverer'] !== '' ? (string)$_GET['discoverer'] : null;
 
 $error = null;

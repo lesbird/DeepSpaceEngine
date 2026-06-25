@@ -31,6 +31,11 @@ public sealed class DiscoveryService
     /// <summary>Credited as the discoverer on new finds. Reporting is skipped while blank.</summary>
     public string PlayerName { get; set; } = "";
 
+    /// <summary>The galaxy currently containing the camera (0 in intergalactic space). Set each frame by
+    /// the host; it prefixes every star/body object id, since a star id is only unique within its galaxy
+    /// (see <see cref="ObjectId"/>). All stars the player can report or credit are in this galaxy.</summary>
+    public ulong CurrentGalaxyId { get; set; }
+
     public SyncState State { get; private set; } = SyncState.Idle;
     public int Count => _byId.Count;
 
@@ -54,15 +59,15 @@ public sealed class DiscoveryService
     /// <summary>Report a star (system entry). No-op if already known, disabled, or no player name.</summary>
     public void ReportStar(in Star sun, IReadOnlyDictionary<string, object?>? meta = null)
     {
-        string id = ObjectId.Star(sun);
+        string id = ObjectId.Star(CurrentGalaxyId, sun);
         Report(id, "star", id, sun.Designation, meta);
     }
 
     /// <summary>Report a planet or moon (environment entry). Resolves the id/kind from the system.</summary>
     public void ReportBody(SolarSystem sys, CelestialBody body, IReadOnlyDictionary<string, object?>? meta = null)
     {
-        if (!ObjectId.TryFor(sys, body, out string id, out string kind)) return;
-        Report(id, kind, ObjectId.Star(sys.Sun), body.Designation, meta);
+        if (!ObjectId.TryFor(CurrentGalaxyId, sys, body, out string id, out string kind)) return;
+        Report(id, kind, ObjectId.Star(CurrentGalaxyId, sys.Sun), body.Designation, meta);
     }
 
     private void Report(string id, string kind, string starId, string designation,
@@ -113,13 +118,22 @@ public sealed class DiscoveryService
         for (int i = 0; i < n && _pending.TryDequeue(out ReportRequest? req); i++) Send(req);
     }
 
+    /// <summary>All known discoveries (local + server-synced), newest first — for the library panel.
+    /// Snapshots the concurrent cache into a fresh list, so the caller can iterate without locking.</summary>
+    public IReadOnlyList<DiscoveryRecord> Snapshot()
+    {
+        var list = new List<DiscoveryRecord>(_byId.Values);
+        list.Sort((a, b) => b.DiscoveredAtUtc.CompareTo(a.DiscoveredAtUtc));
+        return list;
+    }
+
     public bool TryGet(string id, out DiscoveryRecord record) => _byId.TryGetValue(id, out record!);
 
-    public bool TryGetStar(in Star s, out DiscoveryRecord record) => TryGet(ObjectId.Star(s), out record);
+    public bool TryGetStar(in Star s, out DiscoveryRecord record) => TryGet(ObjectId.Star(CurrentGalaxyId, s), out record);
 
     public bool TryGetBody(SolarSystem sys, CelestialBody body, out DiscoveryRecord record)
     {
-        if (ObjectId.TryFor(sys, body, out string id, out _)) return TryGet(id, out record);
+        if (ObjectId.TryFor(CurrentGalaxyId, sys, body, out string id, out _)) return TryGet(id, out record);
         record = null!;
         return false;
     }

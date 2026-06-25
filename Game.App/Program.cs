@@ -138,6 +138,9 @@ internal static class Program
     private static ulong _mapFocusStarId;               // 0 = focus is the ship; else the id of the picked centre star
     private static string _jumpStatus = "";
     private static bool _scannerOpen;
+    private static bool _libraryOpen;                    // 'L' toggles the discovery library
+    private static bool _prevL;
+    private static bool _libraryMineOnly;                // library filter: only my finds
     private static string _starSearch = "";
     private static Star _searchTarget;
     private static bool _hasSearchTarget;
@@ -362,6 +365,9 @@ internal static class Program
         // Nebulae and globular clusters belong to whichever galaxy you're in; rebuild them when that
         // changes (or when a tuning reload reset the sentinel), and clear them in intergalactic space.
         ulong nebGalaxy = _galaxyPager.IsInside ? _galaxyPager.Containing.Id : 0;
+        // Discovery object ids are prefixed by the containing galaxy (a star id is only unique within a
+        // galaxy), so keep the service's current galaxy current before any report/credit lookup this frame.
+        _discovery.CurrentGalaxyId = nebGalaxy;
         if (nebGalaxy != _nebulaGalaxyId)
         {
             RebuildNebulaField();
@@ -392,6 +398,9 @@ internal static class Program
 
         // 'F' toggles the scanner panel (detailed readout for the nearest body in range).
         if (Edge(Key.F, ref _prevF)) _scannerOpen = !_scannerOpen;
+
+        // 'L' toggles the discovery library — the full list of known discoveries.
+        if (Edge(Key.L, ref _prevL)) _libraryOpen = !_libraryOpen;
 
         // 'R' toggles the surface rover. Enter only when a terrain planet is active and we're low
         // enough to be effectively at the surface; exit lifts back into free-fly from the chase cam.
@@ -744,6 +753,7 @@ internal static class Program
             DrawHud();
             DrawTuning();
             DrawScanner();
+            DrawDiscoveryLibrary();
             DrawSystemMap();
             DrawNearbyMap();
             DrawGalaxyMap();
@@ -1424,6 +1434,92 @@ internal static class Program
             ImGui.TextDisabled("Undiscovered");
     }
 
+    /// <summary>The discovery library (toggled with L): the full list of known discoveries — the ones
+    /// you've found plus everyone else's, synced from the server — sortable, filterable to your own.</summary>
+    private static void DrawDiscoveryLibrary()
+    {
+        if (!_libraryOpen) return;
+
+        ImGui.SetNextWindowPos(new System.Numerics.Vector2(360, 60), ImGuiCond.FirstUseEver);
+        ImGui.SetNextWindowSize(new System.Numerics.Vector2(600, 480), ImGuiCond.FirstUseEver);
+        ImGui.Begin("Discovery Library  [L]", ref _libraryOpen, ImGuiWindowFlags.NoNav);
+
+        if (!_discoveryConfig.Enabled)
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.8f, 0.4f, 1f),
+                "Discovery reporting is off — enable it in Tuning ▸ Discovery to record and sync finds.");
+
+        IReadOnlyList<DiscoveryRecord> all = _discovery.Snapshot();
+        int stars = 0, planets = 0, moons = 0;
+        foreach (DiscoveryRecord r in all)
+        {
+            if (r.Kind == "star") stars++;
+            else if (r.Kind == "planet") planets++;
+            else if (r.Kind == "moon") moons++;
+        }
+        string state = _discovery.State switch
+        {
+            DiscoveryService.SyncState.Loading => "syncing…",
+            DiscoveryService.SyncState.Ready   => "synced",
+            DiscoveryService.SyncState.Offline => "offline",
+            _ => "idle",
+        };
+        ImGui.Text($"{all.Count} discoveries  —  {stars} stars · {planets} planets · {moons} moons");
+        ImGui.SameLine();
+        ImGui.TextDisabled($"[{state}]");
+        ImGui.SameLine();
+        ImGui.Checkbox("Mine only", ref _libraryMineOnly);
+        ImGui.Separator();
+
+        if (all.Count == 0)
+        {
+            ImGui.TextDisabled("Nothing discovered yet — fly to a star and drop into its system.");
+            ImGui.End();
+            return;
+        }
+
+        string me = _discoveryConfig.PlayerName.Trim();
+        const ImGuiTableFlags flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY
+            | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.Resizable;
+        if (ImGui.BeginTable("discoveries", 4, flags))
+        {
+            ImGui.TableSetupColumn("Object", ImGuiTableColumnFlags.WidthStretch, 0.36f);
+            ImGui.TableSetupColumn("Designation", ImGuiTableColumnFlags.WidthStretch, 0.30f);
+            ImGui.TableSetupColumn("Discoverer", ImGuiTableColumnFlags.WidthStretch, 0.20f);
+            ImGui.TableSetupColumn("UTC", ImGuiTableColumnFlags.WidthStretch, 0.14f);
+            ImGui.TableSetupScrollFreeze(0, 1);
+            ImGui.TableHeadersRow();
+
+            foreach (DiscoveryRecord r in all)
+            {
+                bool mine = me.Length > 0 && r.Discoverer == me;
+                if (_libraryMineOnly && !mine) continue;
+
+                // A colored kind tag (the ImGui font is ASCII, so a letter rather than a glyph).
+                (string tag, System.Numerics.Vector4 col) = r.Kind switch
+                {
+                    "star"   => ("S", new System.Numerics.Vector4(1f, 0.85f, 0.42f, 1f)),
+                    "planet" => ("P", new System.Numerics.Vector4(0.42f, 0.72f, 1f, 1f)),
+                    "moon"   => ("m", new System.Numerics.Vector4(0.81f, 0.84f, 0.90f, 1f)),
+                    _        => ("?", new System.Numerics.Vector4(0.6f, 0.6f, 0.6f, 1f)),
+                };
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                ImGui.TextColored(col, tag);
+                ImGui.SameLine();
+                ImGui.TextUnformatted(r.ObjectId);
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(string.IsNullOrEmpty(r.Designation) ? "—" : r.Designation);
+                ImGui.TableNextColumn();
+                if (mine) ImGui.TextColored(new System.Numerics.Vector4(0.5f, 1f, 0.6f, 1f), r.Discoverer);
+                else ImGui.TextUnformatted(r.Discoverer);
+                ImGui.TableNextColumn();
+                ImGui.TextDisabled(r.DiscoveredAtUtc.ToString("yyyy-MM-dd"));
+            }
+            ImGui.EndTable();
+        }
+        ImGui.End();
+    }
+
     private static void DrawScanner()
     {
         if (!_scannerOpen) return;
@@ -1452,6 +1548,14 @@ internal static class Program
         }
 
         ImGui.Text($"Nearest: {target.Designation}");
+        // Scanning a body in range discovers it — the act of reading it out here IS the scan. Idempotent
+        // (no-op once known), and ReportBody self-gates on discovery being enabled + a player name set.
+        _discovery.ReportBody(_systemManager.Active!, target, new Dictionary<string, object?>
+        {
+            ["type"] = target.Type.ToString(),
+            ["hasAtmosphere"] = target.HasAtmosphere,
+            ["tempK"] = (int)target.SurfaceTempK,
+        });
         bool bodyFound = _discovery.TryGetBody(_systemManager.Active!, target, out DiscoveryRecord bodyRec);
         DiscoveryLine(bodyFound, bodyFound ? bodyRec : null);
         ImGui.Separator();
