@@ -43,7 +43,7 @@ public sealed class StarOverlay
         _discovery != null && _discovery.TryGetBody(sys, b, out DiscoveryRecord r) ? $"  by {r.Discoverer}" : "";
 
     public void Draw(Camera camera, StarCatalogPager field, SolarSystemManager manager,
-        DiscoveryService? discovery = null, Star? searchTarget = null)
+        DiscoveryService? discovery = null, Star? searchTarget = null, bool atSurface = false)
     {
         _discovery = discovery;
         var io = ImGui.GetIO();
@@ -51,7 +51,14 @@ public sealed class StarOverlay
         if (vp.X < 2 || vp.Y < 2) return;
 
         var dl = ImGui.GetForegroundDrawList();
-        DrawCenterReticle(dl, vp);
+        DrawCenterReticle(dl, vp); // the aiming crosshair stays — it's a screen aid, not an object marker
+
+        // Once you've descended to a world (within its atmosphere / near-surface shell), every reticle for
+        // something *outside* that planet is just clutter pointing through the ground: the other planets,
+        // moons, the sun, nearby stars, and the searched-for star. Suppress them all here. (Future:
+        // surface-based reticles — pickups, mineable deposits — would be drawn in this branch instead.)
+        if (atSurface) return;
+
         Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
         var invOrientation = Quaternion<float>.Inverse(camera.Orientation);
         UniversePosition cam = camera.Position;

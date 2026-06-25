@@ -33,6 +33,9 @@ public sealed class FreeFlyController
     public float Sensitivity = 0.0025f;
     public float RollSpeed = 1.5f; // radians/sec
     public bool MouseLookEnabled = true;
+    /// <summary>When false (cursor freed for a panel/map), the wheel no longer changes flight speed, so
+    /// scrolling a window doesn't also accelerate the ship. Set alongside <see cref="MouseLookEnabled"/>.</summary>
+    public bool WheelSpeedEnabled = true;
 
     private const float MinSpeedExp = 0f;   // 1 m/s
     // Top speed reaches intergalactic scale: galaxies are millions of ly apart (true scale), so ~100 ly/s
@@ -94,7 +97,10 @@ public sealed class FreeFlyController
     }
 
     private void OnScroll(IMouse mouse, ScrollWheel wheel)
-        => SpeedExponent = Math.Clamp(SpeedExponent + wheel.Y * 0.25f, MinSpeedExp, MaxSpeedExp);
+    {
+        if (!WheelSpeedEnabled) return; // cursor is free — let the wheel scroll panels, not change speed
+        SpeedExponent = Math.Clamp(SpeedExponent + wheel.Y * 0.25f, MinSpeedExp, MaxSpeedExp);
+    }
 
     private void OnMouseMove(IMouse mouse, System.Numerics.Vector2 position)
     {

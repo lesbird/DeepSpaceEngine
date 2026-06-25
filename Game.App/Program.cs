@@ -126,12 +126,19 @@ internal static class Program
     private static float _mapRangeLy = 10f;              // 3D map shows stars within this radius of the focus (slider)
     private static bool _prevU;                          // 'U' toggles the universe map
     private static bool _universeMapVisible;             // 2D top-down universe map (galaxies) overlay
+    private static bool _prevMapCursorFree;              // last frame's "a map is open" state — frees/locks the cursor on the edge
     private static double _universeMpp = 0.2e6 * MathUtil.LightYear; // universe-map scale (m/px) ≈ 0.2 Mly/px
     private static Vector3D<double> _universePan;        // map-centre offset from the camera (m, XZ plane)
     private static Galaxy _universeSel;                  // selected galaxy (valid when _universeHasSel)
     private static bool _universeHasSel;
     private static float _universeDragPx;                // drag accumulated this press (click vs pan)
     private static readonly List<(System.Numerics.Vector2 pos, float r, uint col, Galaxy g)> _universeDots = new();
+    private static string _universeSearch = "";          // universe-map: filter resident galaxies by name
+    private static readonly List<(Galaxy g, double distM)> _galaxySearchHits = new(); // name-search results (rebuilt per frame)
+    // Galaxies you've warped to (auto-recorded by GoToGalaxy), so you can jump back to any of them — even
+    // the Milky Way — from anywhere. Only the id is needed to fly there (Galaxy.Center is deterministic);
+    // name/type are cached for display. Dedup by id; most-recent first.
+    private static readonly List<(ulong id, string name, GalaxyType type)> _galaxyBookmarks = new();
     private static bool _mapPressed;                     // a left-press is in progress on the map background
     private static float _mapDragPx;                     // accumulated drag this press (distinguishes click from orbit)
     private static bool _mapClick;                       // a click (not a drag) was released this frame
@@ -432,21 +439,39 @@ internal static class Program
             UpdateInputModes();
         }
 
-        if (_window.Keyboard.IsKeyPressed(Key.Escape))
+        if (_window.Keyboard.IsKeyPressed(Key.Escape) && !ImGui.GetIO().WantCaptureKeyboard)
             _window.Window.Close();
 
         // 'P' toggles the galactic-plane grid: a faint reference plane through the galaxy centre.
         if (Edge(Key.P, ref _prevP)) _galacticGridVisible = !_galacticGridVisible;
         if (Edge(Key.M, ref _prevM)) { _systemMapVisible = !_systemMapVisible; Blip(); }
-        // 'N' opens the 2D galaxy map; if the 3D map is already up, 'N' closes it instead.
+        // 'N' opens the 2D galaxy map; if the 3D map is already up, 'N' closes it instead. The universe
+        // map and the galaxy map are mutually exclusive — opening one closes the other.
         if (Edge(Key.N, ref _prevN))
         {
             if (_galaxy3DVisible) _galaxy3DVisible = false;
             else _galaxyMapVisible = !_galaxyMapVisible;
+            if (_galaxyMapVisible) _universeMapVisible = false;
             Blip();
         }
         // 'U' opens the universe map — the galaxies of the cosmic lattice, fly between them.
-        if (Edge(Key.U, ref _prevU)) { _universeMapVisible = !_universeMapVisible; Blip(); }
+        if (Edge(Key.U, ref _prevU))
+        {
+            _universeMapVisible = !_universeMapVisible;
+            if (_universeMapVisible) _galaxyMapVisible = false;
+            Blip();
+        }
+
+        // The galaxy/universe maps and the discovery library need the cursor to click/scroll — free it
+        // while any is open and re-lock once they all close. Edge-triggered so it also catches a window's
+        // close (X) button and the 3D view's Close, while a manual Tab toggle still works for as long as a
+        // panel stays open.
+        bool mapCursorFree = _galaxyMapVisible || _universeMapVisible || _galaxy3DVisible || _libraryOpen;
+        if (mapCursorFree != _prevMapCursorFree)
+        {
+            SetMouseCaptured(!mapCursorFree);
+            _prevMapCursorFree = mapCursorFree;
+        }
 
         // 'H' hides/shows the whole HUD (reticles + all panels) for a clean view / screenshots.
         if (Edge(Key.H, ref _prevH)) _hudVisible = !_hudVisible;
@@ -751,15 +776,23 @@ internal static class Program
         // renders (an empty frame) so its begin/end frame stays balanced.
         if (_hudVisible)
         {
-            _overlay.Draw(_camera, _starPager, _systemManager, _discovery, _hasSearchTarget ? _searchTarget : null);
-            _overlay.DrawGlobularReticles(_camera, _globularRenderer.Marks);
-            // A reticle on the galaxy core (its supermassive black hole) so you can fly to it.
-            if (_galaxyPager.IsInside)
-                _overlay.DrawGalaxyCenterReticle(_camera, _galaxyPager.Containing.Center);
-            // In intergalactic space, show data for the galaxy the centre reticle is lined up with.
-            else if (_galaxyPager.TryGetAimedGalaxy(_camera.Position, _camera.Forward, out Galaxy aimed, out double aimedDist))
-                _overlay.DrawAimedGalaxyReticle(_camera, aimed, aimedDist);
-            DrawCourse(); // a set course's marker, advancing galaxy → star → planet
+            // Once you've descended into a world's atmosphere / near-surface shell, every reticle for
+            // something outside that planet (other planets/moons, the sun, stars, clusters, galaxies, the
+            // set course) is clutter pointing through the ground — hide them all. Only the aiming crosshair
+            // and (future) surface-based reticles remain. Climbing back out past the shell restores them.
+            bool nearSurface = InNearSurfaceEnvironment();
+            _overlay.Draw(_camera, _starPager, _systemManager, _discovery, _hasSearchTarget ? _searchTarget : null, nearSurface);
+            if (!nearSurface)
+            {
+                _overlay.DrawGlobularReticles(_camera, _globularRenderer.Marks);
+                // A reticle on the galaxy core (its supermassive black hole) so you can fly to it.
+                if (_galaxyPager.IsInside)
+                    _overlay.DrawGalaxyCenterReticle(_camera, _galaxyPager.Containing.Center);
+                // In intergalactic space, show data for the galaxy the centre reticle is lined up with.
+                else if (_galaxyPager.TryGetAimedGalaxy(_camera.Position, _camera.Forward, out Galaxy aimed, out double aimedDist))
+                    _overlay.DrawAimedGalaxyReticle(_camera, aimed, aimedDist);
+                DrawCourse(); // a set course's marker, advancing galaxy → star → planet
+            }
             DrawSpeedOverlay();
             DrawHud();
             DrawTuning();
@@ -1076,6 +1109,27 @@ internal static class Program
         double dist = g.RadiusMeters * 4.0; // ~4 radii: full impostor/cloud, framed
         _camera.Position = g.Center.Translated(new Vector3D<double>(-fwd.X * dist, -fwd.Y * dist, -fwd.Z * dist));
         _jumpStatus = $"Arrived at {g.Name} ({g.Type})";
+        BookmarkGalaxy(g);
+    }
+
+    /// <summary>The Milky Way's fixed global id — block (0,0,0) local 0 (see <see cref="GalaxyId"/>).</summary>
+    private static ulong HomeGalaxyId => GalaxyId.Pack(default, 0);
+
+    /// <summary>Resolve a galaxy by its global id (generating its lattice block on demand if it isn't
+    /// resident) and warp there. The handle bookmarks store, so you can return to any visited galaxy —
+    /// including the Milky Way — from anywhere in the universe.</summary>
+    private static void GoToGalaxyId(ulong id)
+    {
+        if (_galaxyPager.TryGetGalaxy(id, out Galaxy g)) GoToGalaxy(g);
+        else _jumpStatus = "Galaxy no longer exists";
+    }
+
+    /// <summary>Record a visited galaxy so it can be jumped back to later (dedup by id, most-recent first).</summary>
+    private static void BookmarkGalaxy(in Galaxy g)
+    {
+        for (int i = 0; i < _galaxyBookmarks.Count; i++)
+            if (_galaxyBookmarks[i].id == g.Id) { _galaxyBookmarks.RemoveAt(i); break; }
+        _galaxyBookmarks.Insert(0, (g.Id, g.Name, g.Type));
     }
 
     private static void DrawTuning()
@@ -2301,7 +2355,7 @@ internal static class Program
         var io = ImGui.GetIO();
         System.Numerics.Vector2 canvasPos = ImGui.GetCursorScreenPos();
         System.Numerics.Vector2 avail = ImGui.GetContentRegionAvail();
-        float ch = MathF.Max(120f, avail.Y - 116f); // reserve the bottom for footer + info
+        float ch = MathF.Max(120f, avail.Y - 250f); // reserve the bottom for footer + search/bookmarks + info
         var size = new System.Numerics.Vector2(avail.X, ch);
         ImGui.InvisibleButton("##universecanvas", size);
         bool hovered = ImGui.IsItemHovered();
@@ -2385,6 +2439,86 @@ internal static class Program
         if (ImGui.Button("Center on me")) _universePan = default;
         ImGui.SameLine();
         if (ImGui.Button("Reset zoom")) _universeMpp = 0.2e6 * Ly;
+        ImGui.SameLine();
+        if (ImGui.Button("Milky Way (Home)")) { Blip(); GoToGalaxyId(HomeGalaxyId); _universePan = default; }
+
+        ImGui.Separator();
+
+        // Search resident galaxies by name (names aren't unique, so this finds the matching galaxies
+        // currently streamed in around you); click a hit to select + warp. To return to a far-off galaxy
+        // you've already visited, use Bookmarks below (those resolve by id from anywhere).
+        ImGui.SetNextItemWidth(200f);
+        ImGui.InputText("##galaxysearch", ref _universeSearch, 64);
+        ImGui.SameLine();
+        ImGui.TextDisabled("search nearby galaxies by name");
+        string sq = _universeSearch.Trim();
+        if (sq.Length > 0)
+        {
+            _galaxySearchHits.Clear();
+            foreach (GalaxyCatalog block in _galaxyPager.LoadedBlocks)
+                foreach (Galaxy g in block.Galaxies)
+                    if (g.Name.Contains(sq, StringComparison.OrdinalIgnoreCase))
+                        _galaxySearchHits.Add((g, g.Center.DistanceTo(_camera.Position)));
+            _galaxySearchHits.Sort((a, b) => a.distM.CompareTo(b.distM));
+
+            const ImGuiTableFlags hflags = ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY;
+            if (_galaxySearchHits.Count == 0)
+                ImGui.TextDisabled("no resident galaxy matches — pan the map or pick a bookmark");
+            else if (ImGui.BeginTable("galaxyhits", 2, hflags, new System.Numerics.Vector2(0f, 72f)))
+            {
+                ImGui.TableSetupColumn("##go", ImGuiTableColumnFlags.WidthFixed, 56f);
+                ImGui.TableSetupColumn("Galaxy", ImGuiTableColumnFlags.WidthStretch);
+                int shown = 0;
+                foreach (var (g, distM) in _galaxySearchHits)
+                {
+                    if (shown++ >= 50) break;
+                    ImGui.TableNextRow();
+                    ImGui.TableNextColumn();
+                    if (ImGui.SmallButton($"Go##hit{g.Id}")) { Blip(); _universeSel = g; _universeHasSel = true; GoToGalaxy(g); }
+                    ImGui.TableNextColumn();
+                    double mly = distM / Ly / 1.0e6;
+                    ImGui.TextUnformatted($"{g.Name}  •  {g.Type}  •  {mly:0.00} Mly");
+                }
+                ImGui.EndTable();
+                if (_galaxySearchHits.Count > 50)
+                    ImGui.TextDisabled($"… and {_galaxySearchHits.Count - 50} more — narrow the search");
+            }
+        }
+
+        ImGui.Separator();
+
+        // Bookmarks: every galaxy you've warped to, jump-back-able from anywhere.
+        if (ImGui.CollapsingHeader($"Bookmarks ({_galaxyBookmarks.Count})###galaxybookmarks"))
+        {
+            if (_galaxyBookmarks.Count == 0)
+                ImGui.TextDisabled("none yet — jump to a galaxy and it's saved here");
+            else
+            {
+                const ImGuiTableFlags bflags = ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY;
+                if (ImGui.BeginTable("galaxybookmarks", 3, bflags, new System.Numerics.Vector2(0f, 96f)))
+                {
+                    ImGui.TableSetupColumn("##go", ImGuiTableColumnFlags.WidthFixed, 56f);
+                    ImGui.TableSetupColumn("##rm", ImGuiTableColumnFlags.WidthFixed, 28f);
+                    ImGui.TableSetupColumn("Galaxy", ImGuiTableColumnFlags.WidthStretch);
+                    int remove = -1;
+                    for (int i = 0; i < _galaxyBookmarks.Count; i++)
+                    {
+                        (ulong id, string name, GalaxyType type) = _galaxyBookmarks[i];
+                        ImGui.TableNextRow();
+                        ImGui.TableNextColumn();
+                        bool here = id == inside;
+                        if (here) ImGui.TextColored(new System.Numerics.Vector4(0.45f, 1f, 0.7f, 1f), "here");
+                        else if (ImGui.SmallButton($"Go##bm{id}")) { Blip(); GoToGalaxyId(id); }
+                        ImGui.TableNextColumn();
+                        if (ImGui.SmallButton($"x##bm{id}")) remove = i;
+                        ImGui.TableNextColumn();
+                        ImGui.TextUnformatted($"{name}  •  {type}");
+                    }
+                    if (remove >= 0) _galaxyBookmarks.RemoveAt(remove);
+                    ImGui.EndTable();
+                }
+            }
+        }
 
         ImGui.Separator();
         if (_universeHasSel)
@@ -2731,6 +2865,19 @@ internal static class Program
         return best;
     }
 
+    /// <summary>True when the camera sits within the nearest surfaced body's near-surface environment —
+    /// its atmosphere, or a notional shell for airless worlds (the same threshold discovery uses, see
+    /// <see cref="ReportDiscoveries"/>). Used to drop distant-navigation reticles (nearest-planet, galaxy
+    /// core) that are just clutter once you've arrived at a world.</summary>
+    private static bool InNearSurfaceEnvironment()
+    {
+        CelestialBody? b = NearestSurfacedBody();
+        if (b == null) return false;
+        double alt = b.CurrentPosition.DistanceTo(_camera.Position) - b.RadiusMeters;
+        double shell = b.RadiusMeters * (b.HasAtmosphere ? b.AtmosphereHeight : AirlessEnvShell);
+        return alt < shell;
+    }
+
     /// <summary>
     /// Recompute the free-fly proximity speed limit for this frame. The cap is the minimum over the
     /// nearest star and every body in the active system; far from all of them it stays infinite
@@ -2819,7 +2966,10 @@ internal static class Program
         bool now = _window.Keyboard.IsKeyPressed(key);
         bool edge = now && !prev;
         prev = now;
-        return edge;
+        // While ImGui owns the keyboard (e.g. typing in a search box), swallow game hotkeys so letters like
+        // 'M' don't toggle maps. We still update prev above, so releasing the key won't read as a fresh edge
+        // once the text field loses focus.
+        return edge && !ImGui.GetIO().WantCaptureKeyboard;
     }
 
     private static void SetMouseCaptured(bool captured)
@@ -2833,6 +2983,7 @@ internal static class Program
     private static void UpdateInputModes()
     {
         _controller.MouseLookEnabled = _mouseCaptured && !_driving;
+        _controller.WheelSpeedEnabled = _mouseCaptured; // freed cursor → wheel scrolls panels, not speed
         _rover.Active = _driving && _mouseCaptured;
     }
 }
