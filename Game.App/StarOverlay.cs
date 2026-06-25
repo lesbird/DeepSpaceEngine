@@ -396,6 +396,44 @@ public sealed class StarOverlay
         return $"{n:0}";
     }
 
+    /// <summary>A persistent course marker to the current leg of a set course (galaxy → star → planet):
+    /// corner brackets + a ring when the target is on screen, an edge arrow pointing the way when it's
+    /// off. Projected by <i>direction</i> so it works at any distance (galaxy/star legs sit far past the
+    /// far plane). Cyan — distinct from the nav green and the core magenta.</summary>
+    public void DrawCourseMarker(Camera camera, in UniversePosition target, string label)
+    {
+        Vector2 vp = ImGui.GetIO().DisplaySize;
+        if (vp.X < 2 || vp.Y < 2) return;
+
+        Vector3D<double> rel = target.DeltaMeters(camera.Position);
+        double dist = rel.Length;
+        if (dist < 1.0) return;
+        var dir = new Vector3D<float>((float)(rel.X / dist), (float)(rel.Y / dist), (float)(rel.Z / dist));
+
+        var dl = ImGui.GetForegroundDrawList();
+        Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
+        uint col = Col(80, 220, 255, 240); // bright cyan
+
+        if (Project(dir * 1.0e10f, m, vp, out Vector2 s) && OnScreen(s, vp))
+        {
+            DrawBrackets(dl, s, 15f, col);
+            dl.AddCircle(s, 20f, col, 28, 1.5f);
+            dl.AddText(s + new Vector2(24f, -8f), col, label);
+            return;
+        }
+
+        var invOrientation = Quaternion<float>.Inverse(camera.Orientation);
+        Vector3D<float> viewDir = Vector3D.Transform(dir, invOrientation);
+        Vector2 ad = new(viewDir.X, -viewDir.Y);
+        if (ad.LengthSquared() < 1e-6f) ad = new Vector2(0, 1);
+        ad = Vector2.Normalize(ad);
+
+        Vector2 pos = ClampToEdge(vp * 0.5f, ad, vp, margin: 80f);
+        DrawArrow(dl, pos, ad, col);
+        Vector2 textPos = Vector2.Clamp(pos - ad * 30f - new Vector2(80, -10), new Vector2(8, 8), vp - new Vector2(300, 24));
+        dl.AddText(textPos, col, label);
+    }
+
     private static bool Project(Vector3D<float> p, in Matrix4X4<float> m, Vector2 vp, out Vector2 screen)
     {
         // Matches the GPU path: clip = (p,1) * (view*proj) in Silk's row-vector convention.

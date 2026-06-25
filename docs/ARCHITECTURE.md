@@ -330,8 +330,10 @@ and the galaxy the camera `IsInside`/`Containing`.
 belongs to (the gate that confines stars to galaxies).
 `bool TryGetAimedGalaxy(in camera, forward, out Galaxy, out distance, tolerance)` — the galaxy under the
 centre reticle (smallest angular offset within the galaxy's own apparent radius + a small cone), for the
-intergalactic HUD readout. Exposes `LoadedBlocks`, `LoadedGalaxyCount`. The resident radius is kept
-larger than `GalaxyRenderer`'s far-fade so distant galaxies fade out before a block can pop in/out.
+intergalactic HUD readout. `bool TryGetGalaxy(ulong id, out Galaxy)` — resolve a galaxy by id (unpack +
+generate its block on demand), so a course can target any galaxy's fixed centre from anywhere. Exposes
+`LoadedBlocks`, `LoadedGalaxyCount`. The resident radius is kept larger than `GalaxyRenderer`'s far-fade
+so distant galaxies fade out before a block can pop in/out.
 
 **GalaxyId** (static) — invertible `(block, local) ↔ ulong`, like `StarId` (16 local + 3×16 axis bits).
 
@@ -369,7 +371,11 @@ stars** where a halo cluster overlaps the block (`CollectClusterStars`, shared p
 `StarCatalogPager(GalaxyCatalogPager)`; `void Update(in camera, double trackRadiusMeters)`
 resolves each block's galaxy (on the main thread, captured into the off-thread gen), loads blocks
 within 1 Chebyshev block and evicts beyond 2; blocks with no galaxy are empty. Rebuilds `Visible` +
-`Nearest`. `bool TryGetStar(ulong id, out Star)` loads any star's block on demand (find-by-number).
+`Nearest`. `bool TryGetStar(ulong id, out Star)` loads any star's block on demand (find-by-number;
+valid for the local lattice). `bool TryGetStarInGalaxy(ulong id, in Galaxy, out Star)` resolves a star
+*within a given galaxy* — `StarId`'s block field wraps every ~2.9 Mly so a bare id repeats per galaxy;
+the galaxy pins which wrap, reconstructing the actual block (congruent to the id's, nearest the galaxy
+centre) and regenerating it deterministically — used to mark a course star across a galaxy.
 `StarCatalog EnsureLoaded(Vector3D<long>)`. Exposes `Visible`, `LoadedBlocks`, `LoadedBlockCount`,
 `LoadedStarCount`, `HasNearest`, `Nearest`, `NearestDistanceMeters`.
 
@@ -695,7 +701,12 @@ status line, a **travel-to-galaxy** list, find-star box, drawn-vs-resident star 
 sfx volume, music on/off, Test-SFX — see §6), `DrawScanner` (body / star / sector readout, F, which now
 **appends a host-galaxy section** — name, type, radius, star count, core distance — whenever inside a
 galaxy), `DrawDiscoveryLibrary` (**L** — a sortable table of every known discovery from
-`DiscoveryService.Snapshot()`, with a *Mine only* filter and per-kind counts), `DrawSystemMap`
+`DiscoveryService.Snapshot()`, with a *Mine only* filter, per-kind counts, and a **Set course** button
+per row that drives the **course marker** (`StarOverlay.DrawCourseMarker`, cyan), a single
+direction-projected bracket/edge-arrow that advances **galaxy → star → planet/moon** as you arrive —
+`Program.DrawCourse` resolves each leg in turn: the galaxy centre immediately, the star via
+`StarCatalogPager.TryGetStarInGalaxy` once you're inside the galaxy, the planet/moon from the active
+system), `DrawSystemMap`
 (top-down system, M, with nebula disks and click-to-travel),
 `DrawGalaxyMap`/3D neighbourhood (N), and `DrawUniverseMap` (top-down chart of the **galaxies**, U,
 click-to-jump via `GoToGalaxy`).

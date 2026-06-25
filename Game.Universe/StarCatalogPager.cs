@@ -151,6 +151,36 @@ public sealed class StarCatalogPager : INearestStar
         return cat.TryGetLocal(local, out star);
     }
 
+    /// <summary>
+    /// Resolve a star by its id <i>within a known galaxy</i> — the only way that works across the
+    /// universe, because <see cref="StarId"/>'s block field wraps every 2^AxisBits blocks (~2.9 Mly), so
+    /// the same id repeats in every galaxy. The galaxy pins which wrap: we reconstruct the star's actual
+    /// block as the one congruent to the id's wrapped block but nearest the galaxy centre, then regenerate
+    /// it from that galaxy (deterministic, so the local index lands on the same star). The star's
+    /// <see cref="Star.Position"/> is exact — used to mark a course target across a galaxy before it's
+    /// streamed in.
+    /// </summary>
+    public bool TryGetStarInGalaxy(ulong id, in Galaxy galaxy, out Star star)
+    {
+        StarId.Unpack(id, out Vector3D<long> wrapped, out int local);
+        Vector3D<long> gc = BlockCoordOf(galaxy.Center);
+        long period = 1L << StarId.AxisBits;
+        var block = new Vector3D<long>(
+            Relocate(wrapped.X, gc.X, period),
+            Relocate(wrapped.Y, gc.Y, period),
+            Relocate(wrapped.Z, gc.Z, period));
+        return new StarCatalog(galaxy, block).TryGetLocal(local, out star);
+    }
+
+    /// <summary>The value congruent to <paramref name="unpacked"/> mod <paramref name="period"/> that's
+    /// nearest <paramref name="reference"/> — relocates a wrapped block coord to the galaxy's region.</summary>
+    private static long Relocate(long unpacked, long reference, long period)
+    {
+        long d = ((unpacked - reference) % period + period) % period; // [0, period)
+        if (d >= period / 2) d -= period;                              // [-period/2, period/2)
+        return reference + d;
+    }
+
     /// <summary>Get the block at <paramref name="coord"/>, generating it synchronously if not resident.</summary>
     public StarCatalog EnsureLoaded(Vector3D<long> coord)
     {

@@ -141,6 +141,16 @@ internal static class Program
     private static bool _libraryOpen;                    // 'L' toggles the discovery library
     private static bool _prevL;
     private static bool _libraryMineOnly;                // library filter: only my finds
+
+    // A hierarchical course set from the discovery library: marker advances galaxy → star → planet/moon.
+    private static bool _hasCourse;
+    private static ulong _courseGalaxyId, _courseStarId;
+    private static int _coursePlanet = -1, _courseMoon = -1;
+    private static string _courseLabel = "";
+    private static string _courseObjectId = "";
+    private static UniversePosition _courseGalaxyCenter;
+    private static UniversePosition _courseStarPos;
+    private static bool _courseStarResolved;
     private static string _starSearch = "";
     private static Star _searchTarget;
     private static bool _hasSearchTarget;
@@ -749,6 +759,7 @@ internal static class Program
             // In intergalactic space, show data for the galaxy the centre reticle is lined up with.
             else if (_galaxyPager.TryGetAimedGalaxy(_camera.Position, _camera.Forward, out Galaxy aimed, out double aimedDist))
                 _overlay.DrawAimedGalaxyReticle(_camera, aimed, aimedDist);
+            DrawCourse(); // a set course's marker, advancing galaxy → star → planet
             DrawSpeedOverlay();
             DrawHud();
             DrawTuning();
@@ -1434,6 +1445,82 @@ internal static class Program
             ImGui.TextDisabled("Undiscovered");
     }
 
+    /// <summary>Set a course to a discovered object, parsing its '{galaxyId}-{starId}[-PP[-MM]]' id. The
+    /// galaxy centre resolves immediately (deterministic); the star resolves once you're in the galaxy,
+    /// the planet/moon once its system is active — so the marker naturally advances as you arrive.</summary>
+    private static void SetCourse(DiscoveryRecord r)
+    {
+        string[] seg = r.ObjectId.Split('-');
+        if (seg.Length < 2 || !ulong.TryParse(seg[0], out ulong gid) || !ulong.TryParse(seg[1], out ulong sid))
+            return;
+        if (!_galaxyPager.TryGetGalaxy(gid, out Galaxy g)) return; // can't locate the galaxy → no course
+
+        _courseGalaxyId = gid;
+        _courseStarId = sid;
+        _coursePlanet = seg.Length >= 3 && int.TryParse(seg[2], out int pp) ? pp : -1;
+        _courseMoon   = seg.Length >= 4 && int.TryParse(seg[3], out int mm) ? mm : -1;
+        _courseLabel = string.IsNullOrEmpty(r.Designation) ? r.ObjectId : r.Designation;
+        _courseObjectId = r.ObjectId;
+        _courseGalaxyCenter = g.Center;
+        _courseStarResolved = false;
+        _hasCourse = true;
+        Blip();
+    }
+
+    /// <summary>Draw the course marker for the current leg: the destination galaxy until you're inside it,
+    /// then its star until you're in the system, then the planet/moon (or the star itself).</summary>
+    private static void DrawCourse()
+    {
+        if (!_hasCourse) return;
+        double ly = MathUtil.LightYear;
+
+        // Leg 1 — fly to the galaxy.
+        if (!(_galaxyPager.IsInside && _galaxyPager.Containing.Id == _courseGalaxyId))
+        {
+            double mly = _courseGalaxyCenter.DistanceTo(_camera.Position) / ly / 1.0e6;
+            string d = mly >= 1.0 ? $"{mly:0.00} Mly" : $"{mly * 1000.0:0} kly";
+            _overlay.DrawCourseMarker(_camera, _courseGalaxyCenter, $"COURSE  {_courseLabel}  ->  galaxy  {d}");
+            return;
+        }
+
+        // Inside the galaxy now — resolve the star within it (a bare star id wraps, so it must be pinned
+        // to this galaxy). Position is exact and fixed, so resolve once and cache.
+        if (!_courseStarResolved &&
+            _starPager.TryGetStarInGalaxy(_courseStarId, _galaxyPager.Containing, out Star st))
+        {
+            _courseStarPos = st.Position;
+            _courseStarResolved = true;
+        }
+
+        // Leg 2 — fly to the star, until its system is the active one.
+        if (!(_systemManager.HasActive && _systemManager.Active!.Sun.Id == _courseStarId))
+        {
+            if (_courseStarResolved)
+            {
+                double sly = _courseStarPos.DistanceTo(_camera.Position) / ly;
+                _overlay.DrawCourseMarker(_camera, _courseStarPos, $"COURSE  {_courseLabel}  ->  star  {sly:0.000} ly");
+            }
+            return;
+        }
+
+        // Leg 3 — in the system: mark the planet (or its moon, or the star itself if no body was set).
+        SolarSystem sys = _systemManager.Active!;
+        UniversePosition pos;
+        string leg;
+        if (_coursePlanet >= 0 && _coursePlanet < sys.Planets.Length)
+        {
+            Planet p = sys.Planets[_coursePlanet];
+            if (_courseMoon >= 0 && _courseMoon < p.Moons.Length) { pos = p.Moons[_courseMoon].CurrentPosition; leg = "moon"; }
+            else { pos = p.CurrentPosition; leg = "planet"; }
+        }
+        else { pos = sys.Sun.Position; leg = "star"; }
+
+        double meters = pos.DistanceTo(_camera.Position);
+        double au = meters / MathUtil.AstronomicalUnit;
+        string dist = au >= 0.01 ? $"{au:0.00} AU" : $"{meters / 1000.0:0} km";
+        _overlay.DrawCourseMarker(_camera, pos, $"COURSE  {_courseLabel}  ->  {leg}  {dist}");
+    }
+
     /// <summary>The discovery library (toggled with L): the full list of known discoveries — the ones
     /// you've found plus everyone else's, synced from the server — sortable, filterable to your own.</summary>
     private static void DrawDiscoveryLibrary()
@@ -1470,6 +1557,14 @@ internal static class Program
         ImGui.Checkbox("Mine only", ref _libraryMineOnly);
         ImGui.Separator();
 
+        if (_hasCourse)
+        {
+            ImGui.TextColored(new System.Numerics.Vector4(0.3f, 0.85f, 1f, 1f), $"Course: {_courseLabel}");
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Clear course")) _hasCourse = false;
+            ImGui.Separator();
+        }
+
         if (all.Count == 0)
         {
             ImGui.TextDisabled("Nothing discovered yet — fly to a star and drop into its system.");
@@ -1480,8 +1575,9 @@ internal static class Program
         string me = _discoveryConfig.PlayerName.Trim();
         const ImGuiTableFlags flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY
             | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.Resizable;
-        if (ImGui.BeginTable("discoveries", 4, flags))
+        if (ImGui.BeginTable("discoveries", 5, flags))
         {
+            ImGui.TableSetupColumn("##go", ImGuiTableColumnFlags.WidthFixed, 52f);
             ImGui.TableSetupColumn("Object", ImGuiTableColumnFlags.WidthStretch, 0.36f);
             ImGui.TableSetupColumn("Designation", ImGuiTableColumnFlags.WidthStretch, 0.30f);
             ImGui.TableSetupColumn("Discoverer", ImGuiTableColumnFlags.WidthStretch, 0.20f);
@@ -1503,6 +1599,10 @@ internal static class Program
                     _        => ("?", new System.Numerics.Vector4(0.6f, 0.6f, 0.6f, 1f)),
                 };
                 ImGui.TableNextRow();
+                ImGui.TableNextColumn();
+                bool isCourse = _hasCourse && r.ObjectId == _courseObjectId;
+                if (isCourse) ImGui.TextColored(new System.Numerics.Vector4(0.3f, 0.85f, 1f, 1f), "[set]");
+                else if (ImGui.SmallButton($"Set##{r.ObjectId}")) SetCourse(r);
                 ImGui.TableNextColumn();
                 ImGui.TextColored(col, tag);
                 ImGui.SameLine();

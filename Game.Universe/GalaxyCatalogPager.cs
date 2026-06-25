@@ -83,6 +83,22 @@ public sealed class GalaxyCatalogPager : INearestGalaxy
     }
 
     /// <summary>
+    /// Resolve a galaxy by its global id (unpack block + local), generating its lattice block on demand
+    /// if not resident. A galaxy's <see cref="Galaxy.Center"/> is deterministic and fixed, so a course can
+    /// target it from anywhere — even before its block has streamed in. False only if the local index is
+    /// out of range for that block.
+    /// </summary>
+    public bool TryGetGalaxy(ulong id, out Galaxy galaxy)
+    {
+        GalaxyId.Unpack(id, out Vector3D<long> block, out int local);
+        if (!_loaded.TryGetValue(block, out GalaxyCatalog? cat))
+            cat = new GalaxyCatalog(_field, block); // transient; not added to the resident set
+        if (local >= 0 && local < cat.Count) { galaxy = cat.Galaxies[local]; return true; }
+        galaxy = default;
+        return false;
+    }
+
+    /// <summary>
     /// Find the resident galaxy the camera is <i>aiming at</i> — the one whose sprite sits under the
     /// centre-screen reticle. A galaxy qualifies when the angle between <paramref name="forward"/> and
     /// the direction to it is within the galaxy's own angular radius (so anywhere on a big near disk

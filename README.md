@@ -338,12 +338,18 @@ names, never geometry.
 
 - **What triggers a discovery** — entering a **star system** reports its sun; entering a body's
   **near-surface environment** reports that planet or moon (its atmosphere, or a notional shell for
-  airless worlds, so every world is discoverable). First finder wins; the server rejects duplicates.
+  airless worlds, so every world is discoverable); and **scanning** a body in range with `F` claims it
+  from scanner distance, no descent needed. First finder wins; the server rejects duplicates.
 - **On the HUD** — discovered objects show **who** found them and **when**: a `by {name}` tag on the
   star/planet/moon reticles, and a full `Discovered by {name} on {date}` line in the scanner and the
   system header.
-- **Identity** — `star = {id}` (the decimal id already on the HUD), `planet = {id}-{PP}`,
-  `moon = {id}-{PP}-{MM}` (zero-padded generation indices).
+- **Discovery library** (`L`) — a panel listing **every** known discovery (yours and everyone else's,
+  synced from the server), with per-kind counts and a *Mine only* filter. **Set course** on any row to
+  drop a cyan guidance marker that walks you in hierarchically: it points to the **galaxy** until you're
+  inside it, then to the **star** until you're in its system, then to the **planet/moon** itself.
+- **Identity** — `star = {galaxyId}-{starId}`, `planet = {galaxyId}-{starId}-{PP}`,
+  `moon = {galaxyId}-{starId}-{PP}-{MM}` (zero-padded generation indices). The galaxy id prefixes the
+  star id because a star id is only unique *within* its galaxy.
 - **Setup** — **off by default.** In the tuning HUD's **Discovery** panel, set your player name, the
   server URL and API key, and tick *Enable discovery reporting*. The client pulls the full discovery
   list at launch and reports as you fly; everything is async and degrades to offline if the server is
