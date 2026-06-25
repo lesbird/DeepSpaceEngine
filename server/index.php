@@ -9,7 +9,7 @@ declare(strict_types=1);
 require __DIR__ . '/db.php'; // for config()
 
 function h($s): string { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
-function fmt_dt($s): string { return gmdate('Y-m-d H:i', strtotime($s . ' UTC')) . ' UTC'; }
+function fmt_dt($s): string { return gmdate('Y-m-d H:i', strtotime($s . ' UTC')); } // header/footer note UTC
 
 /** A compact, human summary of the free-form meta JSON for the table. */
 function fmt_meta($json): string
@@ -23,6 +23,18 @@ function fmt_meta($json): string
     if (isset($m['tempK']))   $bits[] = (int)$m['tempK'] . ' K';
     if (array_key_exists('hasAtmosphere', $m)) $bits[] = $m['hasAtmosphere'] ? 'atmosphere' : 'airless';
     return implode(' · ', $bits);
+}
+
+/** Render a '{galaxyId}-{starId}[-PP[-MM]]' object id structured: dim galaxy, then star, then body
+ *  suffix — with <wbr> at the segment breaks so a long id wraps cleanly inside its cell. */
+function fmt_object(string $oid): string
+{
+    $seg = explode('-', $oid);
+    if (count($seg) < 2) return '<span class="gid">' . h($oid) . '</span>';
+    $out  = '<span class="gid">' . h($seg[0]) . '</span><wbr>';
+    $out .= '<span class="sid">-' . h($seg[1]) . '</span>';
+    if (count($seg) > 2) $out .= '<wbr><span class="bid">-' . h(implode('-', array_slice($seg, 2))) . '</span>';
+    return $out;
 }
 
 $KIND_BADGE = [
@@ -91,7 +103,7 @@ if (!is_file(__DIR__ . '/config.php')) {
          font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   a { color: #6bb8ff; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 18px 60px; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 28px 18px 60px; }
   h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: .04em; }
   h1 .sub { color: #7c89a6; font-size: 13px; font-weight: normal; }
   h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .1em; color: #8ea0c4;
@@ -99,16 +111,22 @@ if (!is_file(__DIR__ . '/config.php')) {
   .stats { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0 6px; color: #aab6d0; }
   .stats b { color: #e7edf7; }
   .cols { display: grid; grid-template-columns: 1fr; gap: 8px; }
-  @media (min-width: 820px) { .layout { display: grid; grid-template-columns: 1fr 280px; gap: 36px; align-items: start; } }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #131b2e; vertical-align: top; }
+  @media (min-width: 860px) { .layout { display: grid; grid-template-columns: 1fr 240px; gap: 32px; align-items: start; } }
+  /* Fixed layout + per-column widths so the long galaxy-star ids wrap inside their cell
+     instead of shoving the other columns around. */
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th, td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid #131b2e; vertical-align: top; }
   th { color: #7c89a6; font-weight: normal; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
   tr:hover td { background: #0b1020; }
-  .id { color: #9fb0d0; }
-  .who { color: #e7edf7; }
+  .id { overflow-wrap: anywhere; line-height: 1.35; }            /* break the 19-20 digit ids cleanly */
+  .gid { color: #5c6a88; }                                       /* galaxy prefix, dimmed */
+  .sid { color: #cdd6e6; }                                       /* star id */
+  .bid { color: #6bb8ff; }                                       /* planet / moon suffix */
+  .kind { color: #aab6d0; text-transform: capitalize; }
+  .who { color: #e7edf7; overflow-wrap: anywhere; }
   .when { color: #7c89a6; white-space: nowrap; }
   .meta { color: #6f7d9c; }
-  .badge { display: inline-block; min-width: 1.4em; text-align: center; margin-right: 6px; }
+  .badge { display: inline-block; min-width: 1.4em; text-align: center; margin-right: 6px; vertical-align: top; }
   .lead { width: 100%; border-collapse: collapse; }
   .lead td { border-bottom: 1px solid #131b2e; padding: 6px 8px; }
   .lead .n { text-align: right; color: #e7edf7; }
@@ -150,17 +168,21 @@ if (!is_file(__DIR__ . '/config.php')) {
       <p class="empty">Nothing discovered yet — go fly somewhere.</p>
 <?php else: ?>
       <table>
-        <tr><th>Object</th><th>Designation</th><th>Discoverer</th><th>When (UTC)</th></tr>
+        <colgroup>
+          <col style="width: 46%"><col style="width: 22%"><col style="width: 14%"><col style="width: 18%">
+        </colgroup>
+        <tr><th>Object</th><th>Details</th><th>Discoverer</th><th>When (UTC)</th></tr>
 <?php foreach ($rows as $r):
         [$glyph, $col] = $KIND_BADGE[$r['kind']] ?? ['?', '#888', ''];
+        $kindName = $KIND_BADGE[$r['kind']][2] ?? $r['kind'];
         $metaText = fmt_meta($r['meta'] ?? null); ?>
         <tr>
           <td>
             <span class="badge" style="color: <?= $col ?>" title="<?= h($r['kind']) ?>"><?= $glyph ?></span>
-            <span class="id"><?= h($r['object_id']) ?></span>
+            <span class="id"><?= fmt_object($r['object_id']) ?></span>
           </td>
           <td>
-            <?= h($r['designation']) ?>
+            <span class="kind"><?= h($kindName) ?></span>
             <?php if ($metaText !== ''): ?><div class="meta"><?= $metaText ?></div><?php endif; ?>
           </td>
           <td class="who"><a href="?discoverer=<?= h(rawurlencode($r['discoverer'])) ?>"><?= h($r['discoverer']) ?></a></td>
