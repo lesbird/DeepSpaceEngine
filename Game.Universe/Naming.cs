@@ -92,7 +92,7 @@ public static class Naming
     private static string Pick(string[] words, ulong h) => words[(int)(h % (ulong)words.Length)];
 
     /// <summary>Roman numeral for a small positive integer (the values used in star names, 1–39).</summary>
-    private static string Roman(int n)
+    public static string Roman(int n)
     {
         // Only the symbols needed for 1..39.
         string r = "";

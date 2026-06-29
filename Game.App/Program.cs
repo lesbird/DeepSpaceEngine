@@ -1513,7 +1513,7 @@ internal static class Program
         _courseStarId = sid;
         _coursePlanet = seg.Length >= 3 && int.TryParse(seg[2], out int pp) ? pp : -1;
         _courseMoon   = seg.Length >= 4 && int.TryParse(seg[3], out int mm) ? mm : -1;
-        _courseLabel = string.IsNullOrEmpty(r.Designation) ? r.ObjectId : r.Designation;
+        _courseLabel = string.IsNullOrEmpty(r.Name) ? r.ObjectId : r.Name;
         _courseObjectId = r.ObjectId;
         _courseGalaxyCenter = g.Center;
         _courseStarResolved = false;
@@ -1634,7 +1634,7 @@ internal static class Program
         {
             ImGui.TableSetupColumn("##go", ImGuiTableColumnFlags.WidthFixed, 52f);
             ImGui.TableSetupColumn("Object", ImGuiTableColumnFlags.WidthStretch, 0.40f);
-            ImGui.TableSetupColumn("Designation", ImGuiTableColumnFlags.WidthStretch, 0.34f);
+            ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch, 0.34f);
             ImGui.TableSetupColumn("Discoverer", ImGuiTableColumnFlags.WidthStretch, 0.13f);
             ImGui.TableSetupColumn("UTC", ImGuiTableColumnFlags.WidthFixed, 88f);
             ImGui.TableSetupScrollFreeze(0, 1);
@@ -1663,7 +1663,7 @@ internal static class Program
                 ImGui.SameLine();
                 ImGui.TextUnformatted(r.ObjectId);
                 ImGui.TableNextColumn();
-                ImGui.TextUnformatted(string.IsNullOrEmpty(r.Designation) ? "—" : r.Designation);
+                ImGui.TextUnformatted(string.IsNullOrEmpty(r.Name) ? "—" : r.Name);
                 ImGui.TableNextColumn();
                 if (mine) ImGui.TextColored(new System.Numerics.Vector4(0.5f, 1f, 0.6f, 1f), r.Discoverer);
                 else ImGui.TextUnformatted(r.Discoverer);
