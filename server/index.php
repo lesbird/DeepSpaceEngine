@@ -213,7 +213,7 @@ if (!is_file(__DIR__ . '/config.php')) {
 
 <?php endif; ?>
 
-  <footer>First finder wins · times in UTC · <a href="discoveries.php">JSON API</a></footer>
+  <footer>First finder wins · times in UTC · <a href="discoveries.php">JSON API</a> · <a href="https://github.com/lesbird/DeepSpaceEngine">GitHub</a></footer>
 </div>
 </body>
 </html>
