@@ -17,7 +17,11 @@ namespace Game.Universe;
 /// or cratered) so worlds differ from one another, and a low-frequency <b>regional ruggedness
 /// mask</b> modulates the mountains and detail so a <i>single</i> world has both flat plains and
 /// rugged highlands instead of uniform hills. Airless worlds also get a Worley-based <b>crater
-/// field</b> (bowl + raised rim); worlds with weather erode their craters away.
+/// field</b> (bowl + raised rim); worlds with weather erode their craters away. Two further
+/// type-signature layers: desert worlds with an atmosphere grow <b>aeolian dune seas</b> (warped
+/// transverse dunes with asymmetric slip faces, gathered into ergs on flat lowlands) and ice worlds
+/// carry <b>fracture lineae</b> (cross-cutting double-ridge crack systems, Europa-style), each with
+/// a matching albedo signature so they read from orbit as well as from the ground.
 ///
 /// Every term is a FIXED-parameter pure function of direction, so neighbouring LOD patches
 /// sampling a shared edge get identical heights — no vertical cracks (the renderer adds
@@ -71,6 +75,22 @@ public sealed class PlanetTerrain
     private readonly int _strataSteps;
     private readonly double _strataSharp;
 
+    // Aeolian dune seas (desert worlds WITH an atmosphere — dunes need wind): transverse dunes with a
+    // gentle windward slope and a steep slip face, bent organically by a low-frequency warp and gathered
+    // into patchy ergs on flat lowland regions. 0 weight on every other world class.
+    private readonly double _duneWeight;    // dune height as a fraction of the relief budget
+    private readonly double _duneFreq;      // stripe frequency (cells over the unit sphere) → dune wavelength
+    private readonly double _duneWarpFreq;  // low-frequency bend of the dune ridges
+    private readonly double _duneWarpAmp;   // bend strength in dune-wavelength units
+    private readonly double _ergFreq;       // dune-sea (erg) province frequency
+    private readonly Vector3D<double> _duneDir; // prevailing-wind axis (dunes run transverse to it)
+
+    // Ice fracture lineae (ice worlds): two cross-cutting systems of long ridge-pair-and-central-groove
+    // cracks (tidal flexing scars, Europa-style), each a thin fold of a low-frequency fBm so the lines
+    // are planet-scale arcs. 0 weight off ice worlds.
+    private readonly double _crackWeight;
+    private readonly double _crackFreq;
+
     // Three additive layers: broad continents, ridged mountains on the highlands, and
     // high-frequency detail roughness. Octave counts are clamped per-patch to the resolution
     // it can actually show (see OctavesFor), so strong fine detail appears close up without
@@ -104,6 +124,15 @@ public sealed class PlanetTerrain
     private const int CraterOctaves = 10;
     private const double CraterLacunarity = 1.9;
     private const double CraterDepthFalloff = 0.62; // per-octave weight: smaller craters are shallower
+    // Dune / lineae layer constants, shared verbatim by the GPU generator GLSL and the float mirror —
+    // keep all three in sync. Crest at 0.7 of the wavelength → a long windward slope, short slip face.
+    private const double DuneCrest = 0.7;
+    private const int DuneWarpOctaves = 3;
+    private const int CrackOctaves = 5;
+    private static readonly Vector3D<double> DuneWarpOff = new(12.9, 78.2, 44.6);
+    private static readonly Vector3D<double> ErgOff = new(91.7, 23.3, 55.1);
+    private static readonly Vector3D<double> CrackOffA = new(2.7, 33.1, 8.9);
+    private static readonly Vector3D<double> CrackOffB = new(19.3, 4.7, 27.7);
 
     // Analytic upper bound on |height|: the three layers are bounded by their weights, and the
     // mountain term is ≥ 0. Resolved per type so an enabled override wins over the global knobs.
@@ -112,7 +141,7 @@ public sealed class PlanetTerrain
         (ContinentWeight + _mountainWeight * PlanetTuning.EffectiveMountain(Type) + DetailWeight
          + MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale)
          + _craterWeight * PlanetTuning.EffectiveCraterScale(Type)
-         + _volcanoWeight + _strataWeight);
+         + _volcanoWeight + _strataWeight + _duneWeight + _crackWeight);
 
     public PlanetTerrain(CelestialBody body)
     {
@@ -195,6 +224,36 @@ public sealed class PlanetTerrain
         _strataFreq = _continentFreq * rng.Range(2.0, 4.0);
         _strataSteps = rng.RangeInt(5, 11);
         _strataSharp = rng.Range(2.0, 3.5);
+
+        // Aeolian dune seas — desert worlds with an atmosphere (dunes need wind). The stripe frequency
+        // comes from an absolute wavelength (a few hundred metres) so dunes read at human scale on any
+        // radius, capped so the GPU's float fract() of the stripe phase stays precise.
+        if (body.Type == PlanetType.Desert && body.HasAtmosphere)
+        {
+            _duneWeight = rng.Range(0.0012, 0.0028);
+            _duneFreq = Math.Min(2.0 * Math.PI * Radius / rng.Range(400.0, 900.0), 120_000.0);
+            _duneWarpFreq = rng.Range(15.0, 30.0);
+            _duneWarpAmp = rng.Range(2.0, 5.0);
+            _ergFreq = rng.Range(3.0, 6.0);
+            // Prevailing wind: a mostly-equatorial seeded axis (trade winds), so dune ridges run in
+            // coherent belts rather than random orientations per region.
+            double az = rng.Range(0.0, 2.0 * Math.PI), el = rng.Range(-0.35, 0.35);
+            _duneDir = new Vector3D<double>(Math.Cos(az) * Math.Cos(el), Math.Sin(el), Math.Sin(az) * Math.Cos(el));
+        }
+        else
+        {
+            _duneWeight = 0.0; _duneFreq = 60_000.0; _duneWarpFreq = 20.0;
+            _duneWarpAmp = 3.0; _ergFreq = 4.0; _duneDir = new Vector3D<double>(1.0, 0.0, 0.0);
+        }
+
+        // Ice fracture lineae — ice worlds (tidal flexing needs no atmosphere, so icy airless moons keep
+        // both their craters AND their cracks, Callisto-meets-Europa style).
+        if (body.Type == PlanetType.Ice)
+        {
+            _crackWeight = rng.Range(0.010, 0.020);
+            _crackFreq = rng.Range(4.0, 9.0);
+        }
+        else { _crackWeight = 0.0; _crackFreq = 6.0; }
     }
 
     /// <summary>Terrain height (metres, signed) at a unit direction — full detail (tests/colour).</summary>
@@ -318,14 +377,45 @@ public sealed class PlanetTerrain
             strata = Terrace(low, _strataSteps, _strataSharp);          // [-1,1]
         }
 
+        // Aeolian dunes: an LOD-gated stripe profile (the stripe itself is spacing-independent),
+        // gathered into ergs on flat lowlands. In [0,1] before the gate/masks.
+        double dune = 0.0;
+        if (_duneWeight > 0.0)
+        {
+            double duneGate = LayerGate(_duneFreq * fs, sampleSpacing);
+            if (duneGate > 0.0)
+            {
+                double lowland = 1.0 - Smoothstep(0.05, 0.45, continents); // sand pools in the basins
+                dune = DuneProfile(unitDir, fs) * ErgMask(unitDir, fs) * lowland * (1.0 - 0.75 * rugged) * duneGate;
+            }
+        }
+
+        // Ice fracture lineae: two cross-cutting ridge-pair/groove systems in [-1, 0.55] combined,
+        // band-limited like a normal layer and gated on the (thin) line width so far orbits — where
+        // the albedo tint carries the look — don't alias the geometry.
+        double cracks = 0.0;
+        if (_crackWeight > 0.0)
+        {
+            double crackGate = LayerGate(_crackFreq * 8.0 * fs, sampleSpacing);
+            if (crackGate > 0.0)
+            {
+                double crackOct = OctavesFor(_crackFreq * fs, sampleSpacing, CrackOctaves);
+                double nA = _noise.Fbm(unitDir + CrackOffA, crackOct, _crackFreq * fs, 2.0, 0.5);
+                double nB = _noise.Fbm(unitDir + CrackOffB, crackOct, _crackFreq * fs, 2.0, 0.5);
+                cracks = 0.5 * (CrackShape(nA) + CrackShape(nB)) * crackGate;
+            }
+        }
+
         // Each term is bounded by its weight (rugged/mask/gate ∈ [0,1], crater ∈ [-1, rim],
-        // strata ∈ [-1,1]), so |shape| ≤ sum of weights, matching Amplitude.
+        // strata ∈ [-1,1], dune ∈ [0,1], cracks ∈ [-1,1]), so |shape| ≤ sum of weights, matching Amplitude.
         double shape = ContinentWeight * continents
                      + mWeight * mountains * mask * rugged
                      + DetailWeight * detail * detailGate
                      + microW * micro
                      + craterW * crater
-                     + _strataWeight * strata;
+                     + _strataWeight * strata
+                     + _duneWeight * dune
+                     + _crackWeight * cracks;
         // The solid surface keeps its full relief even below the waterline — that *is* the sea
         // floor. A separate translucent water surface (PlanetTerrainRenderer) sits at SeaLevel,
         // and coastlines emerge naturally where the rugged land crosses it.
@@ -408,13 +498,45 @@ public sealed class PlanetTerrain
             strata = Terrace(low, _strataSteps, _strataSharp);
         }
 
+        // Aeolian dunes: the stripe profile and erg mask are spacing-independent (computed once);
+        // only the LOD gate and the lowland mask (via the band-limited continents) differ per cutoff.
+        double duneF = 0.0, duneC = 0.0;
+        if (_duneWeight > 0.0)
+        {
+            double dgF = LayerGate(_duneFreq * fs, fineSpacing), dgC = LayerGate(_duneFreq * fs, coarseSpacing);
+            if (dgF > 0.0 || dgC > 0.0)
+            {
+                double duneBase = DuneProfile(unitDir, fs) * ErgMask(unitDir, fs) * (1.0 - 0.75 * rugged);
+                duneF = duneBase * (1.0 - Smoothstep(0.05, 0.45, contF)) * dgF;
+                duneC = duneBase * (1.0 - Smoothstep(0.05, 0.45, contC)) * dgC;
+            }
+        }
+
+        // Ice fracture lineae: dual-cutoff via Fbm2 so the two systems' lattice samples are shared.
+        double cracksF = 0.0, cracksC = 0.0;
+        if (_crackWeight > 0.0)
+        {
+            double cgF = LayerGate(_crackFreq * 8.0 * fs, fineSpacing), cgC = LayerGate(_crackFreq * 8.0 * fs, coarseSpacing);
+            if (cgF > 0.0 || cgC > 0.0)
+            {
+                double octF = OctavesFor(_crackFreq * fs, fineSpacing, CrackOctaves);
+                double octC = OctavesFor(_crackFreq * fs, coarseSpacing, CrackOctaves);
+                (double nAF, double nAC) = _noise.Fbm2(unitDir + CrackOffA, octF, octC, _crackFreq * fs, 2.0, 0.5);
+                (double nBF, double nBC) = _noise.Fbm2(unitDir + CrackOffB, octF, octC, _crackFreq * fs, 2.0, 0.5);
+                cracksF = 0.5 * (CrackShape(nAF) + CrackShape(nBF)) * cgF;
+                cracksC = 0.5 * (CrackShape(nAC) + CrackShape(nBC)) * cgC;
+            }
+        }
+
         double scale = _baseAmplitude * PlanetTuning.EffectiveRelief(Type);
         fine = scale * (ContinentWeight * contF + mWeight * mtnF * maskF * rugged
                         + DetailWeight * detF * detailGate + microW * microF
-                        + craterW * craterFine + _strataWeight * strata);
+                        + craterW * craterFine + _strataWeight * strata
+                        + _duneWeight * duneF + _crackWeight * cracksF);
         coarse = scale * (ContinentWeight * contC + mWeight * mtnC * maskC * rugged
                         + DetailWeight * detC * detailGate + microW * microC
-                        + craterW * craterC + _strataWeight * strata);
+                        + craterW * craterC + _strataWeight * strata
+                        + _duneWeight * duneC + _crackWeight * cracksC);
     }
 
     /// <summary>
@@ -446,6 +568,14 @@ public sealed class PlanetTerrain
         public int MaxMicroOctaves;
         public double StrataWeight, StrataFreq, StrataSharp; // sedimentary terracing (mesas/canyons)
         public int StrataSteps;
+
+        // Aeolian dune seas (desert worlds with wind): warped transverse stripes gathered into ergs.
+        public double DuneWeight, DuneFreq, DuneWarpFreq, DuneWarpAmp, ErgFreq;
+        public Vector3D<float> DuneDir;      // prevailing-wind axis
+        public float IsDesert;               // 1 = erg albedo tint applies (dune-bearing desert)
+        // Ice fracture lineae (ice worlds): double-ridge crack systems + their rusty albedo tint.
+        public double CrackWeight, CrackFreq;
+        public float IsIcy;                  // 1 = crack albedo tint applies
 
         // Biome / colour (for the per-pixel albedo in the render shader, mirroring ColorAt/LandBand).
         public Vector3D<float> BaseColor, Rock, Snow, Cliff, Lowland, SubstrateTint;
@@ -479,6 +609,12 @@ public sealed class PlanetTerrain
             MicroWeight = MicroWeight * Math.Max(0.0, TerrainTuning.MicroDetailScale),
             MicroFreq = _microFreq * fs, MicroGain = MicroGain, MaxMicroOctaves = MaxMicroOctaves,
             StrataWeight = _strataWeight, StrataFreq = _strataFreq * fs, StrataSteps = _strataSteps, StrataSharp = _strataSharp,
+            DuneWeight = _duneWeight, DuneFreq = _duneFreq * fs, DuneWarpFreq = _duneWarpFreq * fs,
+            DuneWarpAmp = _duneWarpAmp, ErgFreq = _ergFreq * fs,
+            DuneDir = new Vector3D<float>((float)_duneDir.X, (float)_duneDir.Y, (float)_duneDir.Z),
+            IsDesert = _duneWeight > 0.0 ? 1f : 0f,
+            CrackWeight = _crackWeight, CrackFreq = _crackFreq * fs,
+            IsIcy = _crackWeight > 0.0 ? 1f : 0f,
             BaseColor = _baseColor, SubstrateTint = _substrateTint,
             Rock = PlanetTuning.EffectiveRock(Type), Snow = PlanetTuning.EffectiveSnow(Type),
             Cliff = PlanetTuning.EffectiveCliff(Type), Lowland = PlanetTuning.EffectiveLowland(Type),
@@ -569,9 +705,120 @@ public sealed class PlanetTerrain
                 (float)CraterOctavesForSpacing(sampleSpacing), (float)p.CraterDensity, seed);
             shape += (float)p.CraterWeight * crater;
         }
+        if (p.DuneWeight > 0.0)
+        {
+            float duneGate = (float)LayerGateForSpacing(p.DuneFreq, sampleSpacing);
+            if (duneGate > 0f)
+            {
+                float lowland = 1f - SmoothstepF(0.05f, 0.45f, cont);
+                shape += (float)p.DuneWeight * GpuDuneProfile(dir, p, seed) * GpuErgMask(dir, p, seed)
+                       * lowland * (1f - 0.75f * rugged) * duneGate;
+            }
+        }
+        if (p.CrackWeight > 0.0)
+        {
+            float crackGate = (float)LayerGateForSpacing(p.CrackFreq * 8.0, sampleSpacing);
+            if (crackGate > 0f)
+            {
+                float crackOct = (float)OctavesFor(p.CrackFreq, sampleSpacing, CrackOctaves);
+                float nA = GpuFbm(dir + new Vector3D<float>(2.7f, 33.1f, 8.9f), (float)p.CrackFreq, crackOct, 0.5f, seed);
+                float nB = GpuFbm(dir + new Vector3D<float>(19.3f, 4.7f, 27.7f), (float)p.CrackFreq, crackOct, 0.5f, seed);
+                shape += (float)p.CrackWeight * 0.5f * (GpuCrackShape(nA) + GpuCrackShape(nB)) * crackGate;
+            }
+        }
         if (p.VolcanoWeight > 0.0)
             shape += (float)p.VolcanoWeight * GpuVolcano(dir, (float)p.VolcanoFreq, (float)p.VolcanoDensity, seed);
         return p.Scale * shape;
+    }
+
+    /// <summary>Float mirror of the gen shader's <c>duneProfile</c> (asymmetric warped transverse dunes).</summary>
+    private static float GpuDuneProfile(Vector3D<float> dir, in GpuTerrainParams p, Vector3D<float> seed)
+    {
+        float warp = GpuFbm(dir + new Vector3D<float>(12.9f, 78.2f, 44.6f), (float)p.DuneWarpFreq, 3f, 0.5f, seed);
+        float s = (float)p.DuneFreq * Vector3D.Dot(dir, p.DuneDir) + (float)p.DuneWarpAmp * warp;
+        float t = GpuFractF(s);
+        return t < 0.7f ? SmoothstepF(0f, 0.7f, t) : 1f - SmoothstepF(0.7f, 1f, t);
+    }
+
+    /// <summary>Float mirror of the gen shader's <c>ergMask</c> (patchy dune-sea provinces).</summary>
+    private static float GpuErgMask(Vector3D<float> dir, in GpuTerrainParams p, Vector3D<float> seed)
+        => SmoothstepF(0.05f, 0.40f, GpuFbm(dir + new Vector3D<float>(91.7f, 23.3f, 55.1f), (float)p.ErgFreq, 3f, 0.5f, seed));
+
+    /// <summary>Float mirror of the gen shader's <c>crackShape</c> (double-ridge lineae cross-section).</summary>
+    private static float GpuCrackShape(float n)
+    {
+        float v = 1f - MathF.Abs(n);
+        float shoulder = SmoothstepF(0.86f, 0.94f, v) * (1f - SmoothstepF(0.955f, 0.995f, v));
+        float trough = SmoothstepF(0.94f, 0.995f, v);
+        return 0.55f * shoulder - trough;
+    }
+
+    /// <summary>One volcano of the baked cone field: where it is, how big, and whether its caldera
+    /// actually opens at the surface (an off-shell feature only shows its flank). <see cref="Rand"/> is
+    /// the volcano's stable existence hash — seeds per-volcano eruption phase/character.</summary>
+    public readonly record struct VolcanoSite(
+        Vector3D<double> Direction,   // unit direction of the summit
+        double FootprintRadiusM,      // cone base radius on the surface (metres of arc)
+        double PeakHeightM,           // cone rim height above the rest of the terrain (metres)
+        float VentMask,               // 1 = caldera fully open at the surface → erupts; → 0 buried
+        float Rand);
+
+    /// <summary>
+    /// Enumerate every volcano the GPU tile generator will bake for this world (empty off lava worlds)
+    /// by mirroring <c>volcanoField</c>'s cellular hash in float: walk the lattice cells within a cone
+    /// radius of the unit-sphere shell and keep the cells that bear a feature. The eruption renderer
+    /// uses these as its fountain sources, so the plumes rise from exactly the baked summits.
+    /// </summary>
+    public VolcanoSite[] VolcanoSites()
+    {
+        GpuTerrainParams p = GpuParams();
+        if (p.VolcanoWeight <= 0.0) return Array.Empty<VolcanoSite>();
+
+        float freq = (float)p.VolcanoFreq;
+        float density = (float)p.VolcanoDensity;
+        Vector3D<float> seed = GpuSeedOffset(p.Seed);
+        int lo = (int)MathF.Floor(-freq) - 1, hi = (int)MathF.Floor(freq) + 1;
+        const float maxRadius = 0.70f;          // 0.45 + 0.25 upper bound (cell units)
+        const float halfDiag = 0.8660255f;      // half a cell's space diagonal
+
+        var sites = new List<VolcanoSite>();
+        for (int z = lo; z <= hi; z++)
+        for (int y = lo; y <= hi; y++)
+        for (int x = lo; x <= hi; x++)
+        {
+            var c = new Vector3D<float>(x, y, z);
+            // Quick shell reject: a feature lives inside its cell, and only shows if it sits within a
+            // cone radius of the sphere surface (|p| = freq) — most of the lattice cube never can.
+            var cc = c + new Vector3D<float>(0.5f, 0.5f, 0.5f);
+            float cd = MathF.Sqrt(cc.X * cc.X + cc.Y * cc.Y + cc.Z * cc.Z);
+            if (MathF.Abs(cd - freq) > maxRadius + halfDiag) continue;
+
+            float ex = GpuHash13(c + new Vector3D<float>(7f, 7f, 7f), seed);
+            if (ex > density) continue;
+            var jit = new Vector3D<float>(
+                GpuHash13(c + new Vector3D<float>(3.1f, 3.1f, 3.1f), seed),
+                GpuHash13(c + new Vector3D<float>(8.7f, 8.7f, 8.7f), seed),
+                GpuHash13(c + new Vector3D<float>(1.9f, 1.9f, 1.9f), seed));
+            float radius = 0.45f + 0.25f * GpuFractF(ex * 5f + 0.3f);
+
+            Vector3D<float> f = c + jit;
+            float flen = MathF.Sqrt(f.X * f.X + f.Y * f.Y + f.Z * f.Z);
+            if (flen <= 0f) continue;
+            float t0 = MathF.Abs(flen - freq) / radius;   // summit's normalised distance from the shell
+            if (t0 >= 1f) continue;                       // feature too deep/high — no surface expression
+
+            const float rimT = 0.30f;
+            float cone = t0 < rimT ? LerpF(0.55f, 1f, SmoothstepF(0f, rimT, t0)) : SmoothstepF(1f, rimT, t0);
+            float hvar = 0.7f + 0.6f * GpuFractF(ex * 11f);
+            var dir = new Vector3D<double>(f.X / flen, f.Y / flen, f.Z / flen);
+            sites.Add(new VolcanoSite(
+                dir,
+                radius / freq * Radius,
+                p.VolcanoWeight * p.Scale * cone * hvar,
+                1f - SmoothstepF(0f, rimT, t0),
+                ex));
+        }
+        return sites.ToArray();
     }
 
     /// <summary>Float mirror of the gen shader's <c>terrace</c> (mesas/banded canyon walls).</summary>
@@ -813,6 +1060,38 @@ public sealed class PlanetTerrain
         TerrainStyle.Cratered    => new(1.00, 0.40, 0.45, 0.85, 0.22, 0.50, 0.75),
         _ /* Tectonic */         => new(1.00, 1.00, 0.25, 0.62, 0.45, 0.00, 0.00),
     };
+
+    // --- aeolian dunes & ice lineae ---
+
+    /// <summary>
+    /// Transverse-dune height profile in [0,1] at a direction: the fractional phase of a stripe field
+    /// running perpendicular to the prevailing wind, bent organically by a low-frequency warp. The
+    /// profile is asymmetric like a real dune — a long smooth windward rise to the crest at
+    /// <see cref="DuneCrest"/> of the wavelength, then a short steep slip face. Spacing-independent
+    /// (fixed warp octaves), so it never pops across an LOD swap; the caller LOD-gates it instead.
+    /// </summary>
+    private double DuneProfile(Vector3D<double> dir, double freqScale)
+    {
+        double warp = _noise.Fbm(dir + DuneWarpOff, DuneWarpOctaves, _duneWarpFreq * freqScale, 2.0, 0.5);
+        double s = _duneFreq * freqScale * Vector3D.Dot(dir, _duneDir) + _duneWarpAmp * warp;
+        double p = s - Math.Floor(s);
+        return p < DuneCrest ? Smoothstep(0.0, DuneCrest, p) : 1.0 - Smoothstep(DuneCrest, 1.0, p);
+    }
+
+    /// <summary>Dune-sea (erg) provinces in [0,1]: patchy low-frequency regions where the sand has
+    /// gathered, so a desert world has both open rocky plains and seas of dunes.</summary>
+    private double ErgMask(Vector3D<double> dir, double freqScale)
+        => Smoothstep(0.05, 0.40, _noise.Fbm(dir + ErgOff, 3, _ergFreq * freqScale, 2.0, 0.5));
+
+    /// <summary>One lineae system's cross-section from a folded fBm value: a pair of raised shoulders
+    /// flanking a deep central groove (the classic double-ridge fracture). In [-1, 0.55].</summary>
+    private static double CrackShape(double n)
+    {
+        double v = 1.0 - Math.Abs(n);                                          // 1 exactly on the line
+        double shoulder = Smoothstep(0.86, 0.94, v) * (1.0 - Smoothstep(0.955, 0.995, v));
+        double trough = Smoothstep(0.94, 0.995, v);
+        return 0.55 * shoulder - trough;
+    }
 
     /// <summary>Low-frequency regional roughness in [0,1]: 0 = flat plains here, 1 = rugged highlands.</summary>
     private double Ruggedness(Vector3D<double> unitDir, double freqScale)
@@ -1091,10 +1370,38 @@ public sealed class PlanetTerrain
 
         Vector3D<float> land = LandBand(dir, height, amplitude, slope);
         if (Type == PlanetType.Lava) return LavaAlbedo(land, dir, height); // glowing fissures over dark crust
+        if (_crackWeight > 0.0) land = LineaeAlbedo(land, dir, sampleSpacing); // rusty fracture lines on ice
+        if (_duneWeight > 0.0) land = ErgAlbedo(land, dir);                    // warm dune-sea provinces
         if (!IsCratered) return land;
         // Airless cratered worlds get crater-floor/rim albedo and maria provinces over the bare land.
         double cr = craterKnown ? craterValue : CraterField(dir, PlanetTuning.EffectiveFrequency(Type), sampleSpacing);
         return RegolithAlbedo(land, dir, cr);
+    }
+
+    /// <summary>
+    /// Ice-world fracture tint: rusty (salt-stained) bands tracking the SAME folded-fBm line field the
+    /// lineae geometry uses, slightly wider than the grooves so the crack systems read as coloured
+    /// arcs from orbit — where the thin relief itself is sub-texel — down to the surface.
+    /// </summary>
+    private Vector3D<float> LineaeAlbedo(Vector3D<float> col, Vector3D<double> dir, double sampleSpacing)
+    {
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+        double oct = OctavesFor(_crackFreq * fs, sampleSpacing, 4); // band-limited → no far-view shimmer
+        double vA = 1.0 - Math.Abs(_noise.Fbm(dir + CrackOffA, oct, _crackFreq * fs, 2.0, 0.5));
+        double vB = 1.0 - Math.Abs(_noise.Fbm(dir + CrackOffB, oct, _crackFreq * fs, 2.0, 0.5));
+        float lin = (float)Math.Max(Smoothstep(0.88, 0.97, vA), 0.7 * Smoothstep(0.88, 0.97, vB));
+        return Lerp(col, new Vector3D<float>(0.48f, 0.30f, 0.20f), 0.55f * lin);
+    }
+
+    /// <summary>Desert erg tint: dune-sea provinces shifted warm/orange (deep loose sand vs the paler
+    /// rocky plains between), following the same erg mask that gathers the dune geometry — so the dune
+    /// seas read as coloured regions from orbit before their relief resolves.</summary>
+    private Vector3D<float> ErgAlbedo(Vector3D<float> col, Vector3D<double> dir)
+    {
+        double fs = PlanetTuning.EffectiveFrequency(Type);
+        float erg = (float)ErgMask(dir, fs); // low-frequency, fixed octaves → safe at any band-limit
+        var sandy = new Vector3D<float>(col.X * 1.06f, col.Y * 0.82f, col.Z * 0.55f);
+        return Lerp(col, sandy, 0.5f * erg);
     }
 
     /// <summary>Bright molten-lava albedo over the cooled crust on lava worlds: glowing fissures pooled in

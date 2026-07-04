@@ -21,9 +21,9 @@ namespace Game.App;
 /// This is the heightmap-plus-detail-texture split SpaceEngine uses.</para>
 ///
 /// <para><b>Scope.</b> Continents (fBm) + ridged mountains on the highland mask + domain warp + regional
-/// ruggedness + eroded detail (slope-damped fBm) + impact craters. Micro-relief and strata are not ported.
-/// The GPU uses its own GLSL hash, so the look has the same character as the CPU terrain rather than
-/// matching it bit-for-bit.</para>
+/// ruggedness + eroded detail (slope-damped fBm) + impact craters + volcanoes + micro-relief + strata +
+/// aeolian dunes (desert) + fracture lineae (ice). The GPU uses its own GLSL hash, so the look has the
+/// same character as the CPU terrain rather than matching it bit-for-bit.</para>
 /// </summary>
 public sealed class TerrainTileGenerator : IDisposable
 {
@@ -207,6 +207,11 @@ uniform float uVolcanoWeight, uVolcanoFreq, uVolcanoDensity; // raised volcano c
 uniform float uMicroWeight, uMicroFreq, uMicroGain;         // fine micro-relief (LOD-gated; 0 = none)
 uniform float uMicroOctFine, uMicroOctCoarse, uMicroGateFine, uMicroGateCoarse; // micro octave count + LOD gate
 uniform float uStrataWeight, uStrataFreq, uStrataSteps, uStrataSharp; // sedimentary terracing (mesas/canyons)
+uniform float uDuneWeight, uDuneFreq, uDuneWarpFreq, uDuneWarpAmp, uErgFreq; // aeolian dunes (0 weight = none)
+uniform vec3 uDuneDir;                                      // prevailing-wind axis
+uniform float uDuneGateFine, uDuneGateCoarse;               // dune LOD gates per band-limit
+uniform float uCrackWeight, uCrackFreq;                     // ice fracture lineae (0 weight = none)
+uniform float uCrackOctFine, uCrackOctCoarse, uCrackGateFine, uCrackGateCoarse; // lineae octaves + LOD gates
 layout(location = 0) out vec4 oHeight;
 
 const int MaxOct = 32;
@@ -407,7 +412,35 @@ float terrace(float v, float steps, float sharp) {
     return (fl + riser) / steps;
 }
 
-float shape(vec3 dir, vec3 oct, float microOct, float microGate) {
+// Transverse-dune profile in [0,1]: the fractional phase of a stripe field perpendicular to the
+// prevailing wind, bent by a low-frequency warp. Asymmetric like a real dune — a long windward rise
+// to the crest at 0.7 of the wavelength, then a short steep slip face. Mirrors PlanetTerrain.DuneProfile.
+float duneProfile(vec3 dir) {
+    float warp = fbm(dir + vec3(12.9, 78.2, 44.6), uDuneWarpFreq, 3.0, 0.5);
+    float s = uDuneFreq * dot(dir, uDuneDir) + uDuneWarpAmp * warp;
+    float t = fract(s);
+    return t < 0.7 ? smoothstep(0.0, 0.7, t) : 1.0 - smoothstep(0.7, 1.0, t);
+}
+// Dune-sea (erg) provinces in [0,1]: patchy regions where the sand gathers. Mirrors PlanetTerrain.ErgMask.
+float ergMask(vec3 dir) {
+    return smoothstep(0.05, 0.40, fbm(dir + vec3(91.7, 23.3, 55.1), uErgFreq, 3.0, 0.5));
+}
+// One lineae system's cross-section from a folded fBm value: raised shoulder pair flanking a deep
+// central groove (the classic double-ridge fracture). In [-1, 0.55]. Mirrors PlanetTerrain.CrackShape.
+float crackShape(float n) {
+    float v = 1.0 - abs(n);
+    float shoulder = smoothstep(0.86, 0.94, v) * (1.0 - smoothstep(0.955, 0.995, v));
+    float trough = smoothstep(0.94, 0.995, v);
+    return 0.55 * shoulder - trough;
+}
+// Two cross-cutting lineae systems, averaged (in [-1, 0.55]). Same offsets as the CPU/albedo paths.
+float iceCracks(vec3 dir, float oct) {
+    float nA = fbm(dir + vec3(2.7, 33.1, 8.9), uCrackFreq, oct, 0.5);
+    float nB = fbm(dir + vec3(19.3, 4.7, 27.7), uCrackFreq, oct, 0.5);
+    return 0.5 * (crackShape(nA) + crackShape(nB));
+}
+
+float shape(vec3 dir, vec3 oct, float microOct, float microGate, float duneGate, float crackOct, float crackGate) {
     float cont = fbm(dir, uFreq.x, oct.x, uGain.x);     // broad continents / basins
     float rugged = ruggedness(dir);                     // where rugged terrain belongs
     float mask = smoothstep(-0.2, 0.4, cont);           // highlands carry the mountains
@@ -420,8 +453,12 @@ float shape(vec3 dir, vec3 oct, float microOct, float microGate) {
         ? fbm(dir, uMicroFreq, microOct, uMicroGain) * microGate * detailGate : 0.0;
     float strata = (uStrataWeight > 0.0)
         ? terrace(fbm(dir + vec3(8.2, 71.5, 3.6), uStrataFreq, 4.0, 0.5), uStrataSteps, uStrataSharp) : 0.0;
+    // Aeolian dunes gather in ergs on flat lowland; ice lineae cut across everything. Both LOD-gated.
+    float dune = (uDuneWeight > 0.0 && duneGate > 0.0)
+        ? duneProfile(dir) * ergMask(dir) * (1.0 - smoothstep(0.05, 0.45, cont)) * (1.0 - 0.75 * rugged) * duneGate : 0.0;
+    float cracks = (uCrackWeight > 0.0 && crackGate > 0.0) ? iceCracks(dir, crackOct) * crackGate : 0.0;
     return uWeight.x * cont + uWeight.y * mtn * mask * rugged + uWeight.z * det * detailGate
-         + uMicroWeight * micro + uStrataWeight * strata;
+         + uMicroWeight * micro + uStrataWeight * strata + uDuneWeight * dune + uCrackWeight * cracks;
 }
 
 void main() {
@@ -445,8 +482,8 @@ void main() {
     }
     // Volcano cones: large, LOD-independent → added equally to both band-limits (no pop). Lava worlds only.
     float volcano = uVolcanoWeight > 0.0 ? volcanoField(dir, uVolcanoFreq, uVolcanoDensity).x : 0.0;
-    float hFine   = uScale * (shape(dir, uOctFine,   uMicroOctFine,   uMicroGateFine)   + uCraterWeight * craterFine   + uVolcanoWeight * volcano);
-    float hCoarse = uScale * (shape(dir, uOctCoarse, uMicroOctCoarse, uMicroGateCoarse) + uCraterWeight * craterCoarse + uVolcanoWeight * volcano);
+    float hFine   = uScale * (shape(dir, uOctFine,   uMicroOctFine,   uMicroGateFine,   uDuneGateFine,   uCrackOctFine,   uCrackGateFine)   + uCraterWeight * craterFine   + uVolcanoWeight * volcano);
+    float hCoarse = uScale * (shape(dir, uOctCoarse, uMicroOctCoarse, uMicroGateCoarse, uDuneGateCoarse, uCrackOctCoarse, uCrackGateCoarse) + uCraterWeight * craterCoarse + uVolcanoWeight * volcano);
     oHeight = vec4(hFine, hCoarse, craterFine, craterCoarse);
 }";
 
@@ -515,6 +552,20 @@ void main() {
         _shader.SetFloat("uStrataFreq", (float)p.StrataFreq);
         _shader.SetFloat("uStrataSteps", p.StrataSteps);
         _shader.SetFloat("uStrataSharp", (float)p.StrataSharp);
+        _shader.SetFloat("uDuneWeight", (float)p.DuneWeight);
+        _shader.SetFloat("uDuneFreq", (float)p.DuneFreq);
+        _shader.SetFloat("uDuneWarpFreq", (float)p.DuneWarpFreq);
+        _shader.SetFloat("uDuneWarpAmp", (float)p.DuneWarpAmp);
+        _shader.SetFloat("uErgFreq", (float)p.ErgFreq);
+        _shader.SetVector3("uDuneDir", p.DuneDir);
+        _shader.SetFloat("uDuneGateFine", (float)(p.DuneWeight > 0.0 ? terrain.LayerGateForSpacing(p.DuneFreq, spacingFine) : 0.0));
+        _shader.SetFloat("uDuneGateCoarse", (float)(p.DuneWeight > 0.0 ? terrain.LayerGateForSpacing(p.DuneFreq, spacingCoarse) : 0.0));
+        _shader.SetFloat("uCrackWeight", (float)p.CrackWeight);
+        _shader.SetFloat("uCrackFreq", (float)p.CrackFreq);
+        _shader.SetFloat("uCrackOctFine", (float)(p.CrackWeight > 0.0 ? terrain.OctavesForSpacing(p.CrackFreq, spacingFine, 5) : 0.0));
+        _shader.SetFloat("uCrackOctCoarse", (float)(p.CrackWeight > 0.0 ? terrain.OctavesForSpacing(p.CrackFreq, spacingCoarse, 5) : 0.0));
+        _shader.SetFloat("uCrackGateFine", (float)(p.CrackWeight > 0.0 ? terrain.LayerGateForSpacing(p.CrackFreq * 8.0, spacingFine) : 0.0));
+        _shader.SetFloat("uCrackGateCoarse", (float)(p.CrackWeight > 0.0 ? terrain.LayerGateForSpacing(p.CrackFreq * 8.0, spacingCoarse) : 0.0));
 
         // Render the noise into the tile, then restore exactly the framebuffer + viewport that were bound
         // (the scene FBO mid-render): generation can run inside the terrain pass, so it must leave no trace.

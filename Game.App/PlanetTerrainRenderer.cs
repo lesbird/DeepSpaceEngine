@@ -579,6 +579,10 @@ uniform float uIsLava, uLavaGlow, uLavaFreq;
 uniform float uVolcanoFreqR, uVolcanoDensityR;
 uniform float uCityGlow, uCityFreq; // night-side city lights on inhabited worlds (uHasLife gates)
 uniform float uEclipse;             // solar-eclipse coverage [0,1] — dims the sunlit surface to twilight
+// Type-signature albedo accents, tracking the SAME seeded fields the tiles bake (via tf* + uSeedR):
+// rusty fracture-lineae bands on ice worlds, warm erg (dune-sea) provinces on dune-bearing deserts.
+uniform float uIsIcy, uCrackFreqR, uCrackWeightR;
+uniform float uIsDesert, uErgFreqR, uDuneWeightR;
 // Biome / colour (per-pixel port of ColorAt / LandBand).
 uniform vec3 uBaseColor, uRock, uSnow, uCliff, uLowland, uSubstrateTint;
 uniform float uSnowLine, uCliffThreshold, uCliffStrength, uSurfaceTempK, uHasLife;
@@ -709,6 +713,24 @@ void main() {
             vec3 mare = vec3(col.r * 0.55, col.g * 0.56, col.b * 0.60);  // darker, faintly cooler
             col = mix(col, mare, maria * uMariaStrength);
         }
+    }
+
+    // Ice-world fracture tint: rusty (salt-stained) bands over the SAME seeded folded-fBm line field the
+    // baked lineae grooves use, a touch wider than the grooves — so the crack systems read as coloured
+    // arcs from orbit (where the thin relief is sub-texel) and stay registered with the geometry up close.
+    // Mirrors PlanetTerrain.LineaeAlbedo.
+    if (uIsIcy > 0.5 && uCrackWeightR > 0.0) {
+        float vA = 1.0 - abs(tfFbm(up + vec3(2.7, 33.1, 8.9), uCrackFreqR, 4.0, 0.5, uSeedR));
+        float vB = 1.0 - abs(tfFbm(up + vec3(19.3, 4.7, 27.7), uCrackFreqR, 4.0, 0.5, uSeedR));
+        float lin = max(smoothstep(0.88, 0.97, vA), 0.7 * smoothstep(0.88, 0.97, vB));
+        col = mix(col, vec3(0.48, 0.30, 0.20), 0.55 * lin);
+    }
+
+    // Desert erg tint: dune-sea provinces shifted warm/orange (deep loose sand vs paler rocky plains),
+    // following the same seeded erg mask that gathers the baked dunes. Mirrors PlanetTerrain.ErgAlbedo.
+    if (uIsDesert > 0.5 && uDuneWeightR > 0.0) {
+        float erg = smoothstep(0.05, 0.40, tfFbm(up + vec3(91.7, 23.3, 55.1), uErgFreqR, 3.0, 0.5, uSeedR));
+        col = mix(col, col * vec3(1.06, 0.82, 0.55), 0.5 * erg);
     }
 
     // Close-up detail: a band-passed multi-octave noise gives per-pixel normal bump + material breakup
@@ -1365,6 +1387,14 @@ void main() {
         _gpuShader.SetFloat("uCraterAlbedo", Math.Max(0f, TerrainTuning.CraterAlbedo));
         _gpuShader.SetFloat("uMariaStrength", Math.Max(0f, TerrainTuning.MariaStrength));
         _gpuShader.SetFloat("uMariaFreq", (float)(gp.ContinentFreq * 0.6));
+
+        // Type-signature albedo accents: ice fracture-lineae bands + desert erg (dune-sea) provinces.
+        _gpuShader.SetFloat("uIsIcy", gp.IsIcy);
+        _gpuShader.SetFloat("uCrackFreqR", (float)gp.CrackFreq);
+        _gpuShader.SetFloat("uCrackWeightR", (float)gp.CrackWeight);
+        _gpuShader.SetFloat("uIsDesert", gp.IsDesert);
+        _gpuShader.SetFloat("uErgFreqR", (float)gp.ErgFreq);
+        _gpuShader.SetFloat("uDuneWeightR", (float)gp.DuneWeight);
 
         // Orbital macro-relief from the real baked field (matches the mountains, fades out on descent).
         _gpuShader.SetVector3("uSeedR", new Vector3D<float>(
