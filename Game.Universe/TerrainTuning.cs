@@ -52,6 +52,10 @@ public static class TerrainTuning
     /// dark. Clustered on temperate coastal lowlands, visible from orbit, blooming. Live (no rebuild).</summary>
     public static float CityGlow = 1.5f;
 
+    /// <summary>Strength/brightness of the lava fountains erupting from volcano vents on lava worlds;
+    /// 0 = dormant volcanoes (vent glow only). Live (no rebuild).</summary>
+    public static float EruptionStrength = 1.0f;
+
     /// <summary>Scales the fine, LOD-gated micro-relief height layer that only appears up close;
     /// 0 removes it. Changing it requires a terrain rebuild (it's geometry).</summary>
     public static float MicroDetailScale = 1.0f;

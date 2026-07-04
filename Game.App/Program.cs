@@ -46,6 +46,7 @@ internal static class Program
     private static AtmosphereRenderer _atmosphereRenderer = null!;
     private static CloudRenderer _cloudRenderer = null!;
     private static PlanetTerrainRenderer _terrainRenderer = null!;
+    private static VolcanoEruptionRenderer _eruptions = null!;
     private static ScatterRenderer _scatter = null!;
     private static PlanetSurfaceMap _surfaceMap = null!;
     private static ulong _mapBodyId = ulong.MaxValue;
@@ -244,6 +245,7 @@ internal static class Program
         _atmosphereRenderer = new AtmosphereRenderer(_gl);
         _cloudRenderer = new CloudRenderer(_gl);
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
+        _eruptions = new VolcanoEruptionRenderer(_gl);
         _scatter = new ScatterRenderer(_gl);
         _surfaceMap = new PlanetSurfaceMap(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse, _terrainRenderer);
@@ -523,6 +525,7 @@ internal static class Program
 
         _terrainTarget = PickTerrainTarget();
         _terrainRenderer.SetBody(_terrainTarget);
+        _eruptions.SetBody(_terrainTarget, _terrainRenderer.ActiveTerrain); // lava-world vent fountains
         // Keep the terrain finely refined under the rover so the drawn mesh matches the height it
         // rides on (no sinking through coarse, chord-flattened triangles while driving).
         _terrainRenderer.FocusPoint = _driving ? _rover.BodyPosition : null;
@@ -747,6 +750,11 @@ internal static class Program
             // tiles so they sit exactly on the drawn surface.
             _scatter.Render(_camera, _terrainTarget, _terrainRenderer, sunDir,
                 _terrainRenderer.LastNear, _terrainRenderer.LastFar, (float)_renderClock);
+
+            // Lava fountains from the volcano vents (lava worlds): additive, depth-tested against the
+            // terrain just drawn, sharing its near/far so the atmosphere composites over the plumes.
+            _eruptions.Render(_camera, (float)_renderClock,
+                _terrainRenderer.LastNear, _terrainRenderer.LastFar, _sceneFbo.Height);
         }
 
         // Capture the finished scene into a sampleable colour buffer, then composite the depth-aware
@@ -1379,13 +1387,14 @@ internal static class Program
             terrainDirty |= ImGui.SliderFloat("Crater albedo", ref TerrainTuning.CraterAlbedo, 0f, 2f);
             terrainDirty |= ImGui.SliderFloat("Maria", ref TerrainTuning.MariaStrength, 0f, 1.5f);
             ImGui.SliderFloat("Lava glow", ref TerrainTuning.LavaGlow, 0f, 6f);   // live (no rebuild)
+            ImGui.SliderFloat("Eruptions", ref TerrainTuning.EruptionStrength, 0f, 3f); // live (no rebuild)
             ImGui.SliderFloat("City lights", ref TerrainTuning.CityGlow, 0f, 5f); // live (no rebuild)
-            ImGui.TextDisabled("(craters/maria: airless; lava: lava worlds; city lights: life worlds)");
+            ImGui.TextDisabled("(craters/maria: airless; lava/eruptions: lava worlds; city lights: life worlds)");
             if (ImGui.Button("Reset terrain"))
             {
                 relief = 1f; mountain = 1f; freq = 1f; craterDepth = 1f; craterDensity = 1f;
                 TerrainTuning.CraterAlbedo = 1f; TerrainTuning.MariaStrength = 0.6f;
-                TerrainTuning.LavaGlow = 2.5f; TerrainTuning.CityGlow = 1.5f;
+                TerrainTuning.LavaGlow = 2.5f; TerrainTuning.EruptionStrength = 1f; TerrainTuning.CityGlow = 1.5f;
                 terrainDirty = true;
             }
         }
@@ -1459,7 +1468,7 @@ internal static class Program
             }
         }
 
-        if (terrainDirty) _terrainRenderer.Rebuild();
+        if (terrainDirty) { _terrainRenderer.Rebuild(); _eruptions.Invalidate(); }
         if (_terrainTarget == null)
             ImGui.TextDisabled("(fly down to a planet to see terrain)");
 
@@ -1473,6 +1482,7 @@ internal static class Program
             _tuningStatus = TuningConfig.Load(_atmosphereRenderer, _backdrop, _scatter, _galaxyRenderer, TuningPath)
                 ? $"Loaded {TuningPath}" : "No saved file";
             _terrainRenderer.Rebuild();
+            _eruptions.Invalidate();
             _nebulaGalaxyId = ulong.MaxValue; // rebuild nebulae (loaded count/radius) on the next update
         }
         if (_tuningStatus.Length > 0)
