@@ -441,6 +441,41 @@ public sealed class StarOverlay
         dl.AddText(textPos, col, label);
     }
 
+    /// <summary>Surface nav marker pointing at the nearest city on the world you're standing on: corner
+    /// brackets + a ring when it's on screen, an edge arrow when it's off. Warm amber — matching the city
+    /// lights, and distinct from the nav green / core magenta. <paramref name="rel"/> is the city's
+    /// camera-relative surface position; unlike the far markers it's a finite point, so it's projected
+    /// (and edge-arrowed) like the nearest-planet marker rather than by pure direction.</summary>
+    public void DrawCityReticle(Camera camera, Vector3D<float> rel, double distMeters)
+    {
+        Vector2 vp = ImGui.GetIO().DisplaySize;
+        if (vp.X < 2 || vp.Y < 2) return;
+
+        var dl = ImGui.GetForegroundDrawList();
+        Matrix4X4<float> m = camera.ViewMatrix * camera.ProjectionMatrix;
+        uint col = Col(255, 180, 90, 235); // warm amber-orange — the city-light hue
+        string label = $"CITY  {Dist(distMeters)}";
+
+        if (Project(rel, m, vp, out Vector2 s) && OnScreen(s, vp))
+        {
+            DrawBrackets(dl, s, 13f, col);
+            dl.AddCircle(s, 17f, col, 24, 1.4f);
+            dl.AddText(s + new Vector2(20f, -8f), col, label);
+            return;
+        }
+
+        var invOrientation = Quaternion<float>.Inverse(camera.Orientation);
+        Vector3D<float> viewDir = Vector3D.Transform(rel, invOrientation);
+        Vector2 dir = new(viewDir.X, -viewDir.Y);
+        if (dir.LengthSquared() < 1e-6f) dir = new Vector2(0, 1);
+        dir = Vector2.Normalize(dir);
+
+        Vector2 pos = ClampToEdge(vp * 0.5f, dir, vp, margin: 64f);
+        DrawArrow(dl, pos, dir, col);
+        Vector2 textPos = Vector2.Clamp(pos - dir * 26f - new Vector2(60, -10), new Vector2(8, 8), vp - new Vector2(220, 24));
+        dl.AddText(textPos, col, label);
+    }
+
     private static bool Project(Vector3D<float> p, in Matrix4X4<float> m, Vector2 vp, out Vector2 screen)
     {
         // Matches the GPU path: clip = (p,1) * (view*proj) in Silk's row-vector convention.

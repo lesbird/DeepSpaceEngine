@@ -48,6 +48,14 @@ internal static class Program
     private static PlanetTerrainRenderer _terrainRenderer = null!;
     private static VolcanoEruptionRenderer _eruptions = null!;
     private static ScatterRenderer _scatter = null!;
+    private static CityRenderer _city = null!;
+    // Nearest-city reticle (surface nav): cached planet-local direction + height of the nearest settlement,
+    // recomputed periodically (the search is a ring scan of the placement field, too costly per-frame).
+    private static bool _cityFound;
+    private static Vector3D<double> _cityDirLocal;
+    private static double _cityHeight;
+    private static ulong _cityBodyId = ulong.MaxValue;
+    private static int _cityRecalc;
     private static PlanetSurfaceMap _surfaceMap = null!;
     private static ulong _mapBodyId = ulong.MaxValue;
     private static RoverController _rover = null!;
@@ -247,6 +255,7 @@ internal static class Program
         _terrainRenderer = new PlanetTerrainRenderer(_gl);
         _eruptions = new VolcanoEruptionRenderer(_gl);
         _scatter = new ScatterRenderer(_gl);
+        _city = new CityRenderer(_gl);
         _surfaceMap = new PlanetSurfaceMap(_gl);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse, _terrainRenderer);
         _roverRenderer = new RoverRenderer(_gl);
@@ -751,6 +760,11 @@ internal static class Program
             _scatter.Render(_camera, _terrainTarget, _terrainRenderer, sunDir,
                 _terrainRenderer.LastNear, _terrainRenderer.LastFar, (float)_renderClock);
 
+            // Procedural cities on inhabited worlds: buildings instanced over the same near leaves, planted
+            // under the orbital city-light field so the lights seen from orbit resolve into a lit city here.
+            _city.Render(_camera, _terrainTarget, _terrainRenderer, sunDir,
+                _terrainRenderer.LastNear, _terrainRenderer.LastFar);
+
             // Lava fountains from the volcano vents (lava worlds): additive, depth-tested against the
             // terrain just drawn, sharing its near/far so the atmosphere composites over the plumes.
             _eruptions.Render(_camera, (float)_renderClock,
@@ -800,6 +814,11 @@ internal static class Program
                 else if (_galaxyPager.TryGetAimedGalaxy(_camera.Position, _camera.Forward, out Galaxy aimed, out double aimedDist))
                     _overlay.DrawAimedGalaxyReticle(_camera, aimed, aimedDist);
                 DrawCourse(); // a set course's marker, advancing galaxy → star → planet
+            }
+            else
+            {
+                // Landed on a world: a reticle toward the nearest city so the sparse settlements are findable.
+                UpdateAndDrawCityReticle();
             }
             DrawSpeedOverlay();
             DrawHud();
@@ -980,6 +999,16 @@ internal static class Program
                 double finestPatch = _terrainRenderer.MinDrawnWorldSize;
                 string finestStr = finestPatch >= 1e12 ? "—" : $"{finestPatch:0} m"; // sentinel when none drawn
                 ImGui.Text($"  scatter: {_scatter.Count} objects  ({_terrainRenderer.GrassLeaves.Count} near leaves, finest patch {finestStr})");
+                // City diagnostic on inhabited worlds: buildings need a near-leaf finer than the spacing cap;
+                // on high-relief worlds the LOD can stay coarse, so surface this so a zero isn't a mystery.
+                if (_terrainRenderer.ActiveTerrain is { } activeTerrain && activeTerrain.GpuParams().HasLife >= 0.5f)
+                {
+                    double finestSpacing = double.MaxValue;
+                    foreach (var gl in _terrainRenderer.GrassLeaves) finestSpacing = Math.Min(finestSpacing, gl.VertexSpacing);
+                    string spc = finestSpacing >= 1e12 ? "—" : $"{finestSpacing:0} m";
+                    string gate = finestSpacing <= CityRenderer.MaxSpacingMeters ? "" : $"  (too coarse; need ≤ {CityRenderer.MaxSpacingMeters:0} m — descend)";
+                    ImGui.Text($"  city: {_city.Count} building sites  (finest near-leaf {spc}){gate}");
+                }
             }
         }
         else
@@ -1389,6 +1418,9 @@ internal static class Program
             ImGui.SliderFloat("Lava glow", ref TerrainTuning.LavaGlow, 0f, 6f);   // live (no rebuild)
             ImGui.SliderFloat("Eruptions", ref TerrainTuning.EruptionStrength, 0f, 3f); // live (no rebuild)
             ImGui.SliderFloat("City lights", ref TerrainTuning.CityGlow, 0f, 5f); // live (no rebuild)
+            ImGui.Checkbox("City buildings", ref _city.Enabled);
+            ImGui.SameLine();
+            ImGui.SliderFloat("extent##city", ref TerrainTuning.CityDensity, 0f, 1f); // live (no rebuild)
             ImGui.TextDisabled("(craters/maria: airless; lava/eruptions: lava worlds; city lights: life worlds)");
             if (ImGui.Button("Reset terrain"))
             {
@@ -2859,6 +2891,51 @@ internal static class Program
         if (meters >= 0.01 * MathUtil.AstronomicalUnit) return $"{meters / MathUtil.AstronomicalUnit:0.000} AU";
         if (meters >= 1000) return $"{meters / 1000:0.0} km";
         return $"{meters:0} m";
+    }
+
+    /// <summary>Find (cached, every ~20 frames) and draw the reticle pointing at the nearest city on the
+    /// world you're standing on. Cities are sparse clusters — the placement field is shared with the
+    /// buildings and the orbital glow, so the marker lands exactly where structures spawn. Only inhabited
+    /// worlds have cities, and the marker follows the City-buildings toggle.</summary>
+    private static void UpdateAndDrawCityReticle()
+    {
+        PlanetTerrain? terrain = _terrainRenderer.ActiveTerrain;
+        CelestialBody? body = _terrainTarget;
+        if (!_city.Enabled || terrain == null || body == null) { _cityFound = false; return; }
+
+        PlanetTerrain.GpuTerrainParams gp = terrain.GpuParams();
+        if (gp.HasLife < 0.5f) { _cityFound = false; return; }   // no cities off life worlds
+
+        Vector3D<double> camOff = _camera.Position.DeltaMeters(body.CurrentPosition); // planet frame is world-aligned
+        if (camOff.LengthSquared < 1.0) return;
+        Vector3D<double> camDir = Vector3D.Normalize(camOff);
+
+        if (body.Seed != _cityBodyId) { _cityBodyId = body.Seed; _cityRecalc = 0; _cityFound = false; }
+
+        // Lock onto ONE target city rather than re-picking "nearest" every scan — cities cluster tightly, so
+        // re-picking makes the marker jump between neighbours as you fly in. The target is a fixed planet
+        // point, so once acquired the reticle simply tracks it. Re-acquire only when we have none yet, or the
+        // locked city has fallen onto the far hemisphere (you've crossed to a new region and want a nearer one).
+        double lockAngle = _cityFound ? Math.Acos(Math.Clamp(Vector3D.Dot(camDir, _cityDirLocal), -1.0, 1.0)) : double.MaxValue;
+        bool needAcquire = !_cityFound || lockAngle > 1.2; // ~69°: target now on the opposite side of the world
+        if (needAcquire && --_cityRecalc <= 0)
+        {
+            _cityRecalc = 20;
+            float cityFreq = (float)(gp.ContinentFreq * 14.0);                     // matches CityRenderer / orbital glow
+            float threshold = 0.42f - 0.30f * Math.Clamp(TerrainTuning.CityDensity, 0f, 1f); // = mix(0.42,0.12,density)
+            double amp = Math.Max(1.0, gp.Amplitude);
+            double spacing = terrain.Radius * 0.0008;                              // coarse: broad land/ocean shape, cheap
+            double maxAngle = Math.Min(0.5, 2_500_000.0 / Math.Max(1.0, terrain.Radius)); // ~2500 km search cap
+            _cityFound = CityField.TryFindNearest(camDir, cityFreq, threshold, maxAngle,
+                d => terrain.GpuHeightAt(d, spacing) / amp, out _cityDirLocal, out _);
+            _cityHeight = _cityFound ? terrain.GpuHeightAt(_cityDirLocal, spacing) : 0.0;
+        }
+        if (!_cityFound) return;
+
+        // Camera-relative surface position of the city (world-aligned frame): center + dir·(R+h) − camera.
+        Vector3D<double> relD = _cityDirLocal * (terrain.Radius + _cityHeight) - camOff;
+        var rel = new Vector3D<float>((float)relD.X, (float)relD.Y, (float)relD.Z);
+        _overlay.DrawCityReticle(_camera, rel, relD.Length);
     }
 
     private static CelestialBody? NearestSurfacedBody()

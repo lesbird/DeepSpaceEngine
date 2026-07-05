@@ -49,8 +49,14 @@ public static class TerrainTuning
     public static float LavaGlow = 2.5f;
 
     /// <summary>Brightness of night-side city lights on inhabited (life-bearing) worlds; 0 = uninhabited
-    /// dark. Clustered on temperate coastal lowlands, visible from orbit, blooming. Live (no rebuild).</summary>
+    /// dark. Clustered on temperate coastal lowlands, visible from orbit, blooming. Live (no rebuild).
+    /// Also drives the warm window glow on the ground <see cref="CityRenderer"/> buildings.</summary>
     public static float CityGlow = 1.5f;
+
+    /// <summary>Extent of the ground cities (<see cref="CityRenderer"/>): higher spreads settlements over
+    /// more of the populated regions (lowers the city-field threshold). 0 = only the densest cores build
+    /// up. The buildings sit under the same orbital-glow field, so this widens both together. Live.</summary>
+    public static float CityDensity = 0.6f;
 
     /// <summary>Strength/brightness of the lava fountains erupting from volcano vents on lava worlds;
     /// 0 = dormant volcanoes (vent glow only). Live (no rebuild).</summary>
