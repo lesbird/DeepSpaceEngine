@@ -259,6 +259,20 @@ public sealed class PlanetTerrain
     /// <summary>Terrain height (metres, signed) at a unit direction — full detail (tests/colour).</summary>
     public double HeightAt(Vector3D<double> unitDir) => HeightAt(unitDir, 0.0);
 
+    /// <summary>Fixed sample spacing (as a fraction of radius) for the LOD surface anchor — coarse enough
+    /// to gate out detail/micro/crater/dune layers, so only the broad continent+mountain relief survives.</summary>
+    private const double LodAnchorSpacingFrac = 5e-4;
+
+    /// <summary>
+    /// A coarse, <b>LOD-stable</b> surface elevation (signed metres above the base radius) used only to
+    /// anchor the quadtree's split/merge distance to the real surface instead of the base sphere. Sampled
+    /// at a FIXED spacing independent of patch level, so a parent and its children read essentially the
+    /// same lift — no elevation-driven split/merge feedback — and band-limited to the broad relief that
+    /// actually displaces the surface by km (fine detail wouldn't move the LOD decision anyway).
+    /// </summary>
+    public double LodAnchorElevation(Vector3D<double> unitDir)
+        => HasSurface ? HeightAt(unitDir, Radius * LodAnchorSpacingFrac) : 0.0;
+
     /// <summary>
     /// Base frequency (noise cells over the unit sphere) of the mountain layer — the scale the
     /// orbital macro-relief shader starts from. The shader adds octaves finer than this; coarser

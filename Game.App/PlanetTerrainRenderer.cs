@@ -1229,8 +1229,7 @@ void main() {
         float boundR = (float)(node.WorldSize * 0.75 + _terrain!.Amplitude + 50.0);
         bool visible = IsNodeVisible(node, rel, boundR, camera);
 
-        double dist = camera.Position.DistanceTo(center);
-        if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
+        double dist = LodDistance(node, camera); // to the lifted surface anchor, not the base-sphere centre
 
         double splitDist = _lodFactor * node.WorldSize;
         bool wantSplit = visible && node.Level < MaxLevel && dist < splitDist;
@@ -1288,10 +1287,7 @@ void main() {
     {
         if (depthBudget <= 0 || node.Level >= MaxLevel) return;
 
-        UniversePosition center = _body!.CurrentPosition.Translated(node.CenterLocal);
-        double dist = camera.Position.DistanceTo(center);
-        if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
-        if (dist >= _lodFactor * node.WorldSize) return; // LOD doesn't want to refine here
+        if (LodDistance(node, camera) >= _lodFactor * node.WorldSize) return; // LOD doesn't want to refine here
 
         node.Children ??= Split(node);
         QuadNode? next = null;
@@ -1299,9 +1295,7 @@ void main() {
         foreach (QuadNode c in node.Children)
         {
             if (c.Patch == null && !c.GenPending) RequestGenerate(c); // queue all four (we need them to draw)
-            UniversePosition cc = _body!.CurrentPosition.Translated(c.CenterLocal);
-            double d = camera.Position.DistanceTo(cc);
-            if (FocusPoint is { } f) d = Math.Min(d, f.DistanceTo(cc));
+            double d = LodDistance(c, camera);
             if (d < best) { best = d; next = c; }
         }
         if (next != null) SpeculativeRefine(next, camera, depthBudget - 1); // continue down the focus path
@@ -1527,17 +1521,30 @@ void main() {
         }
     }
 
+    /// <summary>Distance driving this node's split/merge decision: to the patch's coarse terrain surface
+    /// (<see cref="Game.Universe.TerrainTuning.SurfaceAwareLod"/>) rather than its base-sphere centre, so
+    /// high-relief ground underfoot refines instead of reading km-away. Honours the focus point.</summary>
+    private double LodDistance(QuadNode node, Camera camera)
+    {
+        Vector3D<double> anchorLocal = TerrainTuning.SurfaceAwareLod ? node.CenterSurfaceLocal : node.CenterLocal;
+        UniversePosition anchor = _body!.CurrentPosition.Translated(anchorLocal);
+        double dist = camera.Position.DistanceTo(anchor);
+        if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(anchor));
+        return dist;
+    }
+
     /// <summary>Standard split/merge/cull state for a node (shared by the ensure and draw passes so they
     /// make identical decisions).</summary>
     private void NodeState(QuadNode node, Camera camera, out Vector3D<float> rel, out bool visible,
         out double dist, out double splitDist)
     {
+        // Placement + visibility stay on the base-sphere centre (vertices are centre-relative to it, and
+        // boundR already includes Amplitude); only the LOD distance follows the lifted surface anchor.
         UniversePosition center = _body!.CurrentPosition.Translated(node.CenterLocal);
         rel = center.ToCameraRelative(camera.Position);
         float boundR = (float)(node.WorldSize * 0.75 + _terrain!.Amplitude + 50.0);
         visible = IsNodeVisible(node, rel, boundR, camera);
-        dist = camera.Position.DistanceTo(center);
-        if (FocusPoint is { } fp) dist = Math.Min(dist, fp.DistanceTo(center));
+        dist = LodDistance(node, camera);
         splitDist = _lodFactor * node.WorldSize;
     }
 
@@ -1987,12 +1994,16 @@ void main() {
     private QuadNode MakeNode(int face, int level, double u0, double v0, double u1, double v1)
     {
         Vector3D<double> centerDir = FacePoint(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5);
+        // Lift the LOD anchor to the coarse terrain surface (once — it's a pure, level-stable function of
+        // direction), so split/merge measures distance to the ground rather than the base sphere below it.
+        double surfR = _terrain!.Radius + _terrain.LodAnchorElevation(centerDir);
         return new QuadNode
         {
             Face = face,
             Level = level,
             U0 = u0, V0 = v0, U1 = u1, V1 = v1,
-            CenterLocal = centerDir * _terrain!.Radius,
+            CenterLocal = centerDir * _terrain.Radius,
+            CenterSurfaceLocal = centerDir * surfR,
             WorldSize = _terrain.Radius * 1.5707963 * (u1 - u0),
             TileId = _nextTileId++, // unique key into the GPU tile cache (GPU path only)
         };
@@ -2317,7 +2328,8 @@ void main() {
     {
         public int Face, Level;
         public double U0, V0, U1, V1;
-        public Vector3D<double> CenterLocal;
+        public Vector3D<double> CenterLocal;        // patch centre on the BASE SPHERE — mesh placement + visibility
+        public Vector3D<double> CenterSurfaceLocal; // patch centre lifted to the coarse terrain surface — the LOD/merge distance anchor
         public double WorldSize;
         public TerrainPatch? Patch;
         public QuadNode[]? Children;

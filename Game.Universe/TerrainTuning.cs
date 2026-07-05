@@ -85,6 +85,14 @@ public static class TerrainTuning
     /// changes the per-frame split/merge decision. 2.5 was the old fixed value.</summary>
     public static float LodDistanceFactor = 4.0f;
 
+    /// <summary>Measure the quadtree's split/merge distance to the <b>terrain surface</b> under each patch
+    /// rather than to the base sphere it's built on. On high-relief worlds the drawn surface floats tens of
+    /// km above the sphere, so the base-sphere distance is inflated by that radial offset and the ground
+    /// right under the camera under-refines (coarse geometry + sparse scatter). Anchoring to the coarse
+    /// surface removes the offset, so high-relief worlds resolve fine geometry — and dense scatter — near
+    /// the camera. Live (no rebuild); uncheck to A/B against the old base-sphere metric. On by default.</summary>
+    public static bool SurfaceAwareLod = true;
+
     /// <summary>How much the detail noise breaks up the surface albedo (0 = none). Live (no rebuild).</summary>
     public static float DetailAlbedo = 0.12f;
 

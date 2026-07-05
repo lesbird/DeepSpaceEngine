@@ -83,6 +83,38 @@ public class TerrainTests
     }
 
     [Fact]
+    public void LodAnchorElevation_IsBoundedAndLevelStable()
+    {
+        // The surface-aware LOD anchor lifts each patch centre to the coarse terrain surface so the
+        // split/merge distance follows the ground, not the base sphere. For that to be safe it must be
+        // (a) bounded by amplitude and (b) LEVEL-STABLE: a parent centre and the four child centres a
+        // subdivision produces sit a tiny angle apart, and their anchor lift must barely differ — else
+        // subdividing would jerk the distance and thrash the quadtree between split and merge.
+        Planet planet = RockyPlanet();
+        var terrain = new PlanetTerrain(planet);
+        var t2 = new PlanetTerrain(planet);
+        var parent = Vector3D.Normalize(new Vector3D<double>(0.2, 0.9, -0.3));
+
+        double a1 = terrain.LodAnchorElevation(parent);
+        Assert.Equal(a1, t2.LodAnchorElevation(parent));       // deterministic
+        Assert.True(Math.Abs(a1) <= terrain.Amplitude + 1e-6); // bounded by amplitude
+
+        // A shallow near-surface quadtree leaf spans ~a few hundred metres; a child centre is offset from
+        // its parent by roughly half that arc. Nudge the direction by ~1e-4 rad (≈ 600 m on an Earth-sized
+        // world) and require the anchor barely moves relative to the relief it rides on.
+        foreach (var tangent in new[]
+        {
+            new Vector3D<double>(1, 0, 0), new Vector3D<double>(0, 1, 0), new Vector3D<double>(0, 0, 1),
+        })
+        {
+            var child = Vector3D.Normalize(parent + tangent * 1e-4);
+            double drift = Math.Abs(terrain.LodAnchorElevation(child) - a1);
+            Assert.True(drift < 0.01 * terrain.Amplitude,
+                $"anchor drifted {drift:0.###} over a sub-leaf step (>1% of amplitude {terrain.Amplitude:0.###}) — would thrash LOD");
+        }
+    }
+
+    [Fact]
     public void Height_IsContinuousAcrossLodSpacing()
     {
         // The whole point of fractional-octave band-limiting: as a patch subdivides, its sample

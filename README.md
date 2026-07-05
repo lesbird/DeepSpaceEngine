@@ -382,13 +382,13 @@ Candidate features, roughly by area — the first group is what's being built ne
 - [x] **Banded gas giants** — procedural zonal cloud bands + a storm oval on gas/ice giants
 - [x] **Micro-relief + strata on the GPU path** — mesas and banded canyon walls (full CPU parity)
 - [x] **Multi-spawner surface-object scatter** — any number of layers, each with its own mesh/density/size/orientation, gated per world by environment traits + a spawn-chance roll (placeholder meshes today; real art next)
+- [x] **Surface-aware LOD** — the quadtree measures its split/merge distance to the *terrain surface* under each patch, not the base sphere it's built on, so high-relief worlds resolve fine geometry (and dense scatter) right under the camera instead of under-refining where the surface floats km above the sphere. The anchor lift is a coarse, level-stable height sample (no LOD feedback); a HUD toggle A/B's it against the old base-sphere metric
 - [x] **System, galaxy & universe maps** — `M` for a top-down system schematic (click-to-travel), `N` for a 2D galaxy chart (click-to-jump) plus a navigable **3-D neighbourhood view** (orbit camera, 10–50 ly radius, nearest-neighbour route, click-to-target), and `U` for a **universe map** of the galaxies (click-to-jump between them)
 - [~] **Eclipses** — built (a world dims when a sibling transits its sun) but **disabled**: the twilight drop was too abrupt; coverage math kept for a gradual-ramp redo
 - [✗] **Planet rotation + day/night cycle** — prototyped as a sun-direction sweep but **dropped**; needs true geometric spin (the sun must actually move across the sky)
 
 **Next up**
 - [ ] **Surface-object meshes** — swap the placeholder cube/cone/rock/tetra for real tree/grass/rock/pickup art (per-world env-trait + spawn-chance gating is already in)
-- [ ] **Surface-aware LOD** — refine terrain by distance to the *surface* (not the base sphere) so high-relief worlds get fine geometry — and dense, natural scatter — near the camera
 - [ ] **Rivers & lakes** — flow-routed hydrology carving the terrain
 - [ ] **Eclipses, take two** — a gentler twilight ramp, plus a moving umbra spot, ring-shadow-on-planet and binary-star double shadows
 
@@ -403,7 +403,7 @@ Candidate features, roughly by area — the first group is what's being built ne
 - [x] Micro-relief + strata on the GPU path (full CPU parity — mesas, banded canyon walls)
 - [x] Multi-spawner surface-object scatter (instanced on the drawn surface; per-layer mesh/density/size/orientation + env-trait & spawn-chance gating; placeholder meshes today, real art pending)
 - [ ] Rivers & lakes (flow-routed hydrology carving the terrain)
-- [ ] Surface-aware LOD (refine by distance to the surface for fine geometry + dense scatter on high-relief worlds)
+- [x] Surface-aware LOD (split/merge distance measured to the lifted terrain surface, not the base sphere — fine geometry + dense scatter on high-relief worlds; coarse level-stable anchor, HUD A/B toggle)
 
 **Rendering & polish**
 - [ ] HDR pipeline + tonemapping (the bloom is currently LDR)
