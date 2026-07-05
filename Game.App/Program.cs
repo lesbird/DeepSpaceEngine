@@ -63,6 +63,7 @@ internal static class Program
     private static SceneFramebuffer _sceneFbo = null!;
     private static ColorTarget _postFbo = null!;
     private static BloomRenderer _bloom = null!;
+    private static LensFlareRenderer _lensFlare = null!;
     private static CelestialBody? _terrainTarget;
     private static bool _driving;
     private static bool _prevR;
@@ -262,6 +263,7 @@ internal static class Program
         _sceneFbo = new SceneFramebuffer(_gl);
         _postFbo = new ColorTarget(_gl);
         _bloom = new BloomRenderer(_gl);
+        _lensFlare = new LensFlareRenderer(_gl);
         var fb = _window.Window.FramebufferSize;
         _sceneFbo.Resize(fb.X, fb.Y);
         _postFbo.Resize(fb.X, fb.Y);
@@ -793,6 +795,11 @@ internal static class Program
         // scene + bloom to the screen. When disabled the composite is a straight copy (intensity 0).
         uint bloomTex = _bloom.Enabled ? _bloom.Render(_postFbo.ColorTexture) : _postFbo.ColorTexture;
         _bloom.Composite(_postFbo.ColorTexture, bloomTex);
+
+        // Lens flare for the active star, additive over the final image (inherits the composite's
+        // full-res viewport on framebuffer 0). Occlusion-faded, so a planet's limb eclipses it.
+        if (_systemManager.HasActive)
+            _lensFlare.Render(_camera, _systemManager.Active!);
 
         // 'H' hides the entire HUD — reticles and every panel — for an unobstructed view. ImGui still
         // renders (an empty frame) so its begin/end frame stays balanced.
@@ -1383,6 +1390,10 @@ internal static class Program
                 bl.Enabled = true; bl.Threshold = 0.75f; bl.Knee = 0.5f;
                 bl.Intensity = 0.6f; bl.Iterations = 5;
             }
+
+            ImGui.Separator();
+            ImGui.Checkbox("Lens flare", ref _lensFlare.Enabled);
+            ImGui.SliderFloat("Flare strength", ref _lensFlare.Intensity, 0f, 3f);
         }
 
         // Choose what the terrain/biome sliders edit: the global defaults, or a per-type override.
