@@ -917,6 +917,8 @@ out vec3 vNormal;
 out vec4 vColor;
 out vec3 vWorld;
 out float vDepth;           // seaLevel - floorHeight (m); < 0 = dry → fragment discards
+out vec3 vSurf;             // planet-local (patch-centre-relative) position — stable, precise foam-noise coords
+out float vCrest;           // swell height as a fraction of max amplitude — drives crest foam
 void main() {
     ivec2 o = ivec2(int(uTileOrigin.x), int(uTileOrigin.y)) + ivec2(int(aTexel.x), int(aTexel.y));
     vec2 hfc = texelFetch(uHeight, o, 0).rg;
@@ -934,6 +936,8 @@ void main() {
     }
     float lift = uSeaLevel - uWaterDrop + h;
     vec3 posRel = aBasePos + aDir * lift;        // base sphere + radial displacement to the swell-lifted sea
+    vSurf = posRel;
+    vCrest = clamp(h / max(1e-3, (uWA.x + uWA.y + uWA.z) * uWaveAmp), 0.0, 1.0);
     vec3 tang = grad - dot(grad, N) * N;
     vNormal = normalize(N - tang);
 
@@ -949,8 +953,25 @@ in vec3 vNormal;
 in vec4 vColor;
 in vec3 vWorld;
 in float vDepth;
+in vec3 vSurf;
+in float vCrest;
 uniform vec3 uSunDir;
+uniform float uTime;
+uniform float uFoamWidth;     // depth (m) over which shoreline foam fades from the waterline out to open water
+uniform float uFoamScale;     // foam-noise frequency (cells per metre)
+uniform float uFoamStrength;  // overall foam brightness (0 = off)
 out vec4 FragColor;
+
+// Compact 3-D value noise for the foam texture — hash-based, no texture lookups.
+float fHash(vec3 p) { p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3)); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float fNoise(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(fHash(i + vec3(0,0,0)), fHash(i + vec3(1,0,0)), f.x),
+                   mix(fHash(i + vec3(0,1,0)), fHash(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(fHash(i + vec3(0,0,1)), fHash(i + vec3(1,0,1)), f.x),
+                   mix(fHash(i + vec3(0,1,1)), fHash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+
 void main() {
     if (vDepth < 0.0) discard;                    // sea floor rises above the waterline here — bare land
     vec3 N = normalize(vNormal);
@@ -962,6 +983,21 @@ void main() {
     float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     vec3 col = vColor.rgb * (0.12 + 0.9 * diff) + vec3(1.0) * spec * 0.7;
     float a = clamp(vColor.a + fres * 0.2, 0.0, 1.0);
+
+    // Shoreline foam: a broken, animated white band pooling in the shallows (depth → 0 at the coast),
+    // plus a lighter dusting on wave crests. Two scrolling noise octaves break the band into surf.
+    if (uFoamStrength > 0.0) {
+        float shore = 1.0 - smoothstep(0.0, uFoamWidth, vDepth);
+        float n  = fNoise(vSurf * uFoamScale + vec3(0.0, uTime * 0.25, 0.0));
+        float n2 = fNoise(vSurf * uFoamScale * 2.3 - vec3(uTime * 0.2, 0.0, 0.0));
+        float ntex = 0.6 * n + 0.4 * n2;
+        float band = smoothstep(0.35, 0.9, shore * (0.55 + 0.85 * ntex));
+        float crest = smoothstep(0.7, 1.0, vCrest) * ntex;
+        float foam = clamp((band + 0.4 * crest) * uFoamStrength, 0.0, 1.0);
+        col = mix(col, vec3(1.0), foam);          // foam whitens and is opaque
+        a = max(a, foam);
+    }
+
     FragColor = vec4(col, a);
 }";
 
@@ -1479,6 +1515,12 @@ void main() {
         _gpuWaterShader.SetVector3("uWK", wk);
         _gpuWaterShader.SetVector3("uWW", new Vector3D<float>((float)(twoPi / WavePeriod[0]), (float)(twoPi / WavePeriod[1]), (float)(twoPi / WavePeriod[2])));
         _gpuWaterShader.SetVector3("uWA", WaveAmp);
+
+        // Shoreline foam: a shallow-water band a few tens of metres deep (scaled to the world's relief) with a
+        // metre-scale surf texture. Live-tunable brightness.
+        _gpuWaterShader.SetFloat("uFoamWidth", (float)(_terrain.Amplitude * 0.012 + 3.0));
+        _gpuWaterShader.SetFloat("uFoamScale", 0.15f);
+        _gpuWaterShader.SetFloat("uFoamStrength", Math.Max(0f, TerrainTuning.FoamStrength));
 
         foreach ((QuadNode node, Vector3D<float> rel) in _gpuWaterFrame)
         {

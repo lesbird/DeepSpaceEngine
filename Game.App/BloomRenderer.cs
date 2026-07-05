@@ -74,12 +74,17 @@ void main() {
 in vec2 vUV;
 uniform sampler2D uScene;
 uniform sampler2D uBloom;
+uniform sampler2D uAo;
 uniform float uIntensity;
+uniform float uAoStrength;   // 0 = SSAO off (uAo ignored)
 out vec4 FragColor;
 void main() {
     vec3 scene = texture(uScene, vUV).rgb;
     vec3 bloom = texture(uBloom, vUV).rgb;
-    FragColor = vec4(scene + bloom * uIntensity, 1.0);
+    // Ambient occlusion darkens the scene in creases; bloom is added afterward so bright emissive
+    // sources still halo out of shadowed contacts.
+    float ao = mix(1.0, texture(uAo, vUV).r, uAoStrength);
+    FragColor = vec4(scene * ao + bloom * uIntensity, 1.0);
 }";
 
     private readonly GL _gl;
@@ -158,8 +163,9 @@ void main() {
         return _a.ColorTexture;
     }
 
-    /// <summary>Draw <c>scene + intensity·bloom</c> to the screen (default framebuffer, full-res).</summary>
-    public void Composite(uint sceneColorTex, uint bloomTex)
+    /// <summary>Draw <c>scene·ao + intensity·bloom</c> to the screen (default framebuffer, full-res).
+    /// Pass <paramref name="aoStrength"/> = 0 (and any texture) to skip ambient occlusion.</summary>
+    public void Composite(uint sceneColorTex, uint bloomTex, uint aoTex = 0, float aoStrength = 0f)
     {
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         _gl.Viewport(0, 0, (uint)_fullW, (uint)_fullH);
@@ -171,9 +177,12 @@ void main() {
         _composite.Use();
         BindTex(0, sceneColorTex);
         BindTex(1, bloomTex);
+        BindTex(2, aoTex);
         _composite.SetInt("uScene", 0);
         _composite.SetInt("uBloom", 1);
+        _composite.SetInt("uAo", 2);
         _composite.SetFloat("uIntensity", Enabled ? Intensity : 0f);
+        _composite.SetFloat("uAoStrength", aoStrength);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
         _gl.BindVertexArray(0);
 

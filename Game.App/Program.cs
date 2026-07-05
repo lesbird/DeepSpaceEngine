@@ -63,6 +63,7 @@ internal static class Program
     private static SceneFramebuffer _sceneFbo = null!;
     private static ColorTarget _postFbo = null!;
     private static BloomRenderer _bloom = null!;
+    private static SsaoRenderer _ssao = null!;
     private static LensFlareRenderer _lensFlare = null!;
     private static CelestialBody? _terrainTarget;
     private static bool _driving;
@@ -201,6 +202,7 @@ internal static class Program
             _sceneFbo.Resize(size.X, size.Y);
             _postFbo.Resize(size.X, size.Y);
             _bloom.Resize(size.X, size.Y);
+            _ssao.Resize(size.X, size.Y);
             _cloudRenderer.Resize(size.X, size.Y);
         };
         _window.Run();
@@ -263,11 +265,13 @@ internal static class Program
         _sceneFbo = new SceneFramebuffer(_gl);
         _postFbo = new ColorTarget(_gl);
         _bloom = new BloomRenderer(_gl);
+        _ssao = new SsaoRenderer(_gl);
         _lensFlare = new LensFlareRenderer(_gl);
         var fb = _window.Window.FramebufferSize;
         _sceneFbo.Resize(fb.X, fb.Y);
         _postFbo.Resize(fb.X, fb.Y);
         _bloom.Resize(fb.X, fb.Y);
+        _ssao.Resize(fb.X, fb.Y);
         _cloudRenderer.Resize(fb.X, fb.Y);
         _imgui = new ImGuiController(_gl, _window.Window, _window.Input);
 
@@ -778,6 +782,8 @@ internal static class Program
         // not attached to _postFbo, so there's no read/write feedback. Near/far come from whichever
         // projection wrote the dominant geometry's depth (terrain when landed, else system).
         _sceneFbo.BlitColorTo(_postFbo.Fbo);
+        uint aoTex = 0;
+        float aoStrength = 0f;
         if (_systemManager.HasActive)
         {
             _postFbo.Bind();
@@ -789,12 +795,20 @@ internal static class Program
                 (float)_renderClock, _terrainTarget, _terrainRenderer.ActiveAmplitude, _postFbo);
             _atmosphereRenderer.Render(_camera, _systemManager.Active!, _sceneFbo.DepthTexture, near, far,
                 _terrainTarget, _terrainRenderer.ActiveAmplitude, _systemManager.SimTime, _eclipse);
+
+            // Ambient occlusion from the scene depth (same near/far the geometry wrote), applied in the
+            // composite below. Only meaningful with real geometry in frame, so it's gated to an active system.
+            if (_ssao.Enabled)
+            {
+                aoTex = _ssao.Render(_sceneFbo.DepthTexture, _camera, near, far);
+                aoStrength = _ssao.Strength;
+            }
         }
 
         // Post-process bloom: bright-pass + blur off _postFbo (scene + atmosphere), then composite
-        // scene + bloom to the screen. When disabled the composite is a straight copy (intensity 0).
+        // scene·ao + bloom to the screen. When disabled the composite is a straight copy (intensity 0).
         uint bloomTex = _bloom.Enabled ? _bloom.Render(_postFbo.ColorTexture) : _postFbo.ColorTexture;
-        _bloom.Composite(_postFbo.ColorTexture, bloomTex);
+        _bloom.Composite(_postFbo.ColorTexture, bloomTex, aoTex, aoStrength);
 
         // Lens flare for the active star, additive over the final image (inherits the composite's
         // full-res viewport on framebuffer 0). Occlusion-faded, so a planet's limb eclipses it.
@@ -1349,6 +1363,7 @@ internal static class Program
         {
             ImGui.Checkbox("Animate water (swell)", ref _terrainRenderer.AnimateWater);
             ImGui.TextDisabled("(off = perfectly flat sea)");
+            ImGui.SliderFloat("Shoreline foam", ref TerrainTuning.FoamStrength, 0f, 2f);
         }
 
         if (ImGui.CollapsingHeader("Clouds", ImGuiTreeNodeFlags.DefaultOpen))
@@ -1394,6 +1409,21 @@ internal static class Program
             ImGui.Separator();
             ImGui.Checkbox("Lens flare", ref _lensFlare.Enabled);
             ImGui.SliderFloat("Flare strength", ref _lensFlare.Intensity, 0f, 3f);
+        }
+
+        if (ImGui.CollapsingHeader("Ambient occlusion (SSAO)"))
+        {
+            SsaoRenderer ao = _ssao;
+            ImGui.TextDisabled("Experimental: bands on distant terrain at planetary scale.");
+            ImGui.Checkbox("Enable SSAO", ref ao.Enabled);
+            ImGui.SliderFloat("AO strength", ref ao.Strength, 0f, 1.5f);
+            ImGui.SliderFloat("AO radius (m)", ref ao.Radius, 0.25f, 20f);
+            ImGui.SliderFloat("AO bias (m)", ref ao.Bias, 0f, 0.5f);
+            ImGui.SliderFloat("AO contrast", ref ao.Power, 0.5f, 4f);
+            if (ImGui.Button("Reset SSAO"))
+            {
+                ao.Enabled = false; ao.Strength = 0.6f; ao.Radius = 2.0f; ao.Bias = 0.05f; ao.Power = 1.6f;
+            }
         }
 
         // Choose what the terrain/biome sliders edit: the global defaults, or a per-type override.

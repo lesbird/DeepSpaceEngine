@@ -133,4 +133,11 @@ public static class TerrainTuning
     /// <summary>How far (tangential metres around the camera's ground point) scattered surface objects spawn
     /// in. Larger = objects appear from farther out (more draw work). Relief-independent. Live (no rebuild).</summary>
     public static float ScatterRange = 1500f;
+
+    // --- Ocean water ---
+
+    /// <summary>Strength/brightness of the white shoreline foam on ocean worlds: a broken, animated band of
+    /// foam pooling in the shallows along the coast (and riding wave crests when the swell is animated);
+    /// 0 = no foam. Live (no rebuild — it's in the water shader).</summary>
+    public static float FoamStrength = 0.8f;
 }
