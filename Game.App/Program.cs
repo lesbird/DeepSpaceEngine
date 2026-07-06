@@ -88,6 +88,7 @@ internal static class Program
     private const double AirlessEnvShell = 0.05; // notional environment shell (× radius) for airless worlds
 
     private const double TerrainActivateRadii = 40.0; // switch to terrain LOD within N planet radii (~50,000 km for a small world)
+    private const double MapActivateRadii = 240.0;    // bake/keep the surface map only within N radii — above the sphere's fade band (SystemRenderer.MapFadeFarRadii) so it's resident before it eases in; distant bodies stay procedural
     private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
     private const string TuningPath = "tuning.json";
     private static string _tuningStatus = "";
@@ -685,10 +686,17 @@ internal static class Program
 
         if (_systemManager.HasActive)
         {
-            // Keep an albedo+normal surface map baked for the nearest surfaced body, so its distant
-            // sphere and its near terrain sample one source (a crater seen from orbit is the same one
-            // you land in). Re-baked only when the nearest body changes; uploaded on this thread.
+            // Keep an albedo+normal surface map baked for the nearest surfaced body you're APPROACHING, so
+            // its distant sphere and its near terrain sample one source (a crater seen from orbit is the one
+            // you land in). Gated to approach range: a body far across the system never gets a map, so the
+            // sphere renderer shows every distant body from its one consistent procedural model instead of
+            // popping one to the baked look as the 'nearest' title moves between them. Re-baked only when the
+            // approached body changes; uploaded on this thread. (The bake radius sits above the shader's
+            // cross-fade band so the map is resident before it starts easing in — see MapFadeFarRadii.)
             CelestialBody? mapBody = NearestSurfacedBody();
+            if (mapBody != null &&
+                mapBody.CurrentPosition.DistanceTo(_camera.Position) > mapBody.RadiusMeters * MapActivateRadii)
+                mapBody = null; // too far to matter — leave it (and every other distant body) procedural
             if (mapBody != null && mapBody.Seed != _mapBodyId)
             {
                 _mapBodyId = mapBody.Seed;

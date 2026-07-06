@@ -49,9 +49,11 @@ uniform float uPlanetRadiusM;
 uniform vec3  uSeedOffset;      // per-planet noise offset (variety)
 uniform float uSpecStrength;    // specular sheen (0 = matte rock)
 uniform float uSpecPower;       // specular exponent (higher = tighter highlight)
-// Baked surface map for the focused body: exact-match albedo + planet-local normal. When present it
-// replaces the procedural detail, so the distant sphere shows the same craters you land in.
-uniform float uHasMap;
+// Baked surface map for the body you're approaching: exact-match albedo + planet-local normal (same source
+// as the terrain you'll land on). Cross-faded OVER the procedural detail by uMapBlend — 0 far away (every
+// body reads from the one consistent procedural model, so none pop as the 'nearest' title moves between
+// them), easing to 1 near terrain range so the sphere resolves into the real surface without a hard switch.
+uniform float uMapBlend;
 uniform sampler2D uAlbedoMap;
 uniform sampler2D uNormalMap;
 out vec4 FragColor;
@@ -113,12 +115,7 @@ void main() {
     vec3 L = normalize(uSunCenter - vWorld);
     vec3 col = uColor;
 
-    if (uEmissive < 0.5 && uHasMap > 0.5) {
-        // Exact baked surface (same source as the terrain) — distant view matches the surface.
-        vec2 uv = dirToUv(N);
-        col = texture(uAlbedoMap, uv).rgb;
-        N = normalize(texture(uNormalMap, uv).rgb * 2.0 - 1.0);
-    } else if (uEmissive < 0.5 && uGasGiant > 0.5) {
+    if (uEmissive < 0.5 && uGasGiant > 0.5) {
         // Banded gas/ice giant: zonal cloud bands (latitude stripes) warped by turbulence so they swirl
         // rather than ring perfectly, with bright zones / dark belts, fine wind streaks, and a storm oval.
         vec3 dir = N + uSeedOffset;
@@ -130,7 +127,8 @@ void main() {
         col *= 1.0 + 0.07 * (fbm(dir * vec3(22.0, 7.0, 22.0)) * 2.0 - 1.0); // longitudinal wind streaks
         float storm = smoothstep(0.78, 0.95, fbm(dir * 4.0 + vec3(5.3, 1.1, 2.7)));
         col = mix(col, uColor * vec3(1.25, 0.8, 0.65), storm * 0.6);       // a Great-Red-Spot-ish storm
-    } else if (uEmissive < 0.5 && (uReliefAmp > 0.0 || uCraterStrength > 0.0)) {
+    } else if (uEmissive < 0.5 && (uReliefAmp > 0.0 || uCraterStrength > 0.0 || uMapBlend > 0.0)) {
+        vec3 Ngeo = N;                                               // geometric normal — the baked-map UV lookup
         vec3 dir = N + uSeedOffset;                                   // per-planet variety
         float fp = max(max(fwidth(N.x), fwidth(N.y)), fwidth(N.z));   // pixel footprint
         vec3 up = abs(N.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
@@ -144,10 +142,12 @@ void main() {
         float hB = surfH(dir + T2*eps, fp, cDummy);
         float invArc = 1.0 / (eps * uPlanetRadiusM);
         N = normalize(N - ((hA-h0)*T1 + (hB-h0)*T2) * invArc);
-        // Broad warm/cool albedo provinces + finer mottle → the tan-highland / grey-lowland read.
-        float prov = fbm(dir * 1.6 + vec3(3.1));
-        col = mix(col * vec3(0.90, 0.93, 1.03), col * vec3(1.07, 1.00, 0.88), smoothstep(0.35, 0.65, prov));
-        col *= 1.0 + 0.12 * (fbm(dir * 4.0) * 2.0 - 1.0);            // subtle large-scale mottle
+        // Broad + fine BRIGHTNESS mottle only — no hue shift. The baked terrain's regolith (RegolithAlbedo)
+        // varies in luminance, not colour; tinting warm/cool here invented a tan cast the real surface lacks,
+        // so the sphere read a different hue than the map it fades into. Keep the highland/lowland light-dark
+        // read, drop the colour.
+        col *= 1.0 + 0.10 * (fbm(dir * 1.6 + vec3(3.1)) * 2.0 - 1.0); // broad highland/lowland brightness
+        col *= 1.0 + 0.12 * (fbm(dir * 4.0) * 2.0 - 1.0);            // finer mottle
         if (uCraterStrength > 0.001) {
             col *= 1.0 - 0.45 * uCraterStrength * max(0.0, -c0);     // crater floors darker
             col *= 1.0 + 0.30 * uCraterStrength * max(0.0,  c0) / 0.28; // rims/ejecta brighter
@@ -155,6 +155,13 @@ void main() {
         if (uMariaStrength > 0.001) {
             float m = smoothstep(0.08, 0.5, fbm(dir * 2.2) * 2.0 - 1.0);
             col = mix(col, col * vec3(0.55, 0.56, 0.60), m * uMariaStrength);
+        }
+        // Ease in the baked surface (albedo + normal) over the procedural approximation as you close in, so
+        // the sphere resolves into the exact surface you'll land on with no visible switch.
+        if (uMapBlend > 0.001) {
+            vec2 uv = dirToUv(Ngeo);
+            col = mix(col, texture(uAlbedoMap, uv).rgb, uMapBlend);
+            N = normalize(mix(N, normalize(texture(uNormalMap, uv).rgb * 2.0 - 1.0), uMapBlend));
         }
     }
 
@@ -240,6 +247,12 @@ uniform vec4 uColor;
 out vec4 FragColor;
 void main() { FragColor = uColor; }";
 
+    // Distance band (in body radii) over which the baked surface map cross-fades in over the procedural
+    // sphere: fully procedural beyond Far, fully baked within Near (which sits above the terrain-activation
+    // radius, so procedural → baked → terrain overlap). Kept in sync with Program's MapActivateRadii.
+    private const double MapFadeNearRadii = 80.0;
+    private const double MapFadeFarRadii = 200.0;
+
     private readonly GL _gl;
     private readonly Shader _planetShader;
     private readonly Shader _orbitShader;
@@ -260,7 +273,7 @@ void main() { FragColor = uColor; }";
         _ring = Primitives.BuildRingAnnulus(gl, segments: 256);
 
         // A 1×1 white texture to bind to the map sampler units (uAlbedoMap/uNormalMap) when a body has no
-        // baked surface map: the samplers are unused then (uHasMap = 0) but must still reference a COMPLETE
+        // baked surface map: the samplers are unused then (uMapBlend = 0) but must still reference a COMPLETE
         // texture, or macOS GL logs "unloadable texture, using zero texture" for the empty unit.
         _dummyTex = gl.GenTexture();
         gl.BindTexture(TextureTarget.Texture2D, _dummyTex);
@@ -293,7 +306,7 @@ void main() { FragColor = uColor; }";
         _planetShader.Use();
         _planetShader.SetVector3("uSunCenter", sunRel);
         // Bind the surface map (focused body) or a complete 1×1 placeholder to the map sampler units, so the
-        // samplers always reference a valid texture even when a body draws with uHasMap = 0 (no warning).
+        // samplers always reference a valid texture even when a body draws with uMapBlend = 0 (no warning).
         uint albedoTex = map is { Ready: true } ? map.AlbedoTex : _dummyTex;
         uint normalTex = map is { Ready: true } ? map.NormalTex : _dummyTex;
         _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, albedoTex);
@@ -392,7 +405,18 @@ void main() { FragColor = uColor; }";
         _planetShader.SetVector3("uSeedOffset", sp.SeedOffset);
         _planetShader.SetFloat("uSpecStrength", sp.SpecStrength);
         _planetShader.SetFloat("uSpecPower", sp.SpecPower);
-        _planetShader.SetFloat("uHasMap", useMap ? 1f : 0f);
+        // Ease the baked map in only for the body it was baked for, and only as you close in — so distant
+        // bodies always read from the procedural model (no popping as 'nearest' moves between them) and the
+        // one you approach dissolves smoothly into its real surface.
+        float mapBlend = 0f;
+        if (useMap)
+        {
+            double dist = rel.Length;
+            double near = radius * MapFadeNearRadii, far = radius * MapFadeFarRadii;
+            double t = Math.Clamp((dist - near) / Math.Max(1.0, far - near), 0.0, 1.0);
+            mapBlend = (float)(1.0 - t * t * (3.0 - 2.0 * t)); // 1 up close, 0 far away
+        }
+        _planetShader.SetFloat("uMapBlend", mapBlend);
         _sphere.Draw();
     }
 
