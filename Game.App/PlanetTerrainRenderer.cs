@@ -981,7 +981,8 @@ void main() {
     vec3 H = normalize(L + V);
     float spec = pow(max(dot(N, H), 0.0), 90.0);  // tight sun glint
     float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    vec3 col = vColor.rgb * (0.12 + 0.9 * diff) + vec3(1.0) * spec * 0.7;
+    float lit = 0.12 + 0.9 * diff;                // day/night curve (small ambient + sun diffuse)
+    vec3 col = vColor.rgb * lit + vec3(1.0) * spec * 0.7;
     float a = clamp(vColor.a + fres * 0.2, 0.0, 1.0);
 
     // Shoreline foam: a broken, animated white band pooling in the shallows (depth → 0 at the coast),
@@ -994,7 +995,7 @@ void main() {
         float band = smoothstep(0.35, 0.9, shore * (0.55 + 0.85 * ntex));
         float crest = smoothstep(0.7, 1.0, vCrest) * ntex;
         float foam = clamp((band + 0.4 * crest) * uFoamStrength, 0.0, 1.0);
-        col = mix(col, vec3(1.0), foam);          // foam whitens and is opaque
+        col = mix(col, vec3(lit), foam);          // foam is white water — lit by the same sun so it doesn't glow at night
         a = max(a, foam);
     }
 
