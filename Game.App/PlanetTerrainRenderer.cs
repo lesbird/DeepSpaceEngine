@@ -1020,7 +1020,7 @@ void main() {
     // bakes still in flight for the old planet are discarded instead of uploaded against a stale tree.
     private readonly BlockingCollection<BuildJob> _jobQueue = new();
     private readonly ConcurrentQueue<BuildResult> _ready = new();
-    private readonly Task[] _workers;
+    private readonly Thread[] _workers;
     private int _epoch;
 
     private CelestialBody? _body;
@@ -1065,10 +1065,16 @@ void main() {
         _waterShader = new Shader(gl, WaterVertexSource, WaterFragmentSource);
 
         // Leave a core for the render/main thread; the rest bake patches. At least one worker always.
+        // These are DEDICATED background threads, not Task.Run: each blocks forever on the job queue, so
+        // running them on the ThreadPool would permanently park ProcessorCount-1 pool threads and starve
+        // every other short Task.Run (e.g. globular-cluster cloud generation) until the pool slowly grew.
         int workerCount = Math.Max(1, Environment.ProcessorCount - 1);
-        _workers = new Task[workerCount];
+        _workers = new Thread[workerCount];
         for (int i = 0; i < workerCount; i++)
-            _workers[i] = Task.Run(WorkerLoop);
+        {
+            _workers[i] = new Thread(WorkerLoop) { IsBackground = true, Name = $"TerrainBake{i}" };
+            _workers[i].Start();
+        }
     }
 
     /// <summary>Background bake loop: build a patch's vertex arrays off the render thread. Jobs whose
@@ -2355,7 +2361,10 @@ void main() {
     public void Dispose()
     {
         _jobQueue.CompleteAdding();
-        try { Task.WaitAll(_workers); } catch { /* a faulted worker must not block teardown */ }
+        // Join the bake threads so no worker touches _jobQueue after it's disposed. They're background
+        // threads, so a hung one can't keep the process alive; bound the wait so teardown never blocks.
+        foreach (Thread w in _workers)
+            try { w.Join(TimeSpan.FromSeconds(1)); } catch { /* a faulted worker must not block teardown */ }
         _jobQueue.Dispose();
         DisposeTree();
         _shader.Dispose();

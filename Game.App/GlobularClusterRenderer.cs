@@ -36,7 +36,12 @@ public sealed class GlobularClusterRenderer : IDisposable
     private const float ResolveLo = 0.012f;  // ~ radius/0.012 ≈ 4000 ly for a 50 ly cluster: resolve begins
     private const float ResolveHi = 0.040f;  // ~1250 ly: fully resolved into stars
     private const float MinSpritePx = 3f, MaxSpritePx = 48f;
-    private const int ResolveCap = 8;        // resolved star clouds for at most this many nearest clusters
+    // Resolved star clouds for at most this many nearest clusters. This caps LOOP ITERATION (not just
+    // draws), so clusters ranked beyond it are never requested/kept and stay a fuzzy sprite no matter how
+    // large they loom. Halo placement is clumpy, so a dense pocket can put well over a handful within
+    // resolve range at once — keep this generous so approaching clusters reliably resolve. Each cloud is
+    // only 1.5–5k additive points, so even a couple dozen is cheap.
+    private const int ResolveCap = 24;
 
     private const float ClusterNear = 1.0e6f;
     private const float ClusterFar = 1.0e21f;
