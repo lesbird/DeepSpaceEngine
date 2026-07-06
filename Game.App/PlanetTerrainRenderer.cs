@@ -424,7 +424,23 @@ void main() {
     // normal + a simple slope tint to validate geometry/LOD/precision; per-pixel normal/albedo tiles and
     // collision readback follow in later phases.
     private const int GpuTileGensPerFrame = 16; // budget like UploadsPerFrame, so a descent can't stall a frame
+    // SpaceEngine-style per-chunk surface tiles: a normal + a color map baked ONCE per node at generation, at a
+    // resolution DECOUPLED from (much finer than) the 16×16 vertex mesh. Sampled bilinearly in the fragment
+    // shader — so crater/detail shading is a cheap texture fetch, not a per-pixel-per-frame noise evaluation,
+    // and effective surface resolution doubles every quadtree level (crisper without bound on approach).
+    private const int SurfTileInterior = 96;                  // texels spanning a patch edge (both edges inclusive)
+    private const int SurfTileSize = SurfTileInterior + 2;    // +1 guard texel each side for seam-free bilinear
+    private const int SurfTileCapacity = 2048;                // resident surface tiles (above the ~1100 drawn-leaf peak); ~157 MB for the normal+color pair
+    // Surface tiles are far heavier to bake than height tiles (a 96² MRT pass with 3 crater-cascade taps vs a
+    // 19² pass), so they get their OWN, smaller per-frame budget (TerrainTuning.SurfaceGensPerFrame): lateral
+    // skimming can't flood a frame — patches beyond the budget draw their (resident, coarser) parent for a
+    // beat, then sharpen.
+    private int _gpuSurfBudget;
+    private bool _bakedSurf;                                  // this frame's BakedSurfaceTiles snapshot (gen + draw gate)
     private TerrainTileCache? _tileCache;
+    // One surface cache, two parallel atlases sharing its slots: primary = object-space normal, secondary =
+    // baked biome/regolith color. A node's normal and color tiles land at the same origin → one UV samples both.
+    private TerrainTileCache? _surfCache;
     private TerrainTileGenerator? _tileGen;
     private Shader? _gpuShader;
     private Shader? _gpuWaterShader;
@@ -491,12 +507,16 @@ uniform vec2 uTileOrigin;   // this patch's tile origin (texels) in the atlas
 uniform float uDetailFreq;  // detail-noise cells per metre (for the fragment detail layer)
 uniform vec3 uPatchFracBase;// fract(patchCentre * detailFreq) — integer part travels in uPatchCellBase
 uniform sampler2D uHeight;
+uniform vec2 uSurfOrigin;   // this patch's baked-normal/color tile origin (texels) in the surface atlas
+uniform float uSurfAtlasDim;// surface atlas edge (texels) — normalises uSurfOrigin + in-patch offset to UV
+uniform float uSurfInterior;// interior texels spanning a patch edge (both edges inclusive)
 out vec3 vWorld;
 out vec3 vDir;
 out vec3 vNormal;           // smooth surface normal from the height field (planet-local)
 out float vElev;            // morphed height (for albedo)
 out float vCrater;          // morphed crater value (B/A of the tile) for crater-floor/rim albedo
 out vec3 vNoiseCoord;       // planet-stable, precise fractional noise coordinate for the detail layer
+out vec2 vSurfUV;           // UV into the baked normal/color atlas (bilinear), seam-aligned to patch edges
 
 vec3 facePoint(int f, float u, float v) {
     float a = u * 2.0 - 1.0, b = v * 2.0 - 1.0;
@@ -525,6 +545,10 @@ void main() {
     vec2 g = aTexel - vec2(1.0);
     float u = mix(uRect.x, uRect.z, g.x / uGridN);
     float v = mix(uRect.y, uRect.w, g.y / uGridN);
+    // Surface-tile UV: patch fraction [0,1] → interior texel centres 1.5 .. (uSurfInterior+0.5), so the patch
+    // edges land on exact interior texel centres (seam-free bilinear between neighbours). Guard texels flank.
+    vec2 fSurf = g / uGridN;
+    vSurfUV = (uSurfOrigin + vec2(1.5) + fSurf * (uSurfInterior - 1.0)) / uSurfAtlasDim;
     vec3 tangU = normalize(facePoint(uFace, u + 0.0005, v) - facePoint(uFace, u - 0.0005, v));
     vec3 tangV = normalize(facePoint(uFace, u, v + 0.0005) - facePoint(uFace, u, v - 0.0005));
     float slopeU = (hu1 - hu0) / (2.0 * uVertexSpacing);
@@ -553,6 +577,10 @@ in vec3 vNormal;
 in float vElev;
 in float vCrater;
 in vec3 vNoiseCoord;
+in vec2 vSurfUV;
+uniform sampler2D uNormalTex;   // baked per-chunk object-space normal (×0.5+0.5), bilinear
+uniform sampler2D uColorTex;    // baked per-chunk biome/regolith albedo, bilinear
+uniform float uUseBakedNormal;  // 1 = read N + color from the baked tiles (SpaceEngine path); 0 = per-pixel (legacy)
 uniform vec3 uSunDir;
 uniform float uAmbient;
 uniform float uScale;            // relief amplitude (metres), to normalise elevation for the albedo ramp
@@ -692,15 +720,22 @@ vec3 biomeColor(vec3 dir, float elevM, float slope) {
 }
 
 void main() {
-    vec3 N = normalize(vNormal);
+    // Baked per-chunk normal (SpaceEngine path): a bilinear fetch replaces the per-pixel detail/crater noise,
+    // and carries finer form than the 16×16 mesh because it was generated at the surface tile's resolution.
+    vec3 N = uUseBakedNormal > 0.5 ? normalize(texture(uNormalTex, vSurfUV).rgb * 2.0 - 1.0) : normalize(vNormal);
     vec3 up = normalize(vDir);
     float slope = clamp(dot(N, up), 0.0, 1.0);               // 1 on flats → 0 on cliffs
-    vec3 col = biomeColor(up, vElev, slope);
+    // Baked colour tile (SpaceEngine path) replaces the per-pixel biome/regolith albedo below; when off, the
+    // per-pixel path runs as before.
+    bool baked = uUseBakedNormal > 0.5;
+    vec3 col;
+    if (baked) col = texture(uColorTex, vSurfUV).rgb;   // if/else (not ?:) so biomeColor is truly skipped
+    else       col = biomeColor(up, vElev, slope);
 
     // Airless regolith: dark dust-pooled crater floors + bright rims/ejecta (from the baked crater value),
     // then low-frequency maria provinces (darker basaltic plains that survive at coarse far LOD). Port of
     // PlanetTerrain.RegolithAlbedo; the crater geometry itself is already baked into the mesh.
-    if (uIsCratered > 0.5) {
+    if (!baked && uIsCratered > 0.5) {
         if (uCraterAlbedo > 0.0) {
             float dark   = max(0.0, -vCrater);               // 0 at rim → 1 deep floor
             float bright = max(0.0,  vCrater) / 0.28;        // 0 → 1 at the rim crest
@@ -719,7 +754,7 @@ void main() {
     // baked lineae grooves use, a touch wider than the grooves — so the crack systems read as coloured
     // arcs from orbit (where the thin relief is sub-texel) and stay registered with the geometry up close.
     // Mirrors PlanetTerrain.LineaeAlbedo.
-    if (uIsIcy > 0.5 && uCrackWeightR > 0.0) {
+    if (!baked && uIsIcy > 0.5 && uCrackWeightR > 0.0) {
         float vA = 1.0 - abs(tfFbm(up + vec3(2.7, 33.1, 8.9), uCrackFreqR, 4.0, 0.5, uSeedR));
         float vB = 1.0 - abs(tfFbm(up + vec3(19.3, 4.7, 27.7), uCrackFreqR, 4.0, 0.5, uSeedR));
         float lin = max(smoothstep(0.88, 0.97, vA), 0.7 * smoothstep(0.88, 0.97, vB));
@@ -728,7 +763,7 @@ void main() {
 
     // Desert erg tint: dune-sea provinces shifted warm/orange (deep loose sand vs paler rocky plains),
     // following the same seeded erg mask that gathers the baked dunes. Mirrors PlanetTerrain.ErgAlbedo.
-    if (uIsDesert > 0.5 && uDuneWeightR > 0.0) {
+    if (!baked && uIsDesert > 0.5 && uDuneWeightR > 0.0) {
         float erg = smoothstep(0.05, 0.40, tfFbm(up + vec3(91.7, 23.3, 55.1), uErgFreqR, 3.0, 0.5, uSeedR));
         col = mix(col, col * vec3(1.06, 0.82, 0.55), 0.5 * erg);
     }
@@ -1367,6 +1402,9 @@ void main() {
         // sized above a deep descent's drawn-leaf count (CPU mode reaches ~1100 + frontier); AllocateLayer
         // fails soft if it's ever exceeded.
         _tileCache ??= new TerrainTileCache(_gl, GridN + 3, 4096);
+        // One bilinear Rgba8 surface cache with two parallel atlases (normal + color) sharing its slots.
+        _surfCache ??= new TerrainTileCache(_gl, SurfTileSize, SurfTileCapacity,
+            InternalFormat.Rgba8, PixelFormat.Rgba, PixelType.UnsignedByte, linear: true, secondary: true);
         _tileGen ??= new TerrainTileGenerator(_gl);
         _gpuShader ??= new Shader(_gl, GpuVertexSource, GpuFragmentSource);
         _gpuWaterShader ??= new Shader(_gl, GpuWaterVertexSource, GpuWaterFragmentSource);
@@ -1380,6 +1418,8 @@ void main() {
     {
         EnsureGpuResources();
         _gpuGenBudget = GpuTileGensPerFrame;
+        _gpuSurfBudget = Math.Clamp(TerrainTuning.SurfaceGensPerFrame, 1, 64);
+        _bakedSurf = TerrainTuning.BakedSurfaceTiles; // snapshot once: gates surface gen AND the draw-readiness
 
         // Pass 1 — GENERATION: walk the tree deciding split/merge and generate any tiles needed this
         // frame (each Generate binds the cache FBO). Generation is fully separated from drawing so it can
@@ -1481,6 +1521,29 @@ void main() {
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _tileCache!.HeightTexture);
         _gpuShader.SetInt("uHeight", 0);
+        // Baked per-chunk normal atlas (bilinear) on unit 1 — the fragment reads its surface normal from here
+        // instead of evaluating detail/crater noise per pixel.
+        // Baked per-chunk surface atlases (bilinear): normal on unit 1, color on unit 2 — the fragment reads
+        // both instead of evaluating detail/crater/biome noise per pixel.
+        _gl.ActiveTexture(TextureUnit.Texture1);
+        _gl.BindTexture(TextureTarget.Texture2D, _surfCache!.HeightTexture);
+        _gpuShader.SetInt("uNormalTex", 1);
+        _gl.ActiveTexture(TextureUnit.Texture2);
+        _gl.BindTexture(TextureTarget.Texture2D, _surfCache.SecondTexture);
+        _gpuShader.SetInt("uColorTex", 2);
+        _gpuShader.SetFloat("uSurfAtlasDim", _surfCache.AtlasDim);
+        _gpuShader.SetFloat("uSurfInterior", SurfTileInterior);
+        _gl.ActiveTexture(TextureUnit.Texture0);
+        // When the baked surface is active it supersedes the per-pixel detail + orbital-relief + colour passes
+        // — zero their strengths so those (expensive) branches are skipped at uniform-false control flow.
+        _gpuShader.SetFloat("uUseBakedNormal", _bakedSurf ? 1f : 0f);
+        if (_bakedSurf)
+        {
+            _gpuShader.SetFloat("uDetailStrength", 0f);
+            _gpuShader.SetFloat("uMaterialStrength", 0f);
+            _gpuShader.SetFloat("uReliefStrength", 0f);
+            _gpuShader.SetFloat("uReliefAlbedo", 0f);
+        }
 
         LeafCount = 0;
         MinDrawnWorldSize = double.MaxValue;
@@ -1633,7 +1696,8 @@ void main() {
         {
             bool allReady = true;
             foreach (QuadNode c in node.Children)
-                if (_tileCache!.TryGetLayer(c.TileId, _renderFrame) < 0 || c.BaseVao == 0) allReady = false;
+                if (_tileCache!.TryGetLayer(c.TileId, _renderFrame) < 0 || c.BaseVao == 0
+                    || (_bakedSurf && _surfCache!.TryGetLayer(c.TileId, _renderFrame) < 0)) allReady = false;
             if (allReady)
             {
                 foreach (QuadNode c in node.Children) DrawSubtreeGpu(c, camera, in viewProj);
@@ -1650,7 +1714,8 @@ void main() {
     private void RenderPatchGpu(QuadNode node, Vector3D<float> rel, in Matrix4X4<float> viewProj, float morph)
     {
         int layer = _tileCache!.TryGetLayer(node.TileId, _renderFrame);
-        if (layer < 0 || node.BaseVao == 0) return; // not resident this frame (budget) — parent stands in
+        int nLayer = _bakedSurf ? _surfCache!.TryGetLayer(node.TileId, _renderFrame) : 0;
+        if (layer < 0 || nLayer < 0 || node.BaseVao == 0) return; // not resident this frame (budget) — parent stands in
         Matrix4X4<float> model = Matrix4X4.CreateTranslation(rel);
         _gpuShader!.SetMatrix("uMVP", model * viewProj);
         _gpuShader.SetMatrix("uModel", model);
@@ -1662,6 +1727,8 @@ void main() {
         _gpuShader.SetInt("uFace", node.Face);
         (int tox, int toy) = _tileCache.TileOrigin(layer);
         _gpuShader.SetVector2("uTileOrigin", new Vector2D<float>(tox, toy));
+        (int nox, int noy) = _surfCache!.TileOrigin(nLayer);
+        _gpuShader.SetVector2("uSurfOrigin", new Vector2D<float>(nox, noy)); // baked-normal tile origin (texels)
         SetPatchDetailBase(_gpuShader, node); // uPatchCellBase/uPatchFracBase/uVertexSpacingDir for the detail layer
         node.DrawMorph = morph;
         node.DrawnFrame = _renderFrame;
@@ -1703,16 +1770,38 @@ void main() {
         EnsureGpuResources(); // SetBody/Rebuild can reach here before the first RenderGpu created them
         if (node.BaseVao == 0) BuildBaseMesh(node);
 
-        int layer = _tileCache!.TryGetLayer(node.TileId, _renderFrame);
-        if (layer >= 0) return true;
-        if (!force && _gpuGenBudget <= 0) return false;
-        if (!force) _gpuGenBudget--;
+        int hLayer = _tileCache!.TryGetLayer(node.TileId, _renderFrame);
+        int nLayer = _bakedSurf ? _surfCache!.TryGetLayer(node.TileId, _renderFrame) : 0;
+        if (hLayer >= 0 && nLayer >= 0) return true;
 
-        layer = _tileCache.AllocateLayer(node.TileId, _renderFrame);
-        if (layer < 0) return false; // pool full of tiles needed this frame — parent stands in this frame
-        double spacing = node.WorldSize / GridN;
-        _tileGen!.Generate(_tileCache, layer, node.Face, node.U0, node.V0, node.U1, node.V1,
-            _terrain!.GpuParams(), _terrain, spacing, spacing * 2.0);
+        PlanetTerrain.GpuTerrainParams gp = _terrain!.GpuParams();
+        // Height tile at the mesh vertex spacing (for vertex displacement + collision) — the cheap pass, on
+        // the general budget. Roots (force) always bake so an ancestor is always drawable.
+        if (hLayer < 0)
+        {
+            if (!force && _gpuGenBudget <= 0) return false;
+            if (!force) _gpuGenBudget--;
+            hLayer = _tileCache.AllocateLayer(node.TileId, _renderFrame);
+            if (hLayer < 0) return false; // pool full of tiles needed this frame — parent stands in this frame
+            double spacing = node.WorldSize / GridN;
+            _tileGen!.Generate(_tileCache, hLayer, node.Face, node.U0, node.V0, node.U1, node.V1,
+                gp, _terrain, spacing, spacing * 2.0);
+        }
+        // Baked surface tile (normal + color) at the (finer) surface-tile spacing — carries crater/detail form
+        // the mesh can't, plus the biome/regolith albedo, in one MRT pass. Heavy → its OWN (smaller) budget so
+        // skimming can't flood a frame; when it's spent this node defers and draws its coarser parent. Off →
+        // skipped entirely.
+        if (_bakedSurf && nLayer < 0)
+        {
+            if (!force && _gpuSurfBudget <= 0) return false;
+            if (!force) _gpuSurfBudget--;
+            nLayer = _surfCache!.AllocateLayer(node.TileId, _renderFrame);
+            if (nLayer < 0) return false;
+            double sSurf = node.WorldSize / SurfTileInterior;
+            _tileGen!.GenerateSurface(_surfCache, nLayer, node.Face, node.U0, node.V0, node.U1, node.V1,
+                gp, _terrain, sSurf, sSurf * 2.0,
+                Math.Max(0f, TerrainTuning.CraterAlbedo), Math.Max(0f, TerrainTuning.MariaStrength));
+        }
         return true;
     }
 
@@ -1811,6 +1900,7 @@ void main() {
             node.BaseVao = node.BaseVbo = node.BaseEbo = 0;
         }
         _tileCache?.Release(node.TileId);
+        _surfCache?.Release(node.TileId);
     }
 
     /// <summary>Per-patch swell phase base for wave <paramref name="i"/>: (2π/λ)·(direction·patchCentre),
@@ -2357,6 +2447,7 @@ void main() {
         _roots = null;
         PatchCount = 0;
         _tileCache?.Clear(); // every GPU layer is now free (nodes released above)
+        _surfCache?.Clear();
     }
 
     public void Dispose()
@@ -2371,6 +2462,7 @@ void main() {
         _shader.Dispose();
         _waterShader.Dispose();
         _tileCache?.Dispose();
+        _surfCache?.Dispose();
         _tileGen?.Dispose();
         _gpuShader?.Dispose();
         _gpuWaterShader?.Dispose();

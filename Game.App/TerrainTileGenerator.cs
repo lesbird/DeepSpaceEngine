@@ -192,7 +192,11 @@ void main() {
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }";
 
-    private const string FragmentSource = @"#version 410 core
+    // The generator fragment is split into three reusable pieces so the height pass and the normal pass share
+    // the EXACT same field math (compiled into two programs): GenHeaderGlsl (uniforms) + GenFieldGlsl (noise/
+    // shape helpers) + a per-target main. Height writes RG=height/BA=crater; normal writes the object-space
+    // surface normal of the same field, but sampled at the finer surface-tile octave budget.
+    private const string GenHeaderGlsl = @"#version 410 core
 in vec2 vUV;
 uniform int uFace;
 uniform vec4 uRect;        // (u0, v0, u1, v1) of this tile on the cube face
@@ -226,8 +230,10 @@ uniform vec3 uDuneDir;                                      // prevailing-wind a
 uniform float uDuneGateFine, uDuneGateCoarse;               // dune LOD gates per band-limit
 uniform float uCrackWeight, uCrackFreq;                     // ice fracture lineae (0 weight = none)
 uniform float uCrackOctFine, uCrackOctCoarse, uCrackGateFine, uCrackGateCoarse; // lineae octaves + LOD gates
-layout(location = 0) out vec4 oHeight;
+uniform float uRadiusM;    // planet radius (m) — normal pass turns an angular texel step into a metric slope
+";
 
+    private const string GenFieldGlsl = @"
 vec3 facePoint(int f, float u, float v) {
     float a = u * 2.0 - 1.0, b = v * 2.0 - 1.0;
     vec3 p;
@@ -582,6 +588,18 @@ float shape(vec3 dir, vec3 oct, float microOct, float microGate, float duneGate,
          + uMicroWeight * micro + uStrataWeight * strata + uDuneWeight * dune + uCrackWeight * cracks;
 }
 
+// Total FINE height (m): the shape stack + baked craters + volcano, i.e. exactly what the height tile's R
+// channel holds. Used by the height main and (perturbed) by the normal main's finite difference.
+float fineHeightAt(vec3 dir) {
+    float craterF = uCraterWeight > 0.0 ? craterField(dir, uCraterFreq, uCraterOctFine, uCraterDensity) : 0.0;
+    float volcano = uVolcanoWeight > 0.0 ? volcanoField(dir, uVolcanoFreq, uVolcanoDensity).x : 0.0;
+    return uScale * (shape(dir, uOctFine, uMicroOctFine, uMicroGateFine, uDuneGateFine, uCrackOctFine, uCrackGateFine)
+                     + uCraterWeight * craterF + uVolcanoWeight * volcano);
+}
+";
+
+    private const string HeightMainGlsl = @"
+layout(location = 0) out vec4 oHeight;
 void main() {
     // Snap to the mesh vertex grid, with a 1-texel guard ring: texel t holds the height at grid fraction
     // (t-1)/GridN (GridN = uTexelN-3), so interior texel 1 = vertex 0 (u0) and texel uTexelN-2 = the last
@@ -608,14 +626,152 @@ void main() {
     oHeight = vec4(hFine, hCoarse, craterFine, craterCoarse);
 }";
 
+    private const string FragmentSource = GenHeaderGlsl + GenFieldGlsl + HeightMainGlsl;
+
+    // Extra uniforms the COLOR half of the surface pass needs (the biome/regolith albedo params) — declared
+    // separately so they append to GenHeaderGlsl without duplicating any of its field uniforms.
+    private const string ColorUniformsGlsl = @"
+uniform float uAmplitude, uSurfaceTempK, uHasLife;
+uniform vec3 uBaseColor, uLowland, uSubstrateTint, uRock, uSnow, uCliff;
+uniform float uSnowLine, uCliffThreshold, uCliffStrength;
+uniform float uMoistureFreq, uMoistureBias;
+uniform float uIsCratered, uCraterAlbedo, uMariaStrength, uMariaFreq;
+uniform float uIsIcy, uCrackFreqR, uCrackWeightR;
+uniform float uIsDesert, uErgFreqR, uDuneWeightR;
+uniform vec3 uSeedR;
+";
+
+    // Albedo helpers — a verbatim port of the render fragment's colour path (its own value-noise fbm3 + the
+    // biome/elevation/slope ramp), so the baked colour matches what the per-pixel path produced.
+    private const string ColorHelpersGlsl = @"
+float hash13(vec3 p) {
+    p = mod(p, 4096.0);
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+float vnoise3(vec3 p) {
+    vec3 c = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(c),               n100 = hash13(c + vec3(1,0,0));
+    float n010 = hash13(c + vec3(0,1,0)), n110 = hash13(c + vec3(1,1,0));
+    float n001 = hash13(c + vec3(0,0,1)), n101 = hash13(c + vec3(1,0,1));
+    float n011 = hash13(c + vec3(0,1,1)), n111 = hash13(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+}
+float fbm3(vec3 p, float freq) {
+    float s = 0.0, a = 1.0, f = freq, n = 0.0;
+    for (int i = 0; i < 4; i++) { s += a * (vnoise3(p * f) * 2.0 - 1.0); n += a; a *= 0.5; f *= 2.0; }
+    return s / n;
+}
+vec3 biomeColor(vec3 dir, float elevM, float slope) {
+    float tBase = clamp((uSurfaceTempK - 215.0) / 105.0, 0.0, 1.0);
+    float lat = abs(dir.y);
+    float elevAbove = max(0.0, elevM / uAmplitude);
+    float temp = clamp(tBase - 0.55 * pow(lat, 1.3) - 0.55 * elevAbove, 0.0, 1.0);
+    float tropics = 1.0 - smoothstep(0.0, 0.45, lat);
+    float temperateBelt = smoothstep(0.5, 0.7, lat) * (1.0 - smoothstep(0.8, 0.97, lat));
+    float rainBand = clamp(max(tropics, 0.75 * temperateBelt), 0.0, 1.0);
+    float regional = 0.5 + 0.5 * fbm3(dir + vec3(17.3, 5.9, 42.1), uMoistureFreq);
+    float moist = clamp(rainBand * (1.0 - 0.55 * elevAbove) * (0.6 + 0.8 * regional) + uMoistureBias, 0.0, 1.0);
+    vec3 temperate = uBaseColor * uLowland;
+    vec3 hot = vec3(0.80, 0.62, 0.40);
+    vec3 substrate = temp < 0.5 ? mix(vec3(0.78,0.82,0.86), temperate, temp / 0.5)
+                                : mix(temperate, hot, (temp - 0.5) / 0.5);
+    substrate = mix(substrate, uSubstrateTint, 0.45);
+    vec3 ground = substrate;
+    if (uHasLife > 0.5) {
+        vec3 aridCold = vec3(0.52,0.52,0.42), aridWarm = vec3(0.66,0.62,0.34), aridHot = hot;
+        vec3 wetCold = vec3(0.16,0.34,0.20), wetWarm = vec3(0.22,0.46,0.18), wetHot = vec3(0.10,0.40,0.14);
+        vec3 arid = temp < 0.5 ? mix(aridCold, aridWarm, temp / 0.5) : mix(aridWarm, aridHot, (temp - 0.5) / 0.5);
+        vec3 wet  = temp < 0.5 ? mix(wetCold, wetWarm, temp / 0.5)   : mix(wetWarm, wetHot, (temp - 0.5) / 0.5);
+        vec3 veg = mix(arid, wet, smoothstep(0.2, 0.8, moist));
+        float lush = smoothstep(0.12, 0.35, temp) * smoothstep(0.2, 0.55, moist);
+        ground = mix(substrate, veg, lush);
+    }
+    float t = clamp((elevM / uAmplitude + 0.3) / 1.3, 0.0, 1.0);
+    vec3 band = mix(ground, uRock, smoothstep(0.0, uSnowLine, t));
+    float coldSnow = 1.0 - smoothstep(0.06, 0.24, temp);
+    float elevSnow = smoothstep(uSnowLine, min(1.0, uSnowLine + 0.22), t);
+    band = mix(band, uSnow, clamp(max(coldSnow, elevSnow), 0.0, 1.0));
+    float steep = 1.0 - smoothstep(uCliffThreshold - 0.135, uCliffThreshold + 0.135, slope);
+    return mix(band, uCliff, steep * uCliffStrength);
+}
+";
+
+    // SURFACE pass (MRT): bakes BOTH the object-space normal (attachment0) and the biome/regolith colour
+    // (attachment1) of the SAME field, at the surface tile's (finer) octave budget, from ONE set of finite-
+    // difference height taps. Grid mapping identical to the height tile (interior texel 1..N spans the patch
+    // inclusive → seam-free bilinear). This replaces the per-pixel detail + orbital-relief + colour work.
+    private const string SurfaceMainGlsl = @"
+layout(location = 0) out vec4 oNormal;
+layout(location = 1) out vec4 oColor;
+void main() {
+    float gridN = uTexelN - 3.0;
+    float gi = min(floor(vUV.x * uTexelN), uTexelN - 1.0);
+    float gj = min(floor(vUV.y * uTexelN), uTexelN - 1.0);
+    float u = mix(uRect.x, uRect.z, (gi - 1.0) / gridN);
+    float v = mix(uRect.y, uRect.w, (gj - 1.0) / gridN);
+    vec3 dir = facePoint(uFace, u, v);
+    float du = (uRect.z - uRect.x) / gridN;
+    float dv = (uRect.w - uRect.y) / gridN;
+    vec3 dirE = facePoint(uFace, u + du, v);
+    vec3 dirN = facePoint(uFace, u, v + dv);
+    float h0 = fineHeightAt(dir);
+    float hE = fineHeightAt(dirE);
+    float hN = fineHeightAt(dirN);
+    vec3 tE = dirE - dir; float dsE = uRadiusM * length(tE); tE = normalize(tE);
+    vec3 tN = dirN - dir; float dsN = uRadiusM * length(tN); tN = normalize(tN);
+    vec3 nrm = normalize(dir - tE * ((hE - h0) / max(dsE, 1e-3)) - tN * ((hN - h0) / max(dsN, 1e-3)));
+    oNormal = vec4(nrm * 0.5 + 0.5, 1.0);
+
+    // COLOUR: verbatim port of the render fragment's albedo (biome + regolith + maria + ice lineae + erg).
+    vec3 up = dir;
+    float slope = clamp(dot(nrm, up), 0.0, 1.0);
+    float vCrater = uCraterWeight > 0.0 ? craterField(dir, uCraterFreq, uCraterOctFine, uCraterDensity) : 0.0;
+    vec3 col = biomeColor(up, h0, slope);
+    if (uIsCratered > 0.5) {
+        if (uCraterAlbedo > 0.0) {
+            float dark   = max(0.0, -vCrater);
+            float bright = max(0.0,  vCrater) / 0.28;
+            col *= 1.0 - 0.45 * uCraterAlbedo * dark;
+            col *= 1.0 + 0.30 * uCraterAlbedo * bright;
+        }
+        if (uMariaStrength > 0.0) {
+            float m = fbm3(up + vec3(23.7, 88.1, 4.3), uMariaFreq);
+            float maria = smoothstep(0.08, 0.5, m);
+            vec3 mare = vec3(col.r * 0.55, col.g * 0.56, col.b * 0.60);
+            col = mix(col, mare, maria * uMariaStrength);
+        }
+    }
+    if (uIsIcy > 0.5 && uCrackWeightR > 0.0) {
+        float vA = 1.0 - abs(tfFbm(up + vec3(2.7, 33.1, 8.9), uCrackFreqR, 4.0, 0.5, uSeedR));
+        float vB = 1.0 - abs(tfFbm(up + vec3(19.3, 4.7, 27.7), uCrackFreqR, 4.0, 0.5, uSeedR));
+        float lin = max(smoothstep(0.88, 0.97, vA), 0.7 * smoothstep(0.88, 0.97, vB));
+        col = mix(col, vec3(0.48, 0.30, 0.20), 0.55 * lin);
+    }
+    if (uIsDesert > 0.5 && uDuneWeightR > 0.0) {
+        float erg = smoothstep(0.05, 0.40, tfFbm(up + vec3(91.7, 23.3, 55.1), uErgFreqR, 3.0, 0.5, uSeedR));
+        col = mix(col, col * vec3(1.06, 0.82, 0.55), 0.5 * erg);
+    }
+    oColor = vec4(col, 1.0);
+}";
+
+    private const string SurfaceSource =
+        GenHeaderGlsl + ColorUniformsGlsl + GenFieldGlsl + FieldGlsl + ColorHelpersGlsl + SurfaceMainGlsl;
+
     private readonly GL _gl;
-    private readonly Shader _shader;
+    private readonly Shader _shader;       // height pass (RG=height, BA=crater), at the mesh vertex resolution
+    private readonly Shader _surfShader;   // surface pass (MRT normal + color), at the finer surface-tile res
     private readonly uint _emptyVao; // attributeless fullscreen-triangle draws need a bound VAO in core
 
     public TerrainTileGenerator(GL gl)
     {
         _gl = gl;
         _shader = new Shader(gl, VertexSource, FragmentSource);
+        _surfShader = new Shader(gl, VertexSource, SurfaceSource);
         _emptyVao = gl.GenVertexArray();
     }
 
@@ -626,6 +782,88 @@ void main() {
     /// counts to what each band-limit resolves (and the float-safe ceiling).
     /// </summary>
     public void Generate(TerrainTileCache cache, int layer, int face, double u0, double v0, double u1, double v1,
+        in PlanetTerrain.GpuTerrainParams p, PlanetTerrain terrain, double spacingFine, double spacingCoarse)
+    {
+        _shader.Use();
+        SetGenUniforms(_shader, face, u0, v0, u1, v1, p, terrain, spacingFine, spacingCoarse);
+        _shader.SetFloat("uTexelN", cache.TileSize);
+        RenderInto(cache, layer);
+    }
+
+    /// <summary>Bake the surface tile (MRT normal + color) for a node into <paramref name="surfCache"/> (its
+    /// primary + secondary atlases). The spacings are the surface tile's (finer) fine/coarse vertex spacings,
+    /// so the baked normal carries the crater/detail octaves the coarse mesh can't — SpaceEngine's high-res-
+    /// surface-over-coarse-mesh split. <paramref name="craterAlbedo"/>/<paramref name="mariaStrength"/> are the
+    /// live regolith sliders, baked in (they take effect as tiles regenerate).</summary>
+    public void GenerateSurface(TerrainTileCache surfCache, int layer, int face,
+        double u0, double v0, double u1, double v1,
+        in PlanetTerrain.GpuTerrainParams p, PlanetTerrain terrain, double spacingFine, double spacingCoarse,
+        float craterAlbedo, float mariaStrength)
+    {
+        _surfShader.Use();
+        SetGenUniforms(_surfShader, face, u0, v0, u1, v1, p, terrain, spacingFine, spacingCoarse);
+        _surfShader.SetFloat("uTexelN", surfCache.TileSize);
+        _surfShader.SetFloat("uRadiusM", (float)terrain.Radius);
+        SetColorUniforms(_surfShader, p, craterAlbedo, mariaStrength);
+        RenderInto(surfCache, layer);
+    }
+
+    /// <summary>Set the biome/regolith albedo uniforms for the surface pass's colour half (mirror of the
+    /// render fragment's colour uniform block, so the baked colour matches the old per-pixel look).</summary>
+    private static void SetColorUniforms(Shader sh, in PlanetTerrain.GpuTerrainParams p,
+        float craterAlbedo, float mariaStrength)
+    {
+        sh.SetVector3("uBaseColor", p.BaseColor);
+        sh.SetVector3("uSubstrateTint", p.SubstrateTint);
+        sh.SetVector3("uRock", p.Rock);
+        sh.SetVector3("uSnow", p.Snow);
+        sh.SetVector3("uCliff", p.Cliff);
+        sh.SetVector3("uLowland", p.Lowland);
+        sh.SetFloat("uSnowLine", p.SnowLine);
+        sh.SetFloat("uCliffThreshold", p.CliffThreshold);
+        sh.SetFloat("uCliffStrength", p.CliffStrength);
+        sh.SetFloat("uSurfaceTempK", p.SurfaceTempK);
+        sh.SetFloat("uHasLife", p.HasLife);
+        sh.SetFloat("uMoistureFreq", (float)p.MoistureFreq);
+        sh.SetFloat("uMoistureBias", (float)p.MoistureBias);
+        sh.SetFloat("uAmplitude", (float)Math.Max(1.0, p.Amplitude));
+        sh.SetFloat("uIsCratered", p.IsCratered);
+        sh.SetFloat("uCraterAlbedo", Math.Max(0f, craterAlbedo));
+        sh.SetFloat("uMariaStrength", Math.Max(0f, mariaStrength));
+        sh.SetFloat("uMariaFreq", (float)(p.ContinentFreq * 0.6));
+        sh.SetFloat("uIsIcy", p.IsIcy);
+        sh.SetFloat("uCrackFreqR", (float)p.CrackFreq);
+        sh.SetFloat("uCrackWeightR", (float)p.CrackWeight);
+        sh.SetFloat("uIsDesert", p.IsDesert);
+        sh.SetFloat("uErgFreqR", (float)p.ErgFreq);
+        sh.SetFloat("uDuneWeightR", (float)p.DuneWeight);
+        sh.SetVector3("uSeedR", new Vector3D<float>(
+            (p.Seed & 1023) / 1024f, ((p.Seed >> 10) & 1023) / 1024f, ((p.Seed >> 20) & 1023) / 1024f));
+    }
+
+    /// <summary>Draw the fullscreen generation pass into <paramref name="cache"/>'s <paramref name="layer"/>,
+    /// then hard-restore the scene framebuffer + viewport (generation runs inside the terrain render pass).</summary>
+    private void RenderInto(TerrainTileCache cache, int layer)
+    {
+        Span<int> prevFbo = stackalloc int[1];
+        Span<int> prevVp = stackalloc int[4];
+        _gl.GetInteger(GetPName.DrawFramebufferBinding, prevFbo);
+        _gl.GetInteger(GetPName.Viewport, prevVp);
+        bool depth = _gl.IsEnabled(EnableCap.DepthTest);
+        if (depth) _gl.Disable(EnableCap.DepthTest);
+
+        cache.BeginRender(layer); // bind the atlas FBO + clip to this tile's sub-rect
+        _gl.BindVertexArray(_emptyVao);
+        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        _gl.BindVertexArray(0);
+        cache.EndRender();        // disable scissor
+
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, (uint)prevFbo[0]);
+        _gl.Viewport(prevVp[0], prevVp[1], (uint)prevVp[2], (uint)prevVp[3]);
+        if (depth) _gl.Enable(EnableCap.DepthTest);
+    }
+
+    private static void SetGenUniforms(Shader sh, int face, double u0, double v0, double u1, double v1,
         in PlanetTerrain.GpuTerrainParams p, PlanetTerrain terrain, double spacingFine, double spacingCoarse)
     {
         var octFine = new Vector3D<float>(
@@ -653,84 +891,63 @@ void main() {
         Vector3D<double> wq0 = new Vector3D<double>(warpedC.X, warpedC.Y, warpedC.Z) * p.MountainFreq;
         double wfx = Math.Floor(wq0.X), wfy = Math.Floor(wq0.Y), wfz = Math.Floor(wq0.Z);
 
-        _shader.Use();
-        _shader.SetInt("uFace", face);
-        _shader.SetVector4("uRect", new Vector4D<float>((float)u0, (float)v0, (float)u1, (float)v1));
-        _shader.SetVector3("uSeed", SeedOffset(p.Seed));
-        _shader.SetVector3("uFreq", new Vector3D<float>((float)p.ContinentFreq, (float)p.MountainFreq, (float)p.DetailFreq));
-        _shader.SetVector3("uWeight", new Vector3D<float>((float)p.ContinentWeight, (float)p.MountainWeight, (float)p.DetailWeight));
-        _shader.SetVector3("uGain", new Vector3D<float>((float)p.ContinentGain, (float)p.MountainGain, (float)p.DetailGain));
-        _shader.SetFloat("uScale", (float)p.Scale);
-        _shader.SetVector3("uOctFine", octFine);
-        _shader.SetVector3("uOctCoarse", octCoarse);
-        _shader.SetVector3("uDetCellBase", new Vector3D<float>(WrapCell8192(dfx), WrapCell8192(dfy), WrapCell8192(dfz)));
-        _shader.SetVector3("uDetFracBase", new Vector3D<float>((float)(q0.X - dfx), (float)(q0.Y - dfy), (float)(q0.Z - dfz)));
-        _shader.SetVector3("uDetDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
-        _shader.SetVector3("uMicroCellBase", new Vector3D<float>(WrapCell8192(mfx), WrapCell8192(mfy), WrapCell8192(mfz)));
-        _shader.SetVector3("uMicroFracBase", new Vector3D<float>((float)(mq0.X - mfx), (float)(mq0.Y - mfy), (float)(mq0.Z - mfz)));
-        _shader.SetVector3("uMicroDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
-        _shader.SetVector3("uMtnCellBase", new Vector3D<float>(WrapCell8192(wfx), WrapCell8192(wfy), WrapCell8192(wfz)));
-        _shader.SetVector3("uMtnFracBase", new Vector3D<float>((float)(wq0.X - wfx), (float)(wq0.Y - wfy), (float)(wq0.Z - wfz)));
-        _shader.SetVector3("uMtnDirC", warpedC);
-        _shader.SetFloat("uTexelN", cache.TileSize);
-        _shader.SetFloat("uWarpFreq", (float)p.WarpFreq);
-        _shader.SetFloat("uWarpStrength", (float)p.WarpStrength);
-        _shader.SetFloat("uRuggedFreq", (float)p.RuggedFreq);
-        _shader.SetFloat("uRuggedLo", (float)p.RuggedLo);
-        _shader.SetFloat("uRuggedHi", (float)p.RuggedHi);
-        _shader.SetFloat("uDetailFloor", (float)p.DetailFloor);
-        _shader.SetFloat("uCraterWeight", (float)p.CraterWeight);
-        _shader.SetFloat("uCraterDensity", (float)p.CraterDensity);
-        _shader.SetFloat("uCraterFreq", (float)p.CraterFreq);
-        _shader.SetFloat("uCraterOctFine", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingFine) : 0.0));
-        _shader.SetFloat("uCraterOctCoarse", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingCoarse) : 0.0));
-        _shader.SetFloat("uVolcanoWeight", (float)p.VolcanoWeight);
-        _shader.SetFloat("uVolcanoFreq", (float)p.VolcanoFreq);
-        _shader.SetFloat("uVolcanoDensity", (float)p.VolcanoDensity);
-        _shader.SetFloat("uMicroWeight", (float)p.MicroWeight);
-        _shader.SetFloat("uMicroFreq", (float)p.MicroFreq);
-        _shader.SetFloat("uMicroGain", (float)p.MicroGain);
-        _shader.SetFloat("uMicroOctFine", (float)(p.MicroWeight > 0.0 ? terrain.OctavesForSpacing(p.MicroFreq, spacingFine, p.MaxMicroOctaves) : 0.0));
-        _shader.SetFloat("uMicroOctCoarse", (float)(p.MicroWeight > 0.0 ? terrain.OctavesForSpacing(p.MicroFreq, spacingCoarse, p.MaxMicroOctaves) : 0.0));
-        _shader.SetFloat("uMicroGateFine", (float)(p.MicroWeight > 0.0 ? terrain.LayerGateForSpacing(p.MicroFreq, spacingFine) : 0.0));
-        _shader.SetFloat("uMicroGateCoarse", (float)(p.MicroWeight > 0.0 ? terrain.LayerGateForSpacing(p.MicroFreq, spacingCoarse) : 0.0));
-        _shader.SetFloat("uStrataWeight", (float)p.StrataWeight);
-        _shader.SetFloat("uStrataFreq", (float)p.StrataFreq);
-        _shader.SetFloat("uStrataSteps", p.StrataSteps);
-        _shader.SetFloat("uStrataSharp", (float)p.StrataSharp);
-        _shader.SetFloat("uDuneWeight", (float)p.DuneWeight);
-        _shader.SetFloat("uDuneFreq", (float)p.DuneFreq);
-        _shader.SetFloat("uDuneWarpFreq", (float)p.DuneWarpFreq);
-        _shader.SetFloat("uDuneWarpAmp", (float)p.DuneWarpAmp);
-        _shader.SetFloat("uErgFreq", (float)p.ErgFreq);
-        _shader.SetVector3("uDuneDir", p.DuneDir);
-        _shader.SetFloat("uDuneGateFine", (float)(p.DuneWeight > 0.0 ? terrain.LayerGateForSpacing(p.DuneFreq, spacingFine) : 0.0));
-        _shader.SetFloat("uDuneGateCoarse", (float)(p.DuneWeight > 0.0 ? terrain.LayerGateForSpacing(p.DuneFreq, spacingCoarse) : 0.0));
-        _shader.SetFloat("uCrackWeight", (float)p.CrackWeight);
-        _shader.SetFloat("uCrackFreq", (float)p.CrackFreq);
-        _shader.SetFloat("uCrackOctFine", (float)(p.CrackWeight > 0.0 ? terrain.OctavesForSpacing(p.CrackFreq, spacingFine, 5) : 0.0));
-        _shader.SetFloat("uCrackOctCoarse", (float)(p.CrackWeight > 0.0 ? terrain.OctavesForSpacing(p.CrackFreq, spacingCoarse, 5) : 0.0));
-        _shader.SetFloat("uCrackGateFine", (float)(p.CrackWeight > 0.0 ? terrain.LayerGateForSpacing(p.CrackFreq * 8.0, spacingFine) : 0.0));
-        _shader.SetFloat("uCrackGateCoarse", (float)(p.CrackWeight > 0.0 ? terrain.LayerGateForSpacing(p.CrackFreq * 8.0, spacingCoarse) : 0.0));
-
-        // Render the noise into the tile, then restore exactly the framebuffer + viewport that were bound
-        // (the scene FBO mid-render): generation can run inside the terrain pass, so it must leave no trace.
-        Span<int> prevFbo = stackalloc int[1];
-        Span<int> prevVp = stackalloc int[4];
-        _gl.GetInteger(GetPName.DrawFramebufferBinding, prevFbo);
-        _gl.GetInteger(GetPName.Viewport, prevVp);
-        bool depth = _gl.IsEnabled(EnableCap.DepthTest);
-        if (depth) _gl.Disable(EnableCap.DepthTest);
-
-        cache.BeginRender(layer); // bind the atlas FBO + clip to this tile's sub-rect
-        _gl.BindVertexArray(_emptyVao);
-        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
-        _gl.BindVertexArray(0);
-        cache.EndRender();        // disable scissor
-
-        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, (uint)prevFbo[0]);
-        _gl.Viewport(prevVp[0], prevVp[1], (uint)prevVp[2], (uint)prevVp[3]);
-        if (depth) _gl.Enable(EnableCap.DepthTest);
+        sh.SetInt("uFace", face);
+        sh.SetVector4("uRect", new Vector4D<float>((float)u0, (float)v0, (float)u1, (float)v1));
+        sh.SetVector3("uSeed", SeedOffset(p.Seed));
+        sh.SetVector3("uFreq", new Vector3D<float>((float)p.ContinentFreq, (float)p.MountainFreq, (float)p.DetailFreq));
+        sh.SetVector3("uWeight", new Vector3D<float>((float)p.ContinentWeight, (float)p.MountainWeight, (float)p.DetailWeight));
+        sh.SetVector3("uGain", new Vector3D<float>((float)p.ContinentGain, (float)p.MountainGain, (float)p.DetailGain));
+        sh.SetFloat("uScale", (float)p.Scale);
+        sh.SetVector3("uOctFine", octFine);
+        sh.SetVector3("uOctCoarse", octCoarse);
+        sh.SetVector3("uDetCellBase", new Vector3D<float>(WrapCell8192(dfx), WrapCell8192(dfy), WrapCell8192(dfz)));
+        sh.SetVector3("uDetFracBase", new Vector3D<float>((float)(q0.X - dfx), (float)(q0.Y - dfy), (float)(q0.Z - dfz)));
+        sh.SetVector3("uDetDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
+        sh.SetVector3("uMicroCellBase", new Vector3D<float>(WrapCell8192(mfx), WrapCell8192(mfy), WrapCell8192(mfz)));
+        sh.SetVector3("uMicroFracBase", new Vector3D<float>((float)(mq0.X - mfx), (float)(mq0.Y - mfy), (float)(mq0.Z - mfz)));
+        sh.SetVector3("uMicroDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
+        sh.SetVector3("uMtnCellBase", new Vector3D<float>(WrapCell8192(wfx), WrapCell8192(wfy), WrapCell8192(wfz)));
+        sh.SetVector3("uMtnFracBase", new Vector3D<float>((float)(wq0.X - wfx), (float)(wq0.Y - wfy), (float)(wq0.Z - wfz)));
+        sh.SetVector3("uMtnDirC", warpedC);
+        sh.SetFloat("uWarpFreq", (float)p.WarpFreq);
+        sh.SetFloat("uWarpStrength", (float)p.WarpStrength);
+        sh.SetFloat("uRuggedFreq", (float)p.RuggedFreq);
+        sh.SetFloat("uRuggedLo", (float)p.RuggedLo);
+        sh.SetFloat("uRuggedHi", (float)p.RuggedHi);
+        sh.SetFloat("uDetailFloor", (float)p.DetailFloor);
+        sh.SetFloat("uCraterWeight", (float)p.CraterWeight);
+        sh.SetFloat("uCraterDensity", (float)p.CraterDensity);
+        sh.SetFloat("uCraterFreq", (float)p.CraterFreq);
+        sh.SetFloat("uCraterOctFine", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingFine) : 0.0));
+        sh.SetFloat("uCraterOctCoarse", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(spacingCoarse) : 0.0));
+        sh.SetFloat("uVolcanoWeight", (float)p.VolcanoWeight);
+        sh.SetFloat("uVolcanoFreq", (float)p.VolcanoFreq);
+        sh.SetFloat("uVolcanoDensity", (float)p.VolcanoDensity);
+        sh.SetFloat("uMicroWeight", (float)p.MicroWeight);
+        sh.SetFloat("uMicroFreq", (float)p.MicroFreq);
+        sh.SetFloat("uMicroGain", (float)p.MicroGain);
+        sh.SetFloat("uMicroOctFine", (float)(p.MicroWeight > 0.0 ? terrain.OctavesForSpacing(p.MicroFreq, spacingFine, p.MaxMicroOctaves) : 0.0));
+        sh.SetFloat("uMicroOctCoarse", (float)(p.MicroWeight > 0.0 ? terrain.OctavesForSpacing(p.MicroFreq, spacingCoarse, p.MaxMicroOctaves) : 0.0));
+        sh.SetFloat("uMicroGateFine", (float)(p.MicroWeight > 0.0 ? terrain.LayerGateForSpacing(p.MicroFreq, spacingFine) : 0.0));
+        sh.SetFloat("uMicroGateCoarse", (float)(p.MicroWeight > 0.0 ? terrain.LayerGateForSpacing(p.MicroFreq, spacingCoarse) : 0.0));
+        sh.SetFloat("uStrataWeight", (float)p.StrataWeight);
+        sh.SetFloat("uStrataFreq", (float)p.StrataFreq);
+        sh.SetFloat("uStrataSteps", p.StrataSteps);
+        sh.SetFloat("uStrataSharp", (float)p.StrataSharp);
+        sh.SetFloat("uDuneWeight", (float)p.DuneWeight);
+        sh.SetFloat("uDuneFreq", (float)p.DuneFreq);
+        sh.SetFloat("uDuneWarpFreq", (float)p.DuneWarpFreq);
+        sh.SetFloat("uDuneWarpAmp", (float)p.DuneWarpAmp);
+        sh.SetFloat("uErgFreq", (float)p.ErgFreq);
+        sh.SetVector3("uDuneDir", p.DuneDir);
+        sh.SetFloat("uDuneGateFine", (float)(p.DuneWeight > 0.0 ? terrain.LayerGateForSpacing(p.DuneFreq, spacingFine) : 0.0));
+        sh.SetFloat("uDuneGateCoarse", (float)(p.DuneWeight > 0.0 ? terrain.LayerGateForSpacing(p.DuneFreq, spacingCoarse) : 0.0));
+        sh.SetFloat("uCrackWeight", (float)p.CrackWeight);
+        sh.SetFloat("uCrackFreq", (float)p.CrackFreq);
+        sh.SetFloat("uCrackOctFine", (float)(p.CrackWeight > 0.0 ? terrain.OctavesForSpacing(p.CrackFreq, spacingFine, 5) : 0.0));
+        sh.SetFloat("uCrackOctCoarse", (float)(p.CrackWeight > 0.0 ? terrain.OctavesForSpacing(p.CrackFreq, spacingCoarse, 5) : 0.0));
+        sh.SetFloat("uCrackGateFine", (float)(p.CrackWeight > 0.0 ? terrain.LayerGateForSpacing(p.CrackFreq * 8.0, spacingFine) : 0.0));
+        sh.SetFloat("uCrackGateCoarse", (float)(p.CrackWeight > 0.0 ? terrain.LayerGateForSpacing(p.CrackFreq * 8.0, spacingCoarse) : 0.0));
     }
 
     /// <summary>Octave count for a band-limit, clamped to both the LOD budget and the float-safe ceiling
@@ -786,5 +1003,6 @@ void main() {
     {
         _gl.DeleteVertexArray(_emptyVao);
         _shader.Dispose();
+        _surfShader.Dispose();
     }
 }

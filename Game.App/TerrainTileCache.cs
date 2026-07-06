@@ -21,44 +21,70 @@ public sealed class TerrainTileCache : IDisposable
     private readonly int _tileSize;  // T: texels per tile edge (= terrain vertex grid resolution)
     private readonly int _capacity;  // number of slots (max resident tiles)
     private readonly int _perRow;    // tiles per atlas row
-    private readonly uint _atlas;    // 2D RGBA32F atlas, (_perRow·T)²
-    private readonly uint _fbo;      // FBO with the atlas attached (complete) — generation renders into it
+    private readonly uint _atlas;    // 2D atlas, (_perRow·T)², format per ctor
+    private readonly uint _fbo;      // FBO — the atlas at attachment0 (+ the parallel atlas at attachment1)
+    private readonly uint _atlas2;   // optional parallel atlas sharing this cache's slots + FBO (0 = none)
 
     private readonly Stack<int> _free = new();
     private readonly Dictionary<long, int> _slotOf = new();
     private readonly Dictionary<long, long> _usedFrame = new();
     private readonly Dictionary<int, long> _keyOfSlot = new();
 
-    public TerrainTileCache(GL gl, int tileSize, int capacity)
+    /// <summary>A single-channel-set atlas: the height cache is <c>Rgba32f</c> + <c>Nearest</c> (each vertex
+    /// fetches its own texel 1:1); the surface cache is <c>Rgba8</c> + <c>Linear</c> (bilinear across a higher-
+    /// resolution baked tile). With <paramref name="secondary"/> the cache owns a SECOND atlas of the same
+    /// geometry sharing one slot allocator — so one node's normal and color tiles land at the same origin and
+    /// a single UV samples both. Same slot allocator either way.</summary>
+    public TerrainTileCache(GL gl, int tileSize, int capacity,
+        InternalFormat internalFormat = InternalFormat.Rgba32f, PixelFormat pixelFormat = PixelFormat.Rgba,
+        PixelType pixelType = PixelType.Float, bool linear = false, bool secondary = false)
     {
         _gl = gl;
         _tileSize = tileSize;
         _capacity = capacity;
         _perRow = (int)Math.Ceiling(Math.Sqrt(capacity));
         int dim = _perRow * tileSize;
+        int filter = linear ? (int)GLEnum.Linear : (int)GLEnum.Nearest;
 
-        _atlas = gl.GenTexture();
-        gl.BindTexture(TextureTarget.Texture2D, _atlas);
-        unsafe
+        uint MakeAtlas()
         {
-            gl.TexImage2D(TextureTarget.Texture2D, 0, (int)InternalFormat.Rgba32f,
-                (uint)dim, (uint)dim, 0, PixelFormat.Rgba, PixelType.Float, null);
+            uint tex = gl.GenTexture();
+            gl.BindTexture(TextureTarget.Texture2D, tex);
+            unsafe
+            {
+                gl.TexImage2D(TextureTarget.Texture2D, 0, (int)internalFormat,
+                    (uint)dim, (uint)dim, 0, pixelFormat, pixelType, null);
+            }
+            gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, filter);
+            gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, filter);
+            gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+            gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+            gl.BindTexture(TextureTarget.Texture2D, 0);
+            return tex;
         }
-        // Nearest: each vertex reads its own texel 1:1 (no blending across the height grid).
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Nearest);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Nearest);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
-        gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
-        gl.BindTexture(TextureTarget.Texture2D, 0);
+        _atlas = MakeAtlas();
+        if (secondary) _atlas2 = MakeAtlas();
 
+        // One FBO: primary atlas at attachment0, the optional parallel atlas at attachment1, so a single MRT
+        // generation pass writes both (e.g. normal + color) from shared work.
         _fbo = gl.GenFramebuffer();
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
         gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
             TextureTarget.Texture2D, _atlas, 0);
+        if (_atlas2 != 0)
+            gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+                TextureTarget.Texture2D, _atlas2, 0);
         gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
 
         for (int i = capacity - 1; i >= 0; i--) _free.Push(i);
     }
+
+    /// <summary>The parallel (secondary) atlas texture, or 0 if this cache has none.</summary>
+    public uint SecondTexture => _atlas2;
+
+    /// <summary>Atlas edge in texels (<c>_perRow·TileSize</c>) — the divisor turning a texel origin into the
+    /// normalised UV the terrain shader samples the bilinear (normal/color) atlases with.</summary>
+    public float AtlasDim => _perRow * _tileSize;
 
     /// <summary>Texels per tile edge.</summary>
     public int TileSize => _tileSize;
@@ -114,10 +140,15 @@ public sealed class TerrainTileCache : IDisposable
     /// <summary>Bind the atlas FBO and clip the viewport/scissor to <paramref name="slot"/>'s sub-rect, so
     /// the generation fullscreen pass writes only that tile. The caller restores its framebuffer/viewport
     /// (and should disable scissor) afterwards via <see cref="EndRender"/>.</summary>
-    public void BeginRender(int slot)
+    public unsafe void BeginRender(int slot)
     {
         (int x, int y) = TileOrigin(slot);
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
+        if (_atlas2 != 0)
+        {
+            Span<GLEnum> bufs = stackalloc GLEnum[] { GLEnum.ColorAttachment0, GLEnum.ColorAttachment1 };
+            fixed (GLEnum* p = bufs) _gl.DrawBuffers(2, p);
+        }
         _gl.Viewport(x, y, (uint)_tileSize, (uint)_tileSize);
         _gl.Scissor(x, y, (uint)_tileSize, (uint)_tileSize);
         _gl.Enable(EnableCap.ScissorTest);
@@ -159,5 +190,6 @@ public sealed class TerrainTileCache : IDisposable
     {
         _gl.DeleteFramebuffer(_fbo);
         _gl.DeleteTexture(_atlas);
+        if (_atlas2 != 0) _gl.DeleteTexture(_atlas2);
     }
 }

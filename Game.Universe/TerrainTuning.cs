@@ -21,6 +21,18 @@ public static class TerrainTuning
     /// </summary>
     public static bool GpuTerrain = true;
 
+    /// <summary>SpaceEngine-style per-chunk baked <b>surface tiles</b>: each quadtree node bakes a high-res
+    /// object-space normal (and, later, colour) map once at generation, and the fragment shader reads its
+    /// normal from that bilinear tile instead of evaluating detail/crater noise per pixel every frame. Detail
+    /// then sharpens without bound as nodes split (the tile resolution is decoupled from the 16×16 mesh), at a
+    /// flat per-frame cost. Live A/B toggle: off falls back to the per-pixel detail + orbital-relief path.</summary>
+    public static bool BakedSurfaceTiles = true;
+
+    /// <summary>Per-frame budget of baked <b>surface</b> tiles (normal+color MRT bakes) — the heavy generation.
+    /// Lower = steadier FPS while skimming/descending (patches beyond the budget draw their coarser parent for
+    /// a beat, then sharpen); higher = the surface resolves faster during motion but heavier frames. Live.</summary>
+    public static int SurfaceGensPerFrame = 8;
+
     /// <summary>Scales overall relief height (and <see cref="PlanetTerrain.Amplitude"/> with it).</summary>
     public static float ReliefScale = 1.0f;
 

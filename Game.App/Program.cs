@@ -1448,6 +1448,9 @@ internal static class Program
         // GPU tile-generation terrain path (default; uncheck = the CPU worker-pool bake fallback). Toggling
         // rebuilds the active terrain in the chosen mode so the two can be A/B-compared.
         if (ImGui.Checkbox("GPU terrain (default; uncheck for CPU)", ref TerrainTuning.GpuTerrain)) terrainDirty = true;
+        ImGui.Checkbox("Baked surface tiles (SpaceEngine normals; uncheck for per-pixel)", ref TerrainTuning.BakedSurfaceTiles);
+        if (TerrainTuning.BakedSurfaceTiles)
+            ImGui.SliderInt("Surface bakes/frame", ref TerrainTuning.SurfaceGensPerFrame, 1, 32);
 
         // Bind each control to the override profile when enabled, else the global default.
         if (ImGui.CollapsingHeader("Terrain", ImGuiTreeNodeFlags.DefaultOpen))

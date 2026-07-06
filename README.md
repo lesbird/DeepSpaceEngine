@@ -27,7 +27,14 @@ interstellar flight down to standing on a planet. See the full design in
 > valley detail** (slope-damped, so valley floors carve smooth while roughness rides the ridges), and
 > a per-pixel **orbital macro-relief** that shades the *same* mountain and crater field the tiles bake:
 > the ranges and craters you see from space are the ones you land on, and they fade out seamlessly as
-> the real geometry resolves on descent. Planets carry **real volumetric atmospheres** — a
+> the real geometry resolves on descent. Near-surface detail now comes from **per-chunk baked surface
+> tiles** (SpaceEngine-style, on by default): each quadtree node bakes its own **high-resolution normal
+> + colour** map once at generation — at a resolution *decoupled from* the 16×16 mesh — and the shader
+> reads them with a single bilinear fetch instead of evaluating detail/crater/biome noise per pixel every
+> frame. Detail then **keeps sharpening without bound as you approach** (effective resolution doubles every
+> quadtree level) at a **flat per-frame cost**, so craters that used to blur on the way down now hold crisp
+> lit rims and shadowed floors all the way in. The heavy bakes ride their own throttled per-frame budget so
+> skimming stays smooth, and a live toggle A/Bs the baked path against the old per-pixel one. Planets carry **real volumetric atmospheres** — a
 > fullscreen pass ray-marches Rayleigh + Mie
 > scattering, so the sky glows on the limb from space and turns blue overhead / hazy at the
 > horizon / red toward the terminator on the surface. The atmosphere's **colour and thickness now
@@ -292,7 +299,9 @@ regenerate the field on release), the **atmosphere** (an on/off
 toggle, plus sun intensity, exposure, Rayleigh/Mie strength, haze anisotropy, shell height —
 and a *Debug: transmittance* toggle that shows the ray-march geometry), **terrain relief**
 (relief scale, mountain bias, feature frequency), **surface detail** (LOD distance — how aggressively
-the terrain subdivides on approach — plus detail-normal strength/fineness/range and material breakup),
+the terrain subdivides on approach — the **baked surface tiles** toggle (SpaceEngine per-chunk normal+colour
+maps vs the legacy per-pixel path) with a **surface bakes/frame** budget for the FPS/sharpen-latency trade,
+plus detail-normal strength/fineness/range and material breakup),
 **surface objects** (the up-close scatter — a live add/remove list of spawner layers, each with its own
 mesh, density, size range, orientation, required environment traits, per-world spawn chance and an
 optional **altitude band** that keeps a layer out of the oceans and off the high peaks),
@@ -377,6 +386,7 @@ names, never geometry.
 Candidate features, roughly by area — the first group is what's being built next.
 
 **Recently shipped**
+- [x] **SpaceEngine-style baked surface tiles** — near-surface detail no longer comes from per-pixel detail/crater noise but from **per-chunk baked normal + colour tiles**: each quadtree node bakes a high-res object-space normal and biome/regolith albedo once at generation (one MRT pass), at a resolution decoupled from the 16×16 mesh, and the shader reads them with a bilinear fetch. Detail sharpens without bound as chunks split (effective resolution doubles per LOD level) at a flat per-frame cost, so craters hold crisp form all the way in instead of blurring in the approach corridor. The heavy bakes ride a throttled, live-tunable per-frame budget (steady FPS while skimming); a HUD toggle A/Bs against the legacy per-pixel path
 - [x] **Universe of galaxies** — a galaxy lattice above the star field; fly out and other galaxies resolve point → spiral/elliptical impostor (bulge + dust lanes) → volumetric star cloud → real streamed stars on entry. Stars confined to galaxy interiors; per-galaxy black hole + nebulae; ~100 Mly/s top speed + travel-to-galaxy list; LOD knobs in `tuning.json`
 - [x] **Globular clusters** — halo clusters that read as a fuzzy star from thousands of ly out (HUD `GC` reticle) and resolve into a dense ball of **real, visitable stars** (injected into the catalog; each spawns a system), with a seamless cloud→catalog hand-off
 - [x] **Smoother in-galaxy starfield** — per-block density sampling + a temporal block fade-in, so streamed stars flow in instead of arriving in chunks
