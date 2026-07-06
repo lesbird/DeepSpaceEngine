@@ -105,6 +105,10 @@ uniform vec4 uRect;         // (u0,v0,u1,v1) of this patch on the face
 uniform float uGridN;
 uniform float uVertexSpacing;
 uniform float uHashSalt;    // per-spawner decorrelation offset
+uniform float uTime;        // seconds, for wind sway
+uniform float uSway;        // 1 for foliage (canopy drifts), 0 for rock/other
+uniform float uFadeStart;   // camera distance (m) where density starts thinning
+uniform float uFadeEnd;     // camera distance (m) where the last objects are gone
 out vec3 vWorld;
 out float vKeep;
 out vec3 vCol;      // per-vertex base colour
@@ -131,6 +135,10 @@ void main() {
 
     float keep = step(hash(aTexel, 0.0), uThin);  // spawn/skip roll
     keep *= step(uMinAlt, h) * step(h, uMaxAlt);  // altitude band: drop oceans (below min) / peaks (above max)
+    // Distance LOD: stochastically drop instances as they near the scatter cutoff, so the field THINS toward
+    // the horizon and is empty before the terrain leaf disappears — no hard wall, no pop as leaves swap out.
+    float distFade = 1.0 - smoothstep(uFadeStart, uFadeEnd, length(base));
+    keep *= step(hash(aTexel, 71.9), distFade);
     float sizeT = hash(aTexel, 7.31);             // independent size roll → variety
     vKeep = keep;
     float s = mix(uMinSize, uMaxSize, sizeT) * keep; // random size in [min,max]; culled sites collapse to 0
@@ -161,8 +169,22 @@ void main() {
     vec3 r2 = right * c + fwd * sn;
     vec3 f2 = -right * sn + fwd * c;
 
-    // aCorner.y in [-0.5,0.5] → +0.5 puts the base on the surface and grows the object up along 'up'.
-    vec3 local = r2 * aCorner.x + up * (aCorner.y + 0.5) + f2 * aCorner.z;
+    // Per-instance non-uniform scale → each object a distinct silhouette from the one shared mesh. Y scales
+    // around the BASE (height-above-base) so it stays planted; X/Z around the mesh axis (rock centre / trunk).
+    vec3 nscale = vec3(0.75 + 0.50 * hash(aTexel, 31.2),
+                       0.80 + 0.55 * hash(aTexel, 41.7),
+                       0.75 + 0.50 * hash(aTexel, 53.9));
+    float hAbove = (aCorner.y + 0.5) * nscale.y;    // 0 at base -> grows up
+
+    // Wind sway (foliage only): amplitude ~ height² so the trunk base holds and the canopy drifts; a
+    // per-instance phase keeps a stand from swaying in lockstep.
+    float amp = uSway * hAbove * hAbove * 0.045;
+    float ph  = hash(aTexel, 61.3) * 6.2831853;
+    vec2 wind = vec2(sin(uTime * 1.3 + ph), sin(uTime * 1.7 + ph * 1.4)) * amp;
+
+    // aCorner base (y=-0.5) sits on the surface; the object grows up 'up', sways in the r2/f2 tangent plane.
+    vec3 local = r2 * (aCorner.x * nscale.x) + up * hAbove + f2 * (aCorner.z * nscale.z)
+               + r2 * wind.x + f2 * wind.y;
     vec3 world = base + local * s;
     vWorld = world;
     vCol = aColor;
@@ -243,6 +265,11 @@ void main() {
         _gl.BindTexture(TextureTarget.Texture2D, heightTex);
         _shader.SetInt("uHeight", 0);
         _shader.SetVector3("uGroundTint", target.SurfaceAlbedo); // this world's average surface colour
+        _shader.SetFloat("uTime", time);                         // wind-sway clock
+        // Thin the field out over the last stretch before the terrain's scatter cutoff so it fades into the
+        // distance instead of ending at a wall (kept in sync with TerrainTuning.ScatterRange's leaf gate).
+        _shader.SetFloat("uFadeStart", TerrainTuning.ScatterRange * 0.55f);
+        _shader.SetFloat("uFadeEnd", TerrainTuning.ScatterRange * 0.90f);
 
         foreach (Spawner sp in Spawners)
         {
@@ -253,6 +280,7 @@ void main() {
             // green; pickups stay their bright signal colour. (Keyed off the debug mesh ids for now.)
             float groundBlend = sp.MeshId switch { 2 => 0.40f, 0 => 0.30f, 3 => 0.0f, _ => 0.14f };
             _shader.SetFloat("uGroundBlend", groundBlend);
+            _shader.SetFloat("uSway", (sp.MeshId == 1 || sp.MeshId == 4) ? 1f : 0f); // foliage sways, rocks don't
 
             float lo = Math.Max(0.1f, Math.Min(sp.MinSize, sp.MaxSize));
             float hi = Math.Max(lo, sp.MaxSize);
