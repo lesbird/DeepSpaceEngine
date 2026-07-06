@@ -228,8 +228,6 @@ uniform float uCrackWeight, uCrackFreq;                     // ice fracture line
 uniform float uCrackOctFine, uCrackOctCoarse, uCrackGateFine, uCrackGateCoarse; // lineae octaves + LOD gates
 layout(location = 0) out vec4 oHeight;
 
-const int MaxOct = 32;
-
 vec3 facePoint(int f, float u, float v) {
     float a = u * 2.0 - 1.0, b = v * 2.0 - 1.0;
     vec3 p;
@@ -269,8 +267,7 @@ float fbm(vec3 dir, float freq, float oct, float gain) {
     int full = int(floor(oct));
     float frac = oct - float(full);
     float sum = 0.0, amp = 1.0, f = freq, norm = 0.0;
-    for (int i = 0; i < MaxOct; i++) {
-        if (i >= full) break;
+    for (int i = 0; i < full; i++) {   // dynamic bound (full is uniform-derived) so Metal can't unroll
         sum += amp * vnoise(dir * f); norm += amp; amp *= gain; f *= 2.0;
     }
     if (frac > 0.0) { sum += amp * frac * vnoise(dir * f); norm += amp * frac; }
@@ -308,8 +305,7 @@ float erodedFbm(vec3 dir, float freq, float oct, float gain) {
     float frac = oct - float(full);
     float sum = 0.0, amp = 1.0, f = freq, norm = 0.0;
     vec3 gradSum = vec3(0.0);
-    for (int i = 0; i < MaxOct; i++) {
-        if (i >= full) break;
+    for (int i = 0; i < full; i++) {   // dynamic bound (full is uniform-derived) so Metal can't unroll
         vec4 ng = vnoiseD(dir * f);
         gradSum += ng.yzw;
         float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
@@ -361,8 +357,7 @@ float erodedFbmSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
     float frac = oct - float(full);
     float sum = 0.0, amp = 1.0, norm = 0.0;
     vec3 cb = cellBase, nc = ncBase, gradSum = vec3(0.0);
-    for (int i = 0; i < MaxOct; i++) {
-        if (i >= full) break;
+    for (int i = 0; i < full; i++) {   // dynamic bound (full is uniform-derived) so Metal can't unroll
         vec4 ng = vnoiseDSplit(cb, nc);
         gradSum += ng.yzw;
         float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
@@ -398,8 +393,7 @@ float fbmSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
     float frac = oct - float(full);
     float sum = 0.0, amp = 1.0, norm = 0.0;
     vec3 cb = cellBase, nc = ncBase;
-    for (int i = 0; i < MaxOct; i++) {
-        if (i >= full) break;
+    for (int i = 0; i < full; i++) {   // dynamic bound (full is uniform-derived) so Metal can't unroll
         sum += amp * vnoiseSplit(cb, nc); norm += amp;
         amp *= gain; cb = mod(cb * 2.0, 8192.0); nc *= 2.0;
     }
@@ -415,8 +409,7 @@ float ridgedSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
     float frac = oct - float(full);
     float sum = 0.0, amp = 0.5, prev = 1.0, norm = 0.0;
     vec3 cb = cellBase, nc = ncBase;
-    for (int i = 0; i < MaxOct; i++) {
-        if (i >= full) break;
+    for (int i = 0; i < full; i++) {   // dynamic bound (full is uniform-derived) so Metal can't unroll
         float n = 1.0 - abs(vnoiseSplit(cb, nc)); n *= n; n *= prev;
         sum += n * amp; norm += amp; prev = n; amp *= gain;
         cb = mod(cb * 2.0, 8192.0); nc *= 2.0;
@@ -431,8 +424,7 @@ float ridged(vec3 dir, float freq, float oct, float gain) {
     int full = int(floor(oct));
     float frac = oct - float(full);
     float sum = 0.0, amp = 0.5, f = freq, prev = 1.0, norm = 0.0;
-    for (int i = 0; i < MaxOct; i++) {
-        if (i >= full) break;
+    for (int i = 0; i < full; i++) {   // dynamic bound (full is uniform-derived) so Metal can't unroll
         float n = 1.0 - abs(vnoise(dir * f)); n *= n; n *= prev;
         sum += n * amp; norm += amp; prev = n; amp *= gain; f *= 2.0;
     }
@@ -453,15 +445,21 @@ vec3 domainWarp(vec3 dir) {
     return vec3(wx, wy, wz) * uWarpStrength;
 }
 
-// Impact-crater cascade in ≈[-1, rim]: 10 size classes of a 3×3×3 cellular bowl+rim field (one crater
-// per cell, combined by deepest-bowl / highest-rim), the top class faded in by octCount's fraction so the
-// craters geomorph as the tile resolves finer. Normalised by the FULL cascade weight (so a coarse tile
-// reads a shallow basin and a deep tile the full pit), matching the CPU CraterField.
+// Impact-crater cascade in ≈[-1, rim]: up to 15 size classes of a 3×3×3 cellular bowl+rim field (one
+// crater per cell, combined by deepest-bowl / highest-rim), the top class faded in by octCount's fraction
+// so the craters geomorph as the tile resolves finer. Normalised by the FULL cascade weight (so a coarse
+// tile reads a shallow basin and a deep tile the full pit), matching the CPU CraterField.
+//
+// The loop runs a DYNAMIC bound ceil(octCount), NOT the constant 15: this cellular 3×3×3 body is the
+// heaviest per-texel work in the whole generator, and unrolling 15 copies of it (on top of the split-noise
+// layers) overflows Apple's GLSL→Metal shader compiler and crashes the GPU process. A uniform-derived bound
+// can't be unrolled, so the shader stays small AND only the octaves this tile actually resolves run.
 float craterField(vec3 dir, float baseFreq, float octCount, float density) {
     if (octCount <= 0.0) return 0.0;
-    const float wnorm = 2.6094;  // Σ_{o=0..9} 0.62^o
+    const float wnorm = 2.6296;  // Σ_{o=0..14} 0.62^o
     float sum = 0.0, freq = baseFreq, weight = 1.0;
-    for (int o = 0; o < 10; o++) {
+    int maxo = int(min(15.0, ceil(octCount)));
+    for (int o = 0; o < maxo; o++) {
         float ofade = clamp(octCount - float(o), 0.0, 1.0);
         if (ofade > 0.0) {
             vec3 p = dir * freq;

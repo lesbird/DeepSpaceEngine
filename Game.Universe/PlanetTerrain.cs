@@ -124,7 +124,12 @@ public sealed class PlanetTerrain
     // a real airless body, where craters pepper every scale). Finer octaves are shallower (depth ∝
     // diameter), and the weighted-average normalisation keeps the field in [-1, rim] so the analytic
     // Amplitude bound is unchanged.
-    private const int CraterOctaves = 10;
+    // 15 size classes (was 10): with the seeded base ~14-27 cells and lacunarity 1.9, the top class stays
+    // under the float wall, so craters now cascade from big basins down to ~180m pits (was ~4.5km) as real
+    // baked geometry — the sub-metre grain inside them comes from the split-coord detail/micro layers. The
+    // octave COUNT that samples is float-safe-clamped (CraterOctavesForSpacing) and the generator loops a
+    // DYNAMIC bound (not the constant 15) so the Metal shader compiler doesn't unroll it into a crash.
+    private const int CraterOctaves = 15;
     private const double CraterLacunarity = 1.9;
     private const double CraterDepthFalloff = 0.62; // per-octave weight: smaller craters are shallower
     // Dune / lineae layer constants, shared verbatim by the GPU generator GLSL and the float mirror —
@@ -660,14 +665,18 @@ public sealed class PlanetTerrain
     /// crater geomorph. Mirrors <see cref="CraterField"/>'s per-octave <see cref="LayerGate"/>.</summary>
     public double CraterOctavesForSpacing(double sampleSpacing)
     {
-        double freq = _craterFreqA * 0.5 * PlanetTuning.EffectiveFrequency(Type);
+        double baseFreq = _craterFreqA * 0.5 * PlanetTuning.EffectiveFrequency(Type);
+        double freq = baseFreq;
         double oct = 0.0;
         for (int o = 0; o < CraterOctaves; o++)
         {
             oct += LayerGate(freq, sampleSpacing);
             freq *= CraterLacunarity;
         }
-        return oct;
+        // Float-safe cap: freq at octave o is baseFreq·1.9^o; keep the highest active one under the wall
+        // (craters sample dir*freq directly — no split coordinates — so they'd shimmer past it).
+        double safe = Math.Floor(Math.Log(GpuFloatSafeFreq / Math.Max(1.0, baseFreq)) / Math.Log(CraterLacunarity)) + 1.0;
+        return Math.Min(oct, Math.Max(0.0, safe));
     }
 
     // --- GPU-path height mirror -----------------------------------------------------------------
@@ -905,9 +914,9 @@ public sealed class PlanetTerrain
     private static float GpuCraterField(Vector3D<float> dir, float baseFreq, float octCount, float density, Vector3D<float> seed)
     {
         if (octCount <= 0f) return 0f;
-        const float wnorm = 2.6094f; // Σ_{o=0..9} 0.62^o — the full cascade weight, so coarse tiles read shallow
+        const float wnorm = 2.6296f; // Σ_{o=0..14} 0.62^o — the full cascade weight, so coarse tiles read shallow
         float sum = 0f, freq = baseFreq, weight = 1f;
-        for (int o = 0; o < 10; o++)
+        for (int o = 0; o < 15; o++)
         {
             float ofade = Math.Clamp(octCount - o, 0f, 1f);
             if (ofade > 0f)
