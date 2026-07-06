@@ -58,7 +58,7 @@ public sealed class ScatterRenderer : IDisposable
     public readonly List<Spawner> Spawners = new();
 
     /// <summary>Zero-separated mesh names for an ImGui combo; index matches <see cref="Spawner.MeshId"/>.</summary>
-    public const string MeshCombo = "Cube\0Cone (tree)\0Rock\0Tetra (pickup)\0";
+    public const string MeshCombo = "Cube\0Tree (broadleaf)\0Rock\0Pickup\0Tree (conifer)\0";
 
     /// <summary>Objects scattered this frame (0 = none) — surfaced on the HUD.</summary>
     public int Count => _count;
@@ -199,12 +199,13 @@ void main() {
     {
         _gl = gl;
         _shader = new Shader(gl, Vertex, Fragment);
-        _meshes = new[] { BuildCube(), BuildCone(8), BuildOcta(), BuildTetra() };
+        _meshes = new[] { BuildCube(), BuildBroadleaf(), BuildBoulder(), BuildTetra(), BuildConifer() };
 
         // Sensible starter set; replaced wholesale if tuning.json carries a saved list.
-        Spawners.Add(new Spawner { Name = "Rocks",   MeshId = 2, Orient = 2, Density = 0.25f, MinSize = 2f, MaxSize = 6f,  Seed = 11, Require = EnvTrait.Surface });
-        Spawners.Add(new Spawner { Name = "Trees",   MeshId = 1, Orient = 0, Density = 0.50f, MinSize = 6f, MaxSize = 14f, Seed = 22, Require = EnvTrait.Life });
-        Spawners.Add(new Spawner { Name = "Pickups", MeshId = 3, Orient = 1, Density = 0.10f, MinSize = 2f, MaxSize = 3f,  Seed = 33, Require = EnvTrait.Surface, SpawnChance = 0.4f });
+        Spawners.Add(new Spawner { Name = "Rocks",    MeshId = 2, Orient = 2, Density = 0.25f, MinSize = 2f, MaxSize = 6f,  Seed = 11, Require = EnvTrait.Surface });
+        Spawners.Add(new Spawner { Name = "Trees",    MeshId = 1, Orient = 0, Density = 0.50f, MinSize = 6f, MaxSize = 14f, Seed = 22, Require = EnvTrait.Life });
+        Spawners.Add(new Spawner { Name = "Conifers", MeshId = 4, Orient = 0, Density = 0.35f, MinSize = 7f, MaxSize = 16f, Seed = 44, Require = EnvTrait.Life, SpawnChance = 0.6f });
+        Spawners.Add(new Spawner { Name = "Pickups",  MeshId = 3, Orient = 1, Density = 0.10f, MinSize = 2f, MaxSize = 3f,  Seed = 33, Require = EnvTrait.Surface, SpawnChance = 0.4f });
     }
 
     /// <summary>Force the per-world activation gates to recompute next frame (call after editing a
@@ -359,6 +360,157 @@ void main() {
         return new ScatterMesh(vao, idx.Length);
     }
 
+    // --- Composite geometry: accumulate positions + per-vertex colours + indices into one buffer. ---
+
+    private sealed class MeshData
+    {
+        public readonly List<float> Pos = new();
+        public readonly List<float> Col = new();
+        public readonly List<uint> Idx = new();
+        public int Count => Pos.Count / 3;
+        public void Vert(Vector3D<float> p, Vector3D<float> c)
+        {
+            Pos.Add(p.X); Pos.Add(p.Y); Pos.Add(p.Z);
+            Col.Add(c.X); Col.Add(c.Y); Col.Add(c.Z);
+        }
+    }
+
+    // Unit icosphere (subdivided icosahedron) as unit-direction verts + triangle faces. sub=1 -> 42 verts /
+    // 80 faces: reads as a rounded solid, cheap, and facets nicely under the fragment's flat (derivative) normal.
+    private static (List<Vector3D<float>> V, List<(int, int, int)> F) Icosphere(int sub)
+    {
+        float t = (1f + MathF.Sqrt(5f)) * 0.5f;
+        var v = new List<Vector3D<float>> {
+            N(-1, t, 0), N(1, t, 0), N(-1, -t, 0), N(1, -t, 0),
+            N(0, -1, t), N(0, 1, t), N(0, -1, -t), N(0, 1, -t),
+            N(t, 0, -1), N(t, 0, 1), N(-t, 0, -1), N(-t, 0, 1),
+        };
+        var f = new List<(int, int, int)> {
+            (0,11,5),(0,5,1),(0,1,7),(0,7,10),(0,10,11),
+            (1,5,9),(5,11,4),(11,10,2),(10,7,6),(7,1,8),
+            (3,9,4),(3,4,2),(3,2,6),(3,6,8),(3,8,9),
+            (4,9,5),(2,4,11),(6,2,10),(8,6,7),(9,8,1),
+        };
+        for (int s = 0; s < sub; s++)
+        {
+            var nf = new List<(int, int, int)>();
+            var mid = new Dictionary<long, int>();
+            int Mid(int a, int b)
+            {
+                long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+                if (mid.TryGetValue(key, out int m)) return m;
+                v.Add(Vector3D.Normalize(v[a] + v[b])); mid[key] = v.Count - 1; return v.Count - 1;
+            }
+            foreach (var (a, b, c) in f)
+            {
+                int ab = Mid(a, b), bc = Mid(b, c), ca = Mid(c, a);
+                nf.Add((a, ab, ca)); nf.Add((b, bc, ab)); nf.Add((c, ca, bc)); nf.Add((ab, bc, ca));
+            }
+            f = nf;
+        }
+        return (v, f);
+
+        static Vector3D<float> N(float x, float y, float z) => Vector3D.Normalize(new Vector3D<float>(x, y, z));
+    }
+
+    // Deterministic low-frequency lumpiness for a direction (summed sines) — pushes an icosphere off-round
+    // into an irregular boulder / canopy blob. Per-instance random orientation hides the shared base shape.
+    private static float Lumps(Vector3D<float> d)
+        => 0.34f * MathF.Sin(1.7f * d.X + 0.3f)
+         + 0.30f * MathF.Sin(2.3f * d.Y + 1.1f)
+         + 0.28f * MathF.Sin(2.9f * d.Z + 2.2f)
+         + 0.18f * MathF.Sin(4.1f * d.X + 3.4f) * MathF.Sin(3.7f * d.Z + 0.7f);
+
+    private static Vector3D<float> Lerp3(Vector3D<float> a, Vector3D<float> b, float t) => a + (b - a) * t;
+
+    /// <summary>Append a lumpy icosphere blob (boulder or canopy), radius scaled per-axis and displaced by
+    /// <see cref="Lumps"/>. Colour ramps base->crown over the blob's own height so undersides shade.</summary>
+    private static void AddBlob(MeshData md, Vector3D<float> center, Vector3D<float> radius, float lump,
+                                Vector3D<float> colLow, Vector3D<float> colHigh, int sub)
+    {
+        var (V, F) = Icosphere(sub);
+        int b = md.Count;
+        foreach (Vector3D<float> dir in V)
+        {
+            float r = 1f + lump * Lumps(dir);
+            md.Vert(center + new Vector3D<float>(dir.X * radius.X * r, dir.Y * radius.Y * r, dir.Z * radius.Z * r),
+                    Lerp3(colLow, colHigh, Math.Clamp(dir.Y * 0.5f + 0.5f, 0f, 1f)));
+        }
+        foreach (var (i0, i1, i2) in F) { md.Idx.Add((uint)(b + i0)); md.Idx.Add((uint)(b + i1)); md.Idx.Add((uint)(b + i2)); }
+    }
+
+    /// <summary>Append a tapered cylinder y0(r0) -> y1(r1). Trunks.</summary>
+    private static void AddCylinder(MeshData md, float y0, float y1, float r0, float r1, int seg, Vector3D<float> col)
+    {
+        int b = md.Count;
+        for (int k = 0; k < seg; k++)
+        {
+            float a = (float)(k * 2.0 * Math.PI / seg);
+            float cx = MathF.Cos(a), cz = MathF.Sin(a);
+            md.Vert(new Vector3D<float>(cx * r0, y0, cz * r0), col);
+            md.Vert(new Vector3D<float>(cx * r1, y1, cz * r1), col);
+        }
+        for (int k = 0; k < seg; k++)
+        {
+            int lo0 = b + k * 2, hi0 = lo0 + 1, lo1 = b + ((k + 1) % seg) * 2, hi1 = lo1 + 1;
+            md.Idx.Add((uint)lo0); md.Idx.Add((uint)lo1); md.Idx.Add((uint)hi1);
+            md.Idx.Add((uint)lo0); md.Idx.Add((uint)hi1); md.Idx.Add((uint)hi0);
+        }
+    }
+
+    /// <summary>Append a cone skirt (apex at yApex, ring at yBase/rBase). Conifer tiers.</summary>
+    private static void AddCone(MeshData md, float yBase, float yApex, float rBase, int seg,
+                                Vector3D<float> colBase, Vector3D<float> colApex)
+    {
+        int apex = md.Count;
+        md.Vert(new Vector3D<float>(0, yApex, 0), colApex);
+        int ring = md.Count;
+        for (int k = 0; k < seg; k++)
+        {
+            float a = (float)(k * 2.0 * Math.PI / seg);
+            md.Vert(new Vector3D<float>(MathF.Cos(a) * rBase, yBase, MathF.Sin(a) * rBase), colBase);
+        }
+        for (int k = 0; k < seg; k++)
+        {
+            int r0 = ring + k, r1 = ring + (k + 1) % seg;
+            md.Idx.Add((uint)apex); md.Idx.Add((uint)r0); md.Idx.Add((uint)r1);
+        }
+    }
+
+    private ScatterMesh BuildBoulder()
+    {
+        // Centre the rock ON the placement pivot (y=-0.5), so it sits half-embedded in the ground and the
+        // per-instance random tumble (Orient=2) spins it about that centre — it can never lift off the surface.
+        var md = new MeshData();
+        AddBlob(md, new Vector3D<float>(0f, -0.5f, 0f), new Vector3D<float>(0.5f, 0.44f, 0.5f), 0.34f,
+                new Vector3D<float>(0.26f, 0.25f, 0.23f), new Vector3D<float>(0.52f, 0.50f, 0.47f), sub: 1);
+        return Build(md.Pos.ToArray(), md.Col.ToArray(), md.Idx.ToArray());
+    }
+
+    private ScatterMesh BuildBroadleaf()
+    {
+        // Bark trunk + a single lumpy green canopy blob.
+        var md = new MeshData();
+        Vector3D<float> bark = new(0.32f, 0.22f, 0.13f);
+        AddCylinder(md, -0.5f, 0.02f, 0.07f, 0.05f, 6, bark);
+        AddBlob(md, new Vector3D<float>(0f, 0.22f, 0f), new Vector3D<float>(0.42f, 0.40f, 0.42f), 0.28f,
+                new Vector3D<float>(0.13f, 0.28f, 0.10f), new Vector3D<float>(0.34f, 0.58f, 0.22f), sub: 1);
+        return Build(md.Pos.ToArray(), md.Col.ToArray(), md.Idx.ToArray());
+    }
+
+    private ScatterMesh BuildConifer()
+    {
+        // Short trunk + three stacked cone tiers.
+        var md = new MeshData();
+        Vector3D<float> bark = new(0.30f, 0.20f, 0.12f);
+        Vector3D<float> lo = new(0.10f, 0.24f, 0.10f), hi = new(0.28f, 0.50f, 0.20f);
+        AddCylinder(md, -0.5f, -0.20f, 0.055f, 0.04f, 6, bark);
+        AddCone(md, -0.30f, 0.10f, 0.34f, 9, lo, hi);
+        AddCone(md,  0.02f, 0.34f, 0.24f, 9, lo, hi);
+        AddCone(md,  0.26f, 0.55f, 0.15f, 9, lo, hi);
+        return Build(md.Pos.ToArray(), md.Col.ToArray(), md.Idx.ToArray());
+    }
+
     private ScatterMesh BuildCube()
     {
         float[] p = {
@@ -370,36 +522,6 @@ void main() {
             3,2,6, 3,6,7,   1,5,6, 1,6,2,   0,3,7, 0,7,4,
         };
         return Build(p, ColorByHeight(p, new(0.34f, 0.32f, 0.29f), new(0.48f, 0.45f, 0.41f)), i); // generic stone/dirt
-    }
-
-    private ScatterMesh BuildCone(int seg)
-    {
-        var p = new List<float> { 0f, 0.5f, 0f,  0f, -0.5f, 0f };   // 0 = apex, 1 = base centre
-        for (int k = 0; k < seg; k++)
-        {
-            float a = (float)(k * 2.0 * Math.PI / seg);
-            p.Add(0.5f * MathF.Cos(a)); p.Add(-0.5f); p.Add(0.5f * MathF.Sin(a));
-        }
-        var i = new List<uint>();
-        for (uint k = 0; k < seg; k++)
-        {
-            uint r0 = 2 + k, r1 = 2 + (k + 1) % (uint)seg;
-            i.Add(0); i.Add(r0); i.Add(r1);   // side
-            i.Add(1); i.Add(r1); i.Add(r0);   // base cap
-        }
-        // Conifer canopy: dark shaded skirt at the base rising to a sunlit crown.
-        return Build(p.ToArray(), ColorByHeight(p.ToArray(), new(0.13f, 0.26f, 0.11f), new(0.34f, 0.55f, 0.22f)), i.ToArray());
-    }
-
-    private ScatterMesh BuildOcta()
-    {
-        float[] p = {
-            0f, 0.5f, 0f,  0f, -0.5f, 0f,  0.5f, 0f, 0f,  -0.5f, 0f, 0f,  0f, 0f, 0.5f,  0f, 0f, -0.5f,
-        };
-        uint[] i = {
-            0,2,4, 0,4,3, 0,3,5, 0,5,2,   1,4,2, 1,3,4, 1,5,3, 1,2,5,
-        };
-        return Build(p, ColorByHeight(p, new(0.30f, 0.29f, 0.27f), new(0.52f, 0.50f, 0.47f)), i); // grey rock
     }
 
     private ScatterMesh BuildTetra()
