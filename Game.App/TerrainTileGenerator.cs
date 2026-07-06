@@ -211,6 +211,7 @@ uniform vec3 uDetCellBase; // fract-free integer cell of (patchCentreDir * detai
 uniform vec3 uDetFracBase; // its fractional part
 uniform vec3 uDetDirC;     // patch-centre unit direction (to rebuild dir - dirC locally)
 uniform vec3 uMicroCellBase, uMicroFracBase, uMicroDirC; // same split base for the fine micro-relief layer
+uniform vec3 uMtnCellBase, uMtnFracBase, uMtnDirC;       // split base for the ridged mountains; DirC is the WARPED patch centre
 uniform float uWarpFreq, uWarpStrength;            // domain warp (bends the mountain ranges)
 uniform float uRuggedFreq, uRuggedLo, uRuggedHi;   // regional ruggedness mask: flat plains vs rugged highlands
 uniform float uDetailFloor;                        // min detail roughness in the flattest regions
@@ -405,6 +406,24 @@ float fbmSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
     if (frac > 0.0) { sum += amp * frac * vnoiseSplit(cb, nc); norm += amp * frac; }
     return norm > 0.0 ? sum / norm : 0.0;
 }
+// Ridged multifractal on split coordinates (mirror of ridged() below): lets mountain ridges/cliffs resolve
+// their fine octaves as real sub-metre geometry past the old float wall. ncBase is the WARPED coordinate
+// (dir + domainWarp) expressed relative to the warped patch centre, so it stays small and precise.
+float ridgedSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
+    if (oct <= 0.0) return 0.0;
+    int full = int(floor(oct));
+    float frac = oct - float(full);
+    float sum = 0.0, amp = 0.5, prev = 1.0, norm = 0.0;
+    vec3 cb = cellBase, nc = ncBase;
+    for (int i = 0; i < MaxOct; i++) {
+        if (i >= full) break;
+        float n = 1.0 - abs(vnoiseSplit(cb, nc)); n *= n; n *= prev;
+        sum += n * amp; norm += amp; prev = n; amp *= gain;
+        cb = mod(cb * 2.0, 8192.0); nc *= 2.0;
+    }
+    if (frac > 0.0) { float n = 1.0 - abs(vnoiseSplit(cb, nc)); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
+    return norm > 0.0 ? clamp(sum / norm, 0.0, 1.0) : 0.0;
+}
 
 // Fractional-octave ridged multifractal in [0,1] (creases at zero crossings, detail riding ridges).
 float ridged(vec3 dir, float freq, float oct, float gain) {
@@ -541,7 +560,10 @@ float shape(vec3 dir, vec3 oct, float microOct, float microGate, float duneGate,
     float rugged = ruggedness(dir);                     // where rugged terrain belongs
     float mask = smoothstep(-0.2, 0.4, cont);           // highlands carry the mountains
     vec3 warped = dir + domainWarp(dir);                // bend the ranges
-    float mtn  = ridged(warped, uFreq.y, oct.y, uGain.y);
+    // Mountains on split coordinates: nc = (warped*mountainFreq) rebuilt relative to the WARPED patch
+    // centre (uMtnDirC), which cancels algebraically at any shared edge → seam-safe and sub-metre precise.
+    vec3 mtnNc = uMtnFracBase + (warped - uMtnDirC) * uFreq.y;
+    float mtn  = ridgedSplit(uMtnCellBase, mtnNc, oct.y, uGain.y);
     // Detail on split coordinates: nc = (dir*detailFreq) rebuilt relative to the patch centre, so it stays
     // small (precise) however deep the patch. Sub-metre roughness is now real baked geometry, not a bump.
     vec3 detNc = uDetFracBase + (dir - uDetDirC) * uFreq.z;
@@ -610,21 +632,28 @@ void main() {
     {
         var octFine = new Vector3D<float>(
             (float)OctClamp(terrain, p.ContinentFreq, spacingFine, p.MaxContinentOctaves),
-            (float)OctClamp(terrain, p.MountainFreq, spacingFine, p.MaxMountainOctaves),
-            (float)DetailOctClamp(terrain, p.DetailFreq, spacingFine, p.MaxDetailOctaves));
+            (float)SplitOctClamp(terrain, p.MountainFreq, spacingFine, p.MaxMountainOctaves),
+            (float)SplitOctClamp(terrain, p.DetailFreq, spacingFine, p.MaxDetailOctaves));
         var octCoarse = new Vector3D<float>(
             (float)OctClamp(terrain, p.ContinentFreq, spacingCoarse, p.MaxContinentOctaves),
-            (float)OctClamp(terrain, p.MountainFreq, spacingCoarse, p.MaxMountainOctaves),
-            (float)DetailOctClamp(terrain, p.DetailFreq, spacingCoarse, p.MaxDetailOctaves));
+            (float)SplitOctClamp(terrain, p.MountainFreq, spacingCoarse, p.MaxMountainOctaves),
+            (float)SplitOctClamp(terrain, p.DetailFreq, spacingCoarse, p.MaxDetailOctaves));
 
-        // Split-coordinate base for the detail layer: the patch centre's noise cell (integer part wrapped to
+        // Split-coordinate base for the split layers: the patch centre's noise cell (integer part wrapped to
         // the hash period, fraction kept precise), so the shader rebuilds a small, precise coordinate from
-        // dir - dirC. This is what keeps the extra (sub-metre) detail octaves seam-free and swim-free.
+        // dir - dirC. This is what keeps the extra (sub-metre) octaves seam-free and swim-free.
         Vector3D<double> dirC = FacePointD(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5);
         Vector3D<double> q0 = dirC * p.DetailFreq;
         double dfx = Math.Floor(q0.X), dfy = Math.Floor(q0.Y), dfz = Math.Floor(q0.Z);
         Vector3D<double> mq0 = dirC * p.MicroFreq;
         double mfx = Math.Floor(mq0.X), mfy = Math.Floor(mq0.Y), mfz = Math.Floor(mq0.Z);
+        // Mountains are sampled at the WARPED direction; base the split off the warped patch centre so the
+        // warp offset (which would otherwise blow up the local coordinate) is folded into the constant that
+        // cancels at edges. Computed via the physics mirror's warp so both agree; float is fine here (the
+        // warpedC value cancels in the shader's reconstruction — only the integer cell must be precise).
+        Vector3D<float> warpedC = terrain.GpuWarpedDir(dirC);
+        Vector3D<double> wq0 = new Vector3D<double>(warpedC.X, warpedC.Y, warpedC.Z) * p.MountainFreq;
+        double wfx = Math.Floor(wq0.X), wfy = Math.Floor(wq0.Y), wfz = Math.Floor(wq0.Z);
 
         _shader.Use();
         _shader.SetInt("uFace", face);
@@ -642,6 +671,9 @@ void main() {
         _shader.SetVector3("uMicroCellBase", new Vector3D<float>(WrapCell8192(mfx), WrapCell8192(mfy), WrapCell8192(mfz)));
         _shader.SetVector3("uMicroFracBase", new Vector3D<float>((float)(mq0.X - mfx), (float)(mq0.Y - mfy), (float)(mq0.Z - mfz)));
         _shader.SetVector3("uMicroDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
+        _shader.SetVector3("uMtnCellBase", new Vector3D<float>(WrapCell8192(wfx), WrapCell8192(wfy), WrapCell8192(wfz)));
+        _shader.SetVector3("uMtnFracBase", new Vector3D<float>((float)(wq0.X - wfx), (float)(wq0.Y - wfy), (float)(wq0.Z - wfz)));
+        _shader.SetVector3("uMtnDirC", warpedC);
         _shader.SetFloat("uTexelN", cache.TileSize);
         _shader.SetFloat("uWarpFreq", (float)p.WarpFreq);
         _shader.SetFloat("uWarpStrength", (float)p.WarpStrength);
@@ -712,9 +744,10 @@ void main() {
         return Math.Max(0.0, Math.Min(lod, safe));
     }
 
-    /// <summary>Octave count for the DETAIL layer — same LOD band-limit, but against the higher
-    /// <see cref="DetailSafeFreq"/> ceiling since it samples in precise split coordinates.</summary>
-    private static double DetailOctClamp(PlanetTerrain terrain, double baseFreq, double spacing, int max)
+    /// <summary>Octave count for a split-coordinate layer (detail, mountains) — same LOD band-limit, but
+    /// against the higher <see cref="DetailSafeFreq"/> ceiling since these sample in precise split
+    /// coordinates rather than a planet-scale dir*freq.</summary>
+    private static double SplitOctClamp(PlanetTerrain terrain, double baseFreq, double spacing, int max)
     {
         double lod = terrain.OctavesForSpacing(baseFreq, spacing, max);
         double safe = Math.Floor(Math.Log2(DetailSafeFreq / Math.Max(1.0, baseFreq))) + 1.0;

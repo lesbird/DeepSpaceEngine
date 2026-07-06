@@ -689,15 +689,21 @@ public sealed class PlanetTerrain
         var dir = new Vector3D<float>((float)unitDir.X, (float)unitDir.Y, (float)unitDir.Z);
         Vector3D<float> seed = GpuSeedOffset(p.Seed);
         float oc = (float)GpuOctClamp(p.ContinentFreq, sampleSpacing, p.MaxContinentOctaves);
-        float om = (float)GpuOctClamp(p.MountainFreq, sampleSpacing, p.MaxMountainOctaves);
-        float od = (float)GpuDetailOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
+        float om = (float)GpuSplitOctClamp(p.MountainFreq, sampleSpacing, p.MaxMountainOctaves);
+        float od = (float)GpuSplitOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
 
         float cont = GpuFbm(dir, (float)p.ContinentFreq, oc, (float)p.ContinentGain, seed);
         float rugged = SmoothstepF((float)p.RuggedLo, (float)p.RuggedHi,
             0.5f + 0.5f * GpuFbm(dir + new Vector3D<float>(53.1f, 12.7f, 91.3f), (float)p.RuggedFreq, 4f, 0.5f, seed));
         float mask = SmoothstepF(-0.2f, 0.4f, cont);
+        // Mountains on split coordinates (mirror of the generator's ridgedSplit): base cell + fraction from
+        // the warped dir in double, so fine ridge octaves stay precise and the physics surface follows them.
         Vector3D<float> warped = dir + GpuDomainWarp(dir, p, seed);
-        float mtn = GpuRidged(warped, (float)p.MountainFreq, om, (float)p.MountainGain, seed);
+        Vector3D<double> wq0 = new Vector3D<double>(warped.X, warped.Y, warped.Z) * p.MountainFreq;
+        double wgx = Math.Floor(wq0.X), wgy = Math.Floor(wq0.Y), wgz = Math.Floor(wq0.Z);
+        var mtnCellBase = new Vector3D<float>(WrapCell8192F(wgx), WrapCell8192F(wgy), WrapCell8192F(wgz));
+        var mtnFracBase = new Vector3D<float>((float)(wq0.X - wgx), (float)(wq0.Y - wgy), (float)(wq0.Z - wgz));
+        float mtn = GpuRidgedSplit(mtnCellBase, mtnFracBase, om, (float)p.MountainGain, seed);
         // Detail on split coordinates (mirror of the generator's erodedFbmSplit): the base cell + fraction
         // come from unitDir*detailFreq in DOUBLE, so the fraction is precise; the eroded fBm then runs in
         // float to match the GPU's rounding. Lets the physics surface follow the sub-metre baked geometry.
@@ -945,13 +951,23 @@ public sealed class PlanetTerrain
         return Math.Max(0.0, Math.Min(lod, safe));
     }
 
-    /// <summary>Detail-layer octave clamp — mirrors TerrainTileGenerator.DetailOctClamp (higher ceiling, as
-    /// the detail layer samples in precise split coordinates).</summary>
-    private double GpuDetailOctClamp(double baseFreq, double spacing, int max)
+    /// <summary>Split-coordinate layer octave clamp (detail, mountains) — mirrors TerrainTileGenerator.
+    /// SplitOctClamp (higher ceiling, as these sample in precise split coordinates).</summary>
+    private double GpuSplitOctClamp(double baseFreq, double spacing, int max)
     {
         double lod = OctavesFor(baseFreq, spacing, max);
         double safe = Math.Floor(Math.Log2(GpuDetailSafeFreq / Math.Max(1.0, baseFreq))) + 1.0;
         return Math.Max(0.0, Math.Min(lod, safe));
+    }
+
+    /// <summary>The domain-warped unit direction (dir + domainWarp) used by the mountain layer — public so
+    /// the tile generator can base its mountain split coordinates off the warped patch centre. Float (the
+    /// warpedC value cancels in the shader's reconstruction; only the derived integer cell must be precise).</summary>
+    public Vector3D<float> GpuWarpedDir(Vector3D<double> unitDir)
+    {
+        GpuTerrainParams p = GpuParams();
+        var dir = new Vector3D<float>((float)unitDir.X, (float)unitDir.Y, (float)unitDir.Z);
+        return dir + GpuDomainWarp(dir, p, GpuSeedOffset(p.Seed));
     }
 
     /// <summary>Wrap an integer cell index into [0, 8192) — the GPU hash period (mirrors WrapCell8192).</summary>
@@ -1138,17 +1154,23 @@ public sealed class PlanetTerrain
         return norm > 0f ? sum / norm : 0f;
     }
 
-    private static float GpuRidged(Vector3D<float> dir, float freq, float oct, float gain, Vector3D<float> seed)
+    /// <summary>Ridged multifractal on split coordinates (mirror of the generator's <c>ridgedSplit</c>):
+    /// doubles the wrapped cell base + small fractional coord per octave, so mountain ridge detail stays
+    /// precise sub-metre. ncBase is the warped coordinate relative to the warped patch/query centre.</summary>
+    private static float GpuRidgedSplit(Vector3D<float> cellBase, Vector3D<float> ncBase, float oct, float gain, Vector3D<float> seed)
     {
         if (oct <= 0f) return 0f;
         int full = (int)MathF.Floor(oct);
-        float frac = oct - full, sum = 0, amp = 0.5f, f = freq, prev = 1f, norm = 0;
+        float frac = oct - full, sum = 0, amp = 0.5f, prev = 1f, norm = 0;
+        var cb = cellBase; var nc = ncBase;
         for (int i = 0; i < 32 && i < full; i++)
         {
-            float n = 1f - MathF.Abs(GpuVNoise(dir * f, seed) * 2f - 1f); n *= n; n *= prev;
-            sum += n * amp; norm += amp; prev = n; amp *= gain; f *= 2f;
+            float n = 1f - MathF.Abs(GpuVNoiseSplit(cb, nc, seed)); n *= n; n *= prev;
+            sum += n * amp; norm += amp; prev = n; amp *= gain;
+            cb = new Vector3D<float>(ModF(cb.X * 2f, 8192f), ModF(cb.Y * 2f, 8192f), ModF(cb.Z * 2f, 8192f));
+            nc *= 2f;
         }
-        if (frac > 0f) { float n = 1f - MathF.Abs(GpuVNoise(dir * f, seed) * 2f - 1f); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
+        if (frac > 0f) { float n = 1f - MathF.Abs(GpuVNoiseSplit(cb, nc, seed)); n *= n; n *= prev; sum += n * amp * frac; norm += amp * frac; }
         return norm > 0f ? Math.Clamp(sum / norm, 0f, 1f) : 0f;
     }
 
