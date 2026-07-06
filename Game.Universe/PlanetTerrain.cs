@@ -103,9 +103,12 @@ public sealed class PlanetTerrain
     // only when a patch resolves it (no aliasing from orbit). Small weight: it adds crisp close-up
     // roughness without changing the planet's silhouette. Folded into `shape` like the other layers,
     // so the analytic Amplitude bound (weights sum to the relief budget) still holds exactly.
-    private const int MaxMicroOctaves = 8;
+    // Split coordinates (see GpuFbmSplit) keep this layer precise past the old float wall, so it can carry
+    // real sub-decimetre grain: more octaves, and a weight that's actually visible (was 0.0006, a near-
+    // invisible whisper kept small only to hide the pre-split shimmer). Live-tunable via TerrainTuning.MicroDetailScale.
+    private const int MaxMicroOctaves = 12;
     private const double MicroGain = 0.5;
-    private const double MicroWeight = 0.0006;
+    private const double MicroWeight = 0.0025;
     // Continents are the lowest-frequency layer, so their amplitude shows up as the planet's
     // large-scale silhouette. Keeping it modest stops continental swells from looming over the
     // limb as "mountains" that turn out to be gentle slopes when you actually fly there; the
@@ -713,7 +716,11 @@ public sealed class PlanetTerrain
             if (microGate > 0f)
             {
                 float microOct = (float)OctavesFor(p.MicroFreq, sampleSpacing, p.MaxMicroOctaves);
-                float micro = GpuFbm(dir, (float)p.MicroFreq, microOct, (float)p.MicroGain, seed) * microGate * detailGate;
+                Vector3D<double> mq0 = unitDir * p.MicroFreq;
+                double mgx = Math.Floor(mq0.X), mgy = Math.Floor(mq0.Y), mgz = Math.Floor(mq0.Z);
+                var microCellBase = new Vector3D<float>(WrapCell8192F(mgx), WrapCell8192F(mgy), WrapCell8192F(mgz));
+                var microFracBase = new Vector3D<float>((float)(mq0.X - mgx), (float)(mq0.Y - mgy), (float)(mq0.Z - mgz));
+                float micro = GpuFbmSplit(microCellBase, microFracBase, microOct, (float)p.MicroGain, seed) * microGate * detailGate;
                 shape += (float)p.MicroWeight * micro;
             }
         }
@@ -1093,6 +1100,41 @@ public sealed class PlanetTerrain
             float damp = 1f / (1f + k * Vector3D.Dot(gradSum, gradSum));
             sum += amp * frac * n * damp; norm += amp * frac;
         }
+        return norm > 0f ? sum / norm : 0f;
+    }
+
+    /// <summary>Plain split-coordinate value noise in [-1,1] (mirror of the generator's <c>vnoiseSplit</c>) —
+    /// gradient-free, for the fine micro-relief layer.</summary>
+    private static float GpuVNoiseSplit(Vector3D<float> cellBase, Vector3D<float> nc, Vector3D<float> seed)
+    {
+        var fl = new Vector3D<float>(MathF.Floor(nc.X), MathF.Floor(nc.Y), MathF.Floor(nc.Z));
+        var c = cellBase + fl;
+        var f = nc - fl;
+        f = new Vector3D<float>(f.X * f.X * (3f - 2f * f.X), f.Y * f.Y * (3f - 2f * f.Y), f.Z * f.Z * (3f - 2f * f.Z));
+        float n000 = GpuHash13(c, seed), n100 = GpuHash13(c + new Vector3D<float>(1, 0, 0), seed);
+        float n010 = GpuHash13(c + new Vector3D<float>(0, 1, 0), seed), n110 = GpuHash13(c + new Vector3D<float>(1, 1, 0), seed);
+        float n001 = GpuHash13(c + new Vector3D<float>(0, 0, 1), seed), n101 = GpuHash13(c + new Vector3D<float>(1, 0, 1), seed);
+        float n011 = GpuHash13(c + new Vector3D<float>(0, 1, 1), seed), n111 = GpuHash13(c + new Vector3D<float>(1, 1, 1), seed);
+        float x00 = LerpF(n000, n100, f.X), x10 = LerpF(n010, n110, f.X);
+        float x01 = LerpF(n001, n101, f.X), x11 = LerpF(n011, n111, f.X);
+        return LerpF(LerpF(x00, x10, f.Y), LerpF(x01, x11, f.Y), f.Z) * 2f - 1f;
+    }
+
+    /// <summary>Fractional-octave fBm on split coordinates (mirror of the generator's <c>fbmSplit</c>):
+    /// doubles the wrapped cell base + small fractional coord per octave. For the fine micro-relief.</summary>
+    private static float GpuFbmSplit(Vector3D<float> cellBase, Vector3D<float> ncBase, float oct, float gain, Vector3D<float> seed)
+    {
+        if (oct <= 0f) return 0f;
+        int full = (int)MathF.Floor(oct);
+        float frac = oct - full, sum = 0, amp = 1, norm = 0;
+        var cb = cellBase; var nc = ncBase;
+        for (int i = 0; i < 32 && i < full; i++)
+        {
+            sum += amp * GpuVNoiseSplit(cb, nc, seed); norm += amp; amp *= gain;
+            cb = new Vector3D<float>(ModF(cb.X * 2f, 8192f), ModF(cb.Y * 2f, 8192f), ModF(cb.Z * 2f, 8192f));
+            nc *= 2f;
+        }
+        if (frac > 0f) { sum += amp * frac * GpuVNoiseSplit(cb, nc, seed); norm += amp * frac; }
         return norm > 0f ? sum / norm : 0f;
     }
 

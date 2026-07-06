@@ -210,6 +210,7 @@ uniform float uTexelN;     // texels per tile edge — snap each texel to its me
 uniform vec3 uDetCellBase; // fract-free integer cell of (patchCentreDir * detailFreq), wrapped to 8192
 uniform vec3 uDetFracBase; // its fractional part
 uniform vec3 uDetDirC;     // patch-centre unit direction (to rebuild dir - dirC locally)
+uniform vec3 uMicroCellBase, uMicroFracBase, uMicroDirC; // same split base for the fine micro-relief layer
 uniform float uWarpFreq, uWarpStrength;            // domain warp (bends the mountain ranges)
 uniform float uRuggedFreq, uRuggedLo, uRuggedHi;   // regional ruggedness mask: flat plains vs rugged highlands
 uniform float uDetailFloor;                        // min detail roughness in the flattest regions
@@ -375,6 +376,35 @@ float erodedFbmSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
     }
     return norm > 0.0 ? sum / norm : 0.0;
 }
+// Plain (gradient-free) split-coordinate value noise + fBm for the fine micro-relief layer — same precision
+// trick as vnoiseDSplit/erodedFbmSplit but cheaper (no erosion damping). Lets micro-relief carry clean
+// sub-decimetre grain instead of shimmering at its top octaves (which sat right at the float wall).
+float vnoiseSplit(vec3 cellBase, vec3 nc) {
+    vec3 c = cellBase + floor(nc);
+    vec3 f = fract(nc);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash(c),               n100 = hash(c + vec3(1,0,0));
+    float n010 = hash(c + vec3(0,1,0)), n110 = hash(c + vec3(1,1,0));
+    float n001 = hash(c + vec3(0,0,1)), n101 = hash(c + vec3(1,0,1));
+    float n011 = hash(c + vec3(0,1,1)), n111 = hash(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, f.x), x10 = mix(n010, n110, f.x);
+    float x01 = mix(n001, n101, f.x), x11 = mix(n011, n111, f.x);
+    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z) * 2.0 - 1.0;
+}
+float fbmSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
+    if (oct <= 0.0) return 0.0;
+    int full = int(floor(oct));
+    float frac = oct - float(full);
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    vec3 cb = cellBase, nc = ncBase;
+    for (int i = 0; i < MaxOct; i++) {
+        if (i >= full) break;
+        sum += amp * vnoiseSplit(cb, nc); norm += amp;
+        amp *= gain; cb = mod(cb * 2.0, 8192.0); nc *= 2.0;
+    }
+    if (frac > 0.0) { sum += amp * frac * vnoiseSplit(cb, nc); norm += amp * frac; }
+    return norm > 0.0 ? sum / norm : 0.0;
+}
 
 // Fractional-octave ridged multifractal in [0,1] (creases at zero crossings, detail riding ridges).
 float ridged(vec3 dir, float freq, float oct, float gain) {
@@ -518,8 +548,10 @@ float shape(vec3 dir, vec3 oct, float microOct, float microGate, float duneGate,
     float det  = erodedFbmSplit(uDetCellBase, detNc, oct.z, uGain.z); // high-freq roughness, slope-damped (eroded)
     float detailGate = uDetailFloor + (1.0 - uDetailFloor) * rugged; // calmer detail on plains
     // Fine micro-relief (LOD-gated so it only resolves up close) + sedimentary strata (fixed-octave terrace).
+    // Split coordinates too, so its fine grain stays precise (sub-decimetre) rather than shimmering.
+    vec3 microNc = uMicroFracBase + (dir - uMicroDirC) * uMicroFreq;
     float micro = (uMicroWeight > 0.0 && microGate > 0.0)
-        ? fbm(dir, uMicroFreq, microOct, uMicroGain) * microGate * detailGate : 0.0;
+        ? fbmSplit(uMicroCellBase, microNc, microOct, uMicroGain) * microGate * detailGate : 0.0;
     float strata = (uStrataWeight > 0.0)
         ? terrace(fbm(dir + vec3(8.2, 71.5, 3.6), uStrataFreq, 4.0, 0.5), uStrataSteps, uStrataSharp) : 0.0;
     // Aeolian dunes gather in ergs on flat lowland; ice lineae cut across everything. Both LOD-gated.
@@ -591,6 +623,8 @@ void main() {
         Vector3D<double> dirC = FacePointD(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5);
         Vector3D<double> q0 = dirC * p.DetailFreq;
         double dfx = Math.Floor(q0.X), dfy = Math.Floor(q0.Y), dfz = Math.Floor(q0.Z);
+        Vector3D<double> mq0 = dirC * p.MicroFreq;
+        double mfx = Math.Floor(mq0.X), mfy = Math.Floor(mq0.Y), mfz = Math.Floor(mq0.Z);
 
         _shader.Use();
         _shader.SetInt("uFace", face);
@@ -605,6 +639,9 @@ void main() {
         _shader.SetVector3("uDetCellBase", new Vector3D<float>(WrapCell8192(dfx), WrapCell8192(dfy), WrapCell8192(dfz)));
         _shader.SetVector3("uDetFracBase", new Vector3D<float>((float)(q0.X - dfx), (float)(q0.Y - dfy), (float)(q0.Z - dfz)));
         _shader.SetVector3("uDetDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
+        _shader.SetVector3("uMicroCellBase", new Vector3D<float>(WrapCell8192(mfx), WrapCell8192(mfy), WrapCell8192(mfz)));
+        _shader.SetVector3("uMicroFracBase", new Vector3D<float>((float)(mq0.X - mfx), (float)(mq0.Y - mfy), (float)(mq0.Z - mfz)));
+        _shader.SetVector3("uMicroDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
         _shader.SetFloat("uTexelN", cache.TileSize);
         _shader.SetFloat("uWarpFreq", (float)p.WarpFreq);
         _shader.SetFloat("uWarpStrength", (float)p.WarpStrength);
