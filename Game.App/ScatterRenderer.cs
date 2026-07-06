@@ -88,6 +88,7 @@ layout(location = 0) in vec3 aCorner;   // mesh-local corner, y in [-0.5,0.5] (b
 layout(location = 1) in vec3 aBasePos;  // per-instance: terrain vertex, patch-centre-relative base sphere pos
 layout(location = 2) in vec3 aDir;      // per-instance: outward unit direction
 layout(location = 3) in vec2 aTexel;    // per-instance: this vertex's texel in the height tile (guard-offset)
+layout(location = 4) in vec3 aColor;    // mesh-local per-vertex colour (canopy green / trunk brown / rock grey)
 uniform mat4 uViewProj;
 uniform mat4 uModel;        // CreateTranslation(patch centre, camera-relative)
 uniform float uMorph;       // fine<->coarse height blend, matches the leaf's terrain draw
@@ -106,6 +107,10 @@ uniform float uVertexSpacing;
 uniform float uHashSalt;    // per-spawner decorrelation offset
 out vec3 vWorld;
 out float vKeep;
+out vec3 vCol;      // per-vertex base colour
+out float vUp01;    // 0 at the object's base, 1 at its top — drives base-darkening AO
+out float vShade;   // per-instance brightness jitter
+out float vHue;     // per-instance warm/cool jitter (-1..1)
 float hash(vec2 p, float seed){ return fract(sin(dot(p, vec2(41.3, 289.1)) + seed + uHashSalt) * 43758.5453); }
 float Hs(ivec2 t){ vec2 hc = texelFetch(uHeight, t, 0).rg; return mix(hc.x, hc.y, uMorph); }
 vec3 facePoint(int f, float u, float v) {
@@ -160,19 +165,34 @@ void main() {
     vec3 local = r2 * aCorner.x + up * (aCorner.y + 0.5) + f2 * aCorner.z;
     vec3 world = base + local * s;
     vWorld = world;
+    vCol = aColor;
+    vUp01 = aCorner.y + 0.5;                     // base (-0.5) -> 0, top (+0.5) -> 1
+    vShade = 0.82 + 0.34 * hash(aTexel, 21.7);   // per-instance brightness variety
+    vHue = hash(aTexel, 27.3) * 2.0 - 1.0;       // per-instance warm/cool shift
     gl_Position = uViewProj * vec4(world, 1.0);
 }";
 
     private const string Fragment = @"#version 410 core
 in vec3 vWorld;
 in float vKeep;
+in vec3 vCol;
+in float vUp01;
+in float vShade;
+in float vHue;
 uniform vec3 uSunDir;
+uniform vec3 uGroundTint;    // planet's average surface colour — objects lean toward it to sit in the palette
+uniform float uGroundBlend;  // how far this layer leans toward the ground tint (rocks a lot, foliage a little)
 out vec4 FragColor;
 void main() {
     if (vKeep < 0.5) discard;
-    vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));  // flat per-face normal
-    float light = 0.35 + 0.65 * abs(dot(n, normalize(uSunDir)));
-    FragColor = vec4(vec3(1.0) * light, 1.0);              // opaque white, lit (debug)
+    vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));   // flat per-face normal
+    float ndl = abs(dot(n, normalize(uSunDir)));            // two-sided sun term (faces aren't back-culled)
+    float ao = mix(0.55, 1.0, vUp01);                      // darker toward the base -> reads as planted, not floating
+    float light = 0.30 + 0.70 * ndl;                       // ambient fill + direct sun
+    vec3 col = mix(vCol, uGroundTint, uGroundBlend);       // lean into the local palette so it belongs in the scene
+    col *= vShade;                                         // per-instance brightness variety
+    col *= vec3(1.0 + 0.06 * vHue, 1.0, 1.0 - 0.06 * vHue); // subtle per-instance warm/cool
+    FragColor = vec4(col * light * ao, 1.0);
 }";
 
     public ScatterRenderer(GL gl)
@@ -221,11 +241,17 @@ void main() {
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, heightTex);
         _shader.SetInt("uHeight", 0);
+        _shader.SetVector3("uGroundTint", target.SurfaceAlbedo); // this world's average surface colour
 
         foreach (Spawner sp in Spawners)
         {
             if (!sp.Enabled || !sp.ActiveHere) continue;
             ScatterMesh mesh = _meshes[Math.Clamp(sp.MeshId, 0, _meshes.Length - 1)];
+
+            // Rocks are made of the ground, so lean them hard into its palette; foliage keeps most of its own
+            // green; pickups stay their bright signal colour. (Keyed off the debug mesh ids for now.)
+            float groundBlend = sp.MeshId switch { 2 => 0.40f, 0 => 0.30f, 3 => 0.0f, _ => 0.14f };
+            _shader.SetFloat("uGroundBlend", groundBlend);
 
             float lo = Math.Max(0.1f, Math.Min(sp.MinSize, sp.MaxSize));
             float hi = Math.Max(lo, sp.MaxSize);
@@ -280,16 +306,45 @@ void main() {
 
     // --- Mesh registry: small unit solids in mesh-local space with y in [-0.5,0.5] (base at -0.5). ---
 
-    private unsafe ScatterMesh Build(float[] pos, uint[] idx)
+    /// <summary>Per-vertex colour ramped by height (y in [-0.5,0.5]): base tone at the bottom, top tone at the
+    /// crown. Gives canopies a lit crown / shaded underside and rocks a darker footing for free.</summary>
+    private static float[] ColorByHeight(float[] pos, Vector3D<float> baseCol, Vector3D<float> topCol)
     {
+        int n = pos.Length / 3;
+        var col = new float[n * 3];
+        for (int v = 0; v < n; v++)
+        {
+            float t = Math.Clamp(pos[v * 3 + 1] + 0.5f, 0f, 1f);
+            col[v * 3 + 0] = baseCol.X + (topCol.X - baseCol.X) * t;
+            col[v * 3 + 1] = baseCol.Y + (topCol.Y - baseCol.Y) * t;
+            col[v * 3 + 2] = baseCol.Z + (topCol.Z - baseCol.Z) * t;
+        }
+        return col;
+    }
+
+    private unsafe ScatterMesh Build(float[] pos, float[] col, uint[] idx)
+    {
+        // Interleave position + colour into one static mesh VBO (6 floats/vertex). Locations 0 (pos) and 4
+        // (colour) bind here at divisor 0; the per-instance attributes 1..3 are re-pointed at each terrain
+        // leaf's VBO in Render, so the VAO keeps pos/colour on this buffer and instance data on the leaf.
+        int n = pos.Length / 3;
+        var data = new float[n * 6];
+        for (int v = 0; v < n; v++)
+        {
+            data[v * 6 + 0] = pos[v * 3 + 0]; data[v * 6 + 1] = pos[v * 3 + 1]; data[v * 6 + 2] = pos[v * 3 + 2];
+            data[v * 6 + 3] = col[v * 3 + 0]; data[v * 6 + 4] = col[v * 3 + 1]; data[v * 6 + 5] = col[v * 3 + 2];
+        }
+
         uint vao = _gl.GenVertexArray();
         _gl.BindVertexArray(vao);
 
         uint vbo = _gl.GenBuffer();
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, vbo);
-        _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, pos, BufferUsageARB.StaticDraw);
-        _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3 * sizeof(float), (void*)0);
+        _gl.BufferData<float>(BufferTargetARB.ArrayBuffer, data, BufferUsageARB.StaticDraw);
+        _gl.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 6 * sizeof(float), (void*)0);
         _gl.EnableVertexAttribArray(0);
+        _gl.VertexAttribPointer(4, 3, VertexAttribPointerType.Float, false, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+        _gl.EnableVertexAttribArray(4);
 
         uint ebo = _gl.GenBuffer();
         _gl.BindBuffer(BufferTargetARB.ElementArrayBuffer, ebo);
@@ -314,7 +369,7 @@ void main() {
             0,1,2, 0,2,3,   4,6,5, 4,7,6,   0,4,5, 0,5,1,
             3,2,6, 3,6,7,   1,5,6, 1,6,2,   0,3,7, 0,7,4,
         };
-        return Build(p, i);
+        return Build(p, ColorByHeight(p, new(0.34f, 0.32f, 0.29f), new(0.48f, 0.45f, 0.41f)), i); // generic stone/dirt
     }
 
     private ScatterMesh BuildCone(int seg)
@@ -332,7 +387,8 @@ void main() {
             i.Add(0); i.Add(r0); i.Add(r1);   // side
             i.Add(1); i.Add(r1); i.Add(r0);   // base cap
         }
-        return Build(p.ToArray(), i.ToArray());
+        // Conifer canopy: dark shaded skirt at the base rising to a sunlit crown.
+        return Build(p.ToArray(), ColorByHeight(p.ToArray(), new(0.13f, 0.26f, 0.11f), new(0.34f, 0.55f, 0.22f)), i.ToArray());
     }
 
     private ScatterMesh BuildOcta()
@@ -343,7 +399,7 @@ void main() {
         uint[] i = {
             0,2,4, 0,4,3, 0,3,5, 0,5,2,   1,4,2, 1,3,4, 1,5,3, 1,2,5,
         };
-        return Build(p, i);
+        return Build(p, ColorByHeight(p, new(0.30f, 0.29f, 0.27f), new(0.52f, 0.50f, 0.47f)), i); // grey rock
     }
 
     private ScatterMesh BuildTetra()
@@ -355,7 +411,7 @@ void main() {
             0.433f, -0.5f, -0.25f,
         };
         uint[] i = { 0,1,2, 0,2,3, 0,3,1, 1,3,2 };
-        return Build(p, i);
+        return Build(p, ColorByHeight(p, new(0.90f, 0.74f, 0.22f), new(0.90f, 0.74f, 0.22f)), i); // bright amber pickup
     }
 
     public void Dispose()
