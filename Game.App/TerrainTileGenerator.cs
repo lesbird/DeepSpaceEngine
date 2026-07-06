@@ -32,6 +32,12 @@ public sealed class TerrainTileGenerator : IDisposable
     /// the per-pixel detail shader instead).</summary>
     public const double FloatSafeFreq = 700_000.0;
 
+    /// <summary>Ceiling for the DETAIL layer only, which samples in split (patch-local) coordinates and so
+    /// stays precise far past <see cref="FloatSafeFreq"/> — this is what lets fine roughness be real baked
+    /// geometry down to sub-metre features instead of a fragment normal-bump. Still bounded so the eroded
+    /// octave loop and the physics mirror stay affordable; kept in sync with PlanetTerrain.DetailSafeFreq.</summary>
+    public const double DetailSafeFreq = 32_000_000.0;
+
     /// <summary>
     /// The terrain noise/field GLSL — hash, value noise, fBm, ridged multifractal, regional ruggedness,
     /// domain warp, and the LOD octave count — exposed as a SHARED module so the render shader can evaluate
@@ -198,6 +204,12 @@ uniform float uScale;      // metres of relief (height = scale * shape)
 uniform vec3 uOctFine;     // (continent, mountain, detail) octave counts at the fine band-limit
 uniform vec3 uOctCoarse;   // ... at the parent (coarse) band-limit
 uniform float uTexelN;     // texels per tile edge — snap each texel to its mesh-vertex (u,v) so seams match
+// Split-coordinate base for the DETAIL layer: the patch-centre's (wrapped, integer) noise cell + fraction,
+// plus the patch-centre direction, so the detail fBm can be sampled in small patch-local coordinates and
+// resolve sub-metre geometry without the float precision loss of a planet-scale dir*freq (see vnoiseDSplit).
+uniform vec3 uDetCellBase; // fract-free integer cell of (patchCentreDir * detailFreq), wrapped to 8192
+uniform vec3 uDetFracBase; // its fractional part
+uniform vec3 uDetDirC;     // patch-centre unit direction (to rebuild dir - dirC locally)
 uniform float uWarpFreq, uWarpStrength;            // domain warp (bends the mountain ranges)
 uniform float uRuggedFreq, uRuggedLo, uRuggedHi;   // regional ruggedness mask: flat plains vs rugged highlands
 uniform float uDetailFloor;                        // min detail roughness in the flattest regions
@@ -303,6 +315,60 @@ float erodedFbm(vec3 dir, float freq, float oct, float gain) {
     }
     if (frac > 0.0) {
         vec4 ng = vnoiseD(dir * f);
+        gradSum += ng.yzw * frac;
+        float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
+        sum += amp * frac * ng.x * damp; norm += amp * frac;
+    }
+    return norm > 0.0 ? sum / norm : 0.0;
+}
+
+// --- Split-coordinate detail: sub-metre geometry without float precision loss --------------------------
+// The value noise above samples dir*freq directly; at the frequencies fine geometry needs (~1e6+ cells over
+// the sphere) that product overflows float's mantissa and the lattice shimmers, which is why the octave
+// count is clamped at FloatSafeFreq (~metre geometry, finer faked by the normal-bump shader). These split
+// versions carry the (large, integer) cell base separately from a small fractional coordinate — the same
+// trick the detail-normal shader uses — so the fraction stays precise however deep we subdivide. Value +
+// analytic gradient (for the erosion damping) from the 8 corner hashes; mirrors vnoiseD.
+vec4 vnoiseDSplit(vec3 cellBase, vec3 nc) {
+    vec3 fl = floor(nc);
+    vec3 c = cellBase + fl;
+    vec3 ff = nc - fl;
+    vec3 u = ff * ff * (3.0 - 2.0 * ff);
+    vec3 du = 6.0 * ff * (1.0 - ff);
+    float n000 = hash(c),               n100 = hash(c + vec3(1,0,0));
+    float n010 = hash(c + vec3(0,1,0)), n110 = hash(c + vec3(1,1,0));
+    float n001 = hash(c + vec3(0,0,1)), n101 = hash(c + vec3(1,0,1));
+    float n011 = hash(c + vec3(0,1,1)), n111 = hash(c + vec3(1,1,1));
+    float x00 = mix(n000, n100, u.x), x10 = mix(n010, n110, u.x);
+    float x01 = mix(n001, n101, u.x), x11 = mix(n011, n111, u.x);
+    float y0 = mix(x00, x10, u.y), y1 = mix(x01, x11, u.y);
+    float val = mix(y0, y1, u.z);
+    float dfu = mix(mix(n100 - n000, n110 - n010, u.y), mix(n101 - n001, n111 - n011, u.y), u.z);
+    float dfv = mix(x10 - x00, x11 - x01, u.z);
+    float dfw = y1 - y0;
+    return vec4(val * 2.0 - 1.0, 2.0 * vec3(dfu * du.x, dfv * du.y, dfw * du.z));
+}
+// erodedFbm on split coordinates. Each octave doubles the wrapped cell base (mod 8192 — kept small so it
+// stays integer-precise) and the small fractional coord, reconstructing the identical lattice fbm() would
+// sample, but precise for the many octaves sub-metre geometry needs. ncBase is (dir*detailFreq) expressed
+// relative to the patch centre; matches erodedFbm() in exact arithmetic (differs only by float ULP).
+float erodedFbmSplit(vec3 cellBase, vec3 ncBase, float oct, float gain) {
+    if (oct <= 0.0) return 0.0;
+    const float k = 1.4;
+    int full = int(floor(oct));
+    float frac = oct - float(full);
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    vec3 cb = cellBase, nc = ncBase, gradSum = vec3(0.0);
+    for (int i = 0; i < MaxOct; i++) {
+        if (i >= full) break;
+        vec4 ng = vnoiseDSplit(cb, nc);
+        gradSum += ng.yzw;
+        float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
+        sum += amp * ng.x * damp; norm += amp;
+        amp *= gain; cb = mod(cb * 2.0, 8192.0); nc *= 2.0;
+    }
+    if (frac > 0.0) {
+        vec4 ng = vnoiseDSplit(cb, nc);
         gradSum += ng.yzw * frac;
         float damp = 1.0 / (1.0 + k * dot(gradSum, gradSum));
         sum += amp * frac * ng.x * damp; norm += amp * frac;
@@ -446,7 +512,10 @@ float shape(vec3 dir, vec3 oct, float microOct, float microGate, float duneGate,
     float mask = smoothstep(-0.2, 0.4, cont);           // highlands carry the mountains
     vec3 warped = dir + domainWarp(dir);                // bend the ranges
     float mtn  = ridged(warped, uFreq.y, oct.y, uGain.y);
-    float det  = erodedFbm(dir, uFreq.z, oct.z, uGain.z); // high-frequency roughness, slope-damped (eroded)
+    // Detail on split coordinates: nc = (dir*detailFreq) rebuilt relative to the patch centre, so it stays
+    // small (precise) however deep the patch. Sub-metre roughness is now real baked geometry, not a bump.
+    vec3 detNc = uDetFracBase + (dir - uDetDirC) * uFreq.z;
+    float det  = erodedFbmSplit(uDetCellBase, detNc, oct.z, uGain.z); // high-freq roughness, slope-damped (eroded)
     float detailGate = uDetailFloor + (1.0 - uDetailFloor) * rugged; // calmer detail on plains
     // Fine micro-relief (LOD-gated so it only resolves up close) + sedimentary strata (fixed-octave terrace).
     float micro = (uMicroWeight > 0.0 && microGate > 0.0)
@@ -510,11 +579,18 @@ void main() {
         var octFine = new Vector3D<float>(
             (float)OctClamp(terrain, p.ContinentFreq, spacingFine, p.MaxContinentOctaves),
             (float)OctClamp(terrain, p.MountainFreq, spacingFine, p.MaxMountainOctaves),
-            (float)OctClamp(terrain, p.DetailFreq, spacingFine, p.MaxDetailOctaves));
+            (float)DetailOctClamp(terrain, p.DetailFreq, spacingFine, p.MaxDetailOctaves));
         var octCoarse = new Vector3D<float>(
             (float)OctClamp(terrain, p.ContinentFreq, spacingCoarse, p.MaxContinentOctaves),
             (float)OctClamp(terrain, p.MountainFreq, spacingCoarse, p.MaxMountainOctaves),
-            (float)OctClamp(terrain, p.DetailFreq, spacingCoarse, p.MaxDetailOctaves));
+            (float)DetailOctClamp(terrain, p.DetailFreq, spacingCoarse, p.MaxDetailOctaves));
+
+        // Split-coordinate base for the detail layer: the patch centre's noise cell (integer part wrapped to
+        // the hash period, fraction kept precise), so the shader rebuilds a small, precise coordinate from
+        // dir - dirC. This is what keeps the extra (sub-metre) detail octaves seam-free and swim-free.
+        Vector3D<double> dirC = FacePointD(face, (u0 + u1) * 0.5, (v0 + v1) * 0.5);
+        Vector3D<double> q0 = dirC * p.DetailFreq;
+        double dfx = Math.Floor(q0.X), dfy = Math.Floor(q0.Y), dfz = Math.Floor(q0.Z);
 
         _shader.Use();
         _shader.SetInt("uFace", face);
@@ -526,6 +602,9 @@ void main() {
         _shader.SetFloat("uScale", (float)p.Scale);
         _shader.SetVector3("uOctFine", octFine);
         _shader.SetVector3("uOctCoarse", octCoarse);
+        _shader.SetVector3("uDetCellBase", new Vector3D<float>(WrapCell8192(dfx), WrapCell8192(dfy), WrapCell8192(dfz)));
+        _shader.SetVector3("uDetFracBase", new Vector3D<float>((float)(q0.X - dfx), (float)(q0.Y - dfy), (float)(q0.Z - dfz)));
+        _shader.SetVector3("uDetDirC", new Vector3D<float>((float)dirC.X, (float)dirC.Y, (float)dirC.Z));
         _shader.SetFloat("uTexelN", cache.TileSize);
         _shader.SetFloat("uWarpFreq", (float)p.WarpFreq);
         _shader.SetFloat("uWarpStrength", (float)p.WarpStrength);
@@ -587,12 +666,48 @@ void main() {
         if (depth) _gl.Enable(EnableCap.DepthTest);
     }
 
-    /// <summary>Octave count for a band-limit, clamped to both the LOD budget and the float-safe ceiling.</summary>
+    /// <summary>Octave count for a band-limit, clamped to both the LOD budget and the float-safe ceiling
+    /// (direct-coordinate layers: continents, mountains).</summary>
     private static double OctClamp(PlanetTerrain terrain, double baseFreq, double spacing, int max)
     {
         double lod = terrain.OctavesForSpacing(baseFreq, spacing, max);
         double safe = Math.Floor(Math.Log2(FloatSafeFreq / Math.Max(1.0, baseFreq))) + 1.0;
         return Math.Max(0.0, Math.Min(lod, safe));
+    }
+
+    /// <summary>Octave count for the DETAIL layer — same LOD band-limit, but against the higher
+    /// <see cref="DetailSafeFreq"/> ceiling since it samples in precise split coordinates.</summary>
+    private static double DetailOctClamp(PlanetTerrain terrain, double baseFreq, double spacing, int max)
+    {
+        double lod = terrain.OctavesForSpacing(baseFreq, spacing, max);
+        double safe = Math.Floor(Math.Log2(DetailSafeFreq / Math.Max(1.0, baseFreq))) + 1.0;
+        return Math.Max(0.0, Math.Min(lod, safe));
+    }
+
+    /// <summary>Unit cube-sphere direction for face + (u,v) in double — mirrors the shader's facePoint, for
+    /// computing the split-coordinate base at the patch centre.</summary>
+    private static Vector3D<double> FacePointD(int f, double u, double v)
+    {
+        double a = u * 2.0 - 1.0, b = v * 2.0 - 1.0;
+        Vector3D<double> p = f switch
+        {
+            0 => new(1.0, b, -a),
+            1 => new(-1.0, b, a),
+            2 => new(a, 1.0, -b),
+            3 => new(a, -1.0, b),
+            4 => new(a, b, 1.0),
+            _ => new(-a, b, -1.0),
+        };
+        return Vector3D.Normalize(p);
+    }
+
+    /// <summary>Wrap an integer cell index into [0, 8192) — the generator hash's period, keeping the
+    /// shader's cell base small enough to stay integer-precise across the octave doublings.</summary>
+    private static float WrapCell8192(double flooredCell)
+    {
+        double m = flooredCell % 8192.0;
+        if (m < 0) m += 8192.0;
+        return (float)m;
     }
 
     /// <summary>Three fractional offsets in [0,1) from the body seed, shifting the hash so worlds differ.</summary>

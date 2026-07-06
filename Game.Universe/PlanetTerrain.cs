@@ -675,6 +675,7 @@ public sealed class PlanetTerrain
     // ample for the near plane and good enough for vehicle placement.
 
     private const double GpuFloatSafeFreq = 700_000.0; // mirror of TerrainTileGenerator.FloatSafeFreq
+    private const double GpuDetailSafeFreq = 32_000_000.0; // mirror of TerrainTileGenerator.DetailSafeFreq (split-coord detail)
 
     /// <summary>Height (metres, signed) of the GPU-generated terrain at a unit direction, band-limited to
     /// <paramref name="sampleSpacing"/> (0 = full). Mirrors the generation shader; see the region note.</summary>
@@ -686,7 +687,7 @@ public sealed class PlanetTerrain
         Vector3D<float> seed = GpuSeedOffset(p.Seed);
         float oc = (float)GpuOctClamp(p.ContinentFreq, sampleSpacing, p.MaxContinentOctaves);
         float om = (float)GpuOctClamp(p.MountainFreq, sampleSpacing, p.MaxMountainOctaves);
-        float od = (float)GpuOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
+        float od = (float)GpuDetailOctClamp(p.DetailFreq, sampleSpacing, p.MaxDetailOctaves);
 
         float cont = GpuFbm(dir, (float)p.ContinentFreq, oc, (float)p.ContinentGain, seed);
         float rugged = SmoothstepF((float)p.RuggedLo, (float)p.RuggedHi,
@@ -694,7 +695,15 @@ public sealed class PlanetTerrain
         float mask = SmoothstepF(-0.2f, 0.4f, cont);
         Vector3D<float> warped = dir + GpuDomainWarp(dir, p, seed);
         float mtn = GpuRidged(warped, (float)p.MountainFreq, om, (float)p.MountainGain, seed);
-        float det = GpuErodedFbm(dir, (float)p.DetailFreq, od, (float)p.DetailGain, seed);
+        // Detail on split coordinates (mirror of the generator's erodedFbmSplit): the base cell + fraction
+        // come from unitDir*detailFreq in DOUBLE, so the fraction is precise; the eroded fBm then runs in
+        // float to match the GPU's rounding. Lets the physics surface follow the sub-metre baked geometry.
+        double dq = p.DetailFreq;
+        Vector3D<double> dq0 = unitDir * dq;
+        double dgx = Math.Floor(dq0.X), dgy = Math.Floor(dq0.Y), dgz = Math.Floor(dq0.Z);
+        var detCellBase = new Vector3D<float>(WrapCell8192F(dgx), WrapCell8192F(dgy), WrapCell8192F(dgz));
+        var detFracBase = new Vector3D<float>((float)(dq0.X - dgx), (float)(dq0.Y - dgy), (float)(dq0.Z - dgz));
+        float det = GpuErodedFbmSplit(detCellBase, detFracBase, od, (float)p.DetailGain, seed);
         float detailGate = (float)p.DetailFloor + (1f - (float)p.DetailFloor) * rugged;
         float shape = (float)p.ContinentWeight * cont + (float)p.MountainWeight * mtn * mask * rugged
                     + (float)p.DetailWeight * det * detailGate;
@@ -929,6 +938,18 @@ public sealed class PlanetTerrain
         return Math.Max(0.0, Math.Min(lod, safe));
     }
 
+    /// <summary>Detail-layer octave clamp — mirrors TerrainTileGenerator.DetailOctClamp (higher ceiling, as
+    /// the detail layer samples in precise split coordinates).</summary>
+    private double GpuDetailOctClamp(double baseFreq, double spacing, int max)
+    {
+        double lod = OctavesFor(baseFreq, spacing, max);
+        double safe = Math.Floor(Math.Log2(GpuDetailSafeFreq / Math.Max(1.0, baseFreq))) + 1.0;
+        return Math.Max(0.0, Math.Min(lod, safe));
+    }
+
+    /// <summary>Wrap an integer cell index into [0, 8192) — the GPU hash period (mirrors WrapCell8192).</summary>
+    private static float WrapCell8192F(double flooredCell) { double m = flooredCell % 8192.0; if (m < 0) m += 8192.0; return (float)m; }
+
     // Everything below mirrors the GLSL generator in float (not double): the noise hash floors at the
     // float precision edge, so only matching float reproduces the GPU surface — a double mirror diverged
     // by up to kilometres on a coarse leaf's top octave.
@@ -1015,6 +1036,59 @@ public sealed class PlanetTerrain
         if (frac > 0f)
         {
             (float n, Vector3D<float> g) = GpuVNoiseD(dir * f, seed);
+            gradSum += g * frac;
+            float damp = 1f / (1f + k * Vector3D.Dot(gradSum, gradSum));
+            sum += amp * frac * n * damp; norm += amp * frac;
+        }
+        return norm > 0f ? sum / norm : 0f;
+    }
+
+    /// <summary>Split-coordinate value noise + analytic gradient (mirror of the generator's
+    /// <c>vnoiseDSplit</c>): the wrapped integer cell base is carried separately from a small fractional
+    /// coord, so fine octaves stay precise. GPU hash (period 8192). Value + gradient scaled to [-1,1].</summary>
+    private static (float val, Vector3D<float> grad) GpuVNoiseDSplit(Vector3D<float> cellBase, Vector3D<float> nc, Vector3D<float> seed)
+    {
+        var fl = new Vector3D<float>(MathF.Floor(nc.X), MathF.Floor(nc.Y), MathF.Floor(nc.Z));
+        var c = cellBase + fl;
+        var ff = nc - fl;
+        var u = new Vector3D<float>(ff.X * ff.X * (3f - 2f * ff.X), ff.Y * ff.Y * (3f - 2f * ff.Y), ff.Z * ff.Z * (3f - 2f * ff.Z));
+        var du = new Vector3D<float>(6f * ff.X * (1f - ff.X), 6f * ff.Y * (1f - ff.Y), 6f * ff.Z * (1f - ff.Z));
+        float n000 = GpuHash13(c, seed), n100 = GpuHash13(c + new Vector3D<float>(1, 0, 0), seed);
+        float n010 = GpuHash13(c + new Vector3D<float>(0, 1, 0), seed), n110 = GpuHash13(c + new Vector3D<float>(1, 1, 0), seed);
+        float n001 = GpuHash13(c + new Vector3D<float>(0, 0, 1), seed), n101 = GpuHash13(c + new Vector3D<float>(1, 0, 1), seed);
+        float n011 = GpuHash13(c + new Vector3D<float>(0, 1, 1), seed), n111 = GpuHash13(c + new Vector3D<float>(1, 1, 1), seed);
+        float x00 = LerpF(n000, n100, u.X), x10 = LerpF(n010, n110, u.X);
+        float x01 = LerpF(n001, n101, u.X), x11 = LerpF(n011, n111, u.X);
+        float y0 = LerpF(x00, x10, u.Y), y1 = LerpF(x01, x11, u.Y);
+        float val = LerpF(y0, y1, u.Z);
+        float dfu = LerpF(LerpF(n100 - n000, n110 - n010, u.Y), LerpF(n101 - n001, n111 - n011, u.Y), u.Z);
+        float dfv = LerpF(x10 - x00, x11 - x01, u.Z);
+        float dfw = y1 - y0;
+        return (val * 2f - 1f, new Vector3D<float>(2f * dfu * du.X, 2f * dfv * du.Y, 2f * dfw * du.Z));
+    }
+
+    /// <summary>Erosive fBm on split coordinates (mirror of the generator's <c>erodedFbmSplit</c>): doubles
+    /// the wrapped cell base and the small fractional coord each octave, so precision holds for the sub-metre
+    /// detail octaves. Matches GpuErodedFbm in exact arithmetic; differs only by float ULP.</summary>
+    private static float GpuErodedFbmSplit(Vector3D<float> cellBase, Vector3D<float> ncBase, float oct, float gain, Vector3D<float> seed)
+    {
+        if (oct <= 0f) return 0f;
+        const float k = 1.4f;
+        int full = (int)MathF.Floor(oct);
+        float frac = oct - full, sum = 0, amp = 1, norm = 0;
+        var cb = cellBase; var nc = ncBase; var gradSum = new Vector3D<float>(0, 0, 0);
+        for (int i = 0; i < 32 && i < full; i++)
+        {
+            (float n, Vector3D<float> g) = GpuVNoiseDSplit(cb, nc, seed);
+            gradSum += g;
+            float damp = 1f / (1f + k * Vector3D.Dot(gradSum, gradSum));
+            sum += amp * n * damp; norm += amp; amp *= gain;
+            cb = new Vector3D<float>(ModF(cb.X * 2f, 8192f), ModF(cb.Y * 2f, 8192f), ModF(cb.Z * 2f, 8192f));
+            nc *= 2f;
+        }
+        if (frac > 0f)
+        {
+            (float n, Vector3D<float> g) = GpuVNoiseDSplit(cb, nc, seed);
             gradSum += g * frac;
             float damp = 1f / (1f + k * Vector3D.Dot(gradSum, gradSum));
             sum += amp * frac * n * damp; norm += amp * frac;
