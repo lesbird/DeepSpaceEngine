@@ -626,6 +626,9 @@ uniform float uSurfaceSpecular;  // close-up specular highlight strength
 uniform float uVertexSpacingDir; // this patch's vertex spacing / planet radius
 uniform float uPlanetRadius;     // metres
 uniform float uGeomDetailFloor;  // finest spacing the baked geometry resolves (metres)
+uniform float uDetailSpacingMul; // scales the detail-bump handoff point: <1 when baked surface tiles resolve
+                                 // finer than the 16×16 mesh, so the per-pixel bump only adds octaves BELOW the
+                                 // tile (no double-count with the baked normal). 1 = legacy (handoff at mesh spacing).
 uniform float uReliefMeshK;      // lodFactor * GridN — converts camera distance → effective mesh spacing
 uniform float uPixelArc;         // radians per pixel (vertical FOV / viewport height) — fwidth-free footprint
 out vec4 FragColor;
@@ -774,7 +777,10 @@ void main() {
         float fpMax = max(max(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
         float fpMin = min(min(fwidth(vNoiseCoord.x), fwidth(vNoiseCoord.y)), fwidth(vNoiseCoord.z));
         float footprint = max(fpMin, fpMax * 0.2);
-        float effSpacing = max(uVertexSpacingDir * uPlanetRadius, uGeomDetailFloor);
+        // Handoff at the finest scale the baked GEOMETRY resolves: the mesh (legacy) or, when baked surface
+        // tiles are on, the tile — uDetailSpacingMul (<1) shifts the handoff finer so the bump fills in only
+        // sub-tile octaves and doesn't re-add the roughness already in the baked normal.
+        float effSpacing = uDetailSpacingMul * max(uVertexSpacingDir * uPlanetRadius, uGeomDetailFloor);
         float meshCellsPerVertex = effSpacing * uDetailFreq;
         vec3 tangAccum = vec3(0.0);
         float nDetail = 0.0, wsum = 0.0, m = 1.0;
@@ -1517,6 +1523,7 @@ void main() {
         _gpuShader.SetFloat("uSurfaceSpecular", Math.Max(0f, TerrainTuning.SurfaceSpecular));
         _gpuShader.SetFloat("uPlanetRadius", (float)_terrain.Radius);
         _gpuShader.SetFloat("uGeomDetailFloor", (float)(_terrain.FinestGeometryWavelength * 0.5));
+        _gpuShader.SetFloat("uDetailSpacingMul", 1f); // legacy handoff at mesh spacing; overridden below when baked
 
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _tileCache!.HeightTexture);
@@ -1534,15 +1541,19 @@ void main() {
         _gpuShader.SetFloat("uSurfAtlasDim", _surfCache.AtlasDim);
         _gpuShader.SetFloat("uSurfInterior", SurfTileInterior);
         _gl.ActiveTexture(TextureUnit.Texture0);
-        // When the baked surface is active it supersedes the per-pixel detail + orbital-relief + colour passes
-        // — zero their strengths so those (expensive) branches are skipped at uniform-false control flow.
+        // When the baked surface is active it carries the macro/crater/mountain FORM (baked normal) and the
+        // biome/regolith albedo (baked colour), so the orbital macro-relief pass is redundant — zero it (it
+        // would double the mountain shading). But the per-pixel detail bump + material breakup are KEPT: they
+        // supply the fine, camera-distance-keyed surface texture BELOW the tile's resolution (the tile only
+        // bakes down to WorldSize/SurfTileInterior, LOD-gated), which is the close-up "surface detail" the
+        // baked tile alone can't reach. Its handoff is shifted to the (finer) tile spacing so it doesn't
+        // re-add roughness already in the baked normal.
         _gpuShader.SetFloat("uUseBakedNormal", _bakedSurf ? 1f : 0f);
         if (_bakedSurf)
         {
-            _gpuShader.SetFloat("uDetailStrength", 0f);
-            _gpuShader.SetFloat("uMaterialStrength", 0f);
             _gpuShader.SetFloat("uReliefStrength", 0f);
             _gpuShader.SetFloat("uReliefAlbedo", 0f);
+            _gpuShader.SetFloat("uDetailSpacingMul", (float)GridN / SurfTileInterior); // tile is 6× finer than the mesh
         }
 
         LeafCount = 0;
