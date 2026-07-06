@@ -47,6 +47,8 @@ uniform float uGasGiant;        // 1 = banded gas/ice giant (zonal cloud bands +
 uniform float uBandFreq;        // number of zonal bands (latitude stripes)
 uniform float uPlanetRadiusM;
 uniform vec3  uSeedOffset;      // per-planet noise offset (variety)
+uniform float uSpecStrength;    // specular sheen (0 = matte rock)
+uniform float uSpecPower;       // specular exponent (higher = tighter highlight)
 // Baked surface map for the focused body: exact-match albedo + planet-local normal. When present it
 // replaces the procedural detail, so the distant sphere shows the same craters you land in.
 uniform float uHasMap;
@@ -75,7 +77,7 @@ float reliefF(vec3 d, float f, float fp) {
 }
 float craterF(vec3 dir, float baseFreq, float fp) {
     float sum=0.0, wsum=0.0, freq=baseFreq, weight=1.0;
-    for (int o=0;o<3;o++){   // coarse bands only — distant spheres need just the big craters
+    for (int o=0;o<5;o++){   // footprint-gated: fine octaves auto-cull when the disk is small/distant
         float aa = 1.0 - smoothstep(0.5, 1.1, freq * fp);
         if (aa > 0.0) {
             vec3 p = dir * freq; vec3 ip = floor(p); float minBowl=0.0, maxRim=0.0, salt=float(o)*17.0;
@@ -94,6 +96,16 @@ float craterF(vec3 dir, float baseFreq, float fp) {
         wsum += weight; freq *= 1.9; weight *= 0.62;
     }
     return sum / max(wsum, 1e-4);
+}
+// Combined surface height in metres (macro relief + impact craters), footprint band-limited. The crater
+// component is returned separately so the albedo pass can darken bowl floors / brighten rims without a
+// second (expensive) crater-field evaluation.
+float surfH(vec3 d, float fp, out float craterOut) {
+    float h = reliefF(d, uReliefFreq, fp) * uReliefAmp;
+    float cr = 0.0;
+    if (uCraterStrength > 0.001) { cr = craterF(d, uCraterFreq, fp); h += cr * uReliefAmp * 2.0 * uCraterStrength; }
+    craterOut = cr;
+    return h;
 }
 
 void main() {
@@ -124,13 +136,19 @@ void main() {
         vec3 up = abs(N.y) < 0.99 ? vec3(0,1,0) : vec3(1,0,0);
         vec3 T1 = normalize(cross(N, up)); vec3 T2 = cross(N, T1);
         float eps = max(fp, 1e-5);
-        float r0 = reliefF(dir, uReliefFreq, fp), rA = reliefF(dir+T1*eps, uReliefFreq, fp), rB = reliefF(dir+T2*eps, uReliefFreq, fp);
-        float invArc = uReliefAmp / (eps * uPlanetRadiusM);
-        N = normalize(N - ((rA-r0)*T1 + (rB-r0)*T2) * invArc);       // relief normal (cheap fBm, no cell search)
+        // Relief AND craters both perturb the normal (real bowl/rim shading) from one height gradient — so
+        // craters catch light and cast shading at the terminator instead of reading as flat dark spots.
+        float c0, cDummy;
+        float h0 = surfH(dir,          fp, c0);
+        float hA = surfH(dir + T1*eps, fp, cDummy);
+        float hB = surfH(dir + T2*eps, fp, cDummy);
+        float invArc = 1.0 / (eps * uPlanetRadiusM);
+        N = normalize(N - ((hA-h0)*T1 + (hB-h0)*T2) * invArc);
+        // Broad warm/cool albedo provinces + finer mottle → the tan-highland / grey-lowland read.
+        float prov = fbm(dir * 1.6 + vec3(3.1));
+        col = mix(col * vec3(0.90, 0.93, 1.03), col * vec3(1.07, 1.00, 0.88), smoothstep(0.35, 0.65, prov));
         col *= 1.0 + 0.12 * (fbm(dir * 4.0) * 2.0 - 1.0);            // subtle large-scale mottle
         if (uCraterStrength > 0.001) {
-            // Craters as albedo only (one crater-field evaluation) — the expensive 3×3×3 search runs once.
-            float c0 = craterF(dir, uCraterFreq, fp);
             col *= 1.0 - 0.45 * uCraterStrength * max(0.0, -c0);     // crater floors darker
             col *= 1.0 + 0.30 * uCraterStrength * max(0.0,  c0) / 0.28; // rims/ejecta brighter
         }
@@ -140,8 +158,17 @@ void main() {
         }
     }
 
-    float diff = max(dot(N, L), 0.0);
-    vec3 lit = col * (0.04 + diff);
+    vec3 V = normalize(-vWorld);                     // camera sits at the origin (camera-relative world)
+    float ndl = dot(N, L);
+    float diff = max(ndl, 0.0);
+    // Soften the terminator (a little wrap light) so it reads as a rounded body, not a hard day/night edge.
+    float term = clamp((ndl + 0.12) / 1.12, 0.0, 1.0);
+    diff = mix(diff, term * term, 0.3);
+    float ndv = max(dot(N, V), 0.0);
+    float limb = mix(0.7, 1.0, ndv);                 // gentle limb darkening toward the grazing edge
+    vec3 Hh = normalize(L + V);
+    float spec = uSpecStrength * pow(max(dot(N, Hh), 0.0), max(uSpecPower, 1.0)) * diff;
+    vec3 lit = col * ((0.035 + diff) * limb) + vec3(spec);
     FragColor = vec4(mix(lit, uColor, uEmissive), 1.0);
 }";
 
@@ -363,6 +390,8 @@ void main() { FragColor = uColor; }";
         _planetShader.SetFloat("uBandFreq", sp.BandFreq);
         _planetShader.SetFloat("uPlanetRadiusM", (float)radius);
         _planetShader.SetVector3("uSeedOffset", sp.SeedOffset);
+        _planetShader.SetFloat("uSpecStrength", sp.SpecStrength);
+        _planetShader.SetFloat("uSpecPower", sp.SpecPower);
         _planetShader.SetFloat("uHasMap", useMap ? 1f : 0f);
         _sphere.Draw();
     }
@@ -372,9 +401,9 @@ void main() { FragColor = uColor; }";
     /// others get gentle relief. The seed offset varies the noise so worlds differ.</summary>
     private readonly record struct SurfaceParams(
         float ReliefAmp, float ReliefFreq, float CraterStrength, float CraterFreq, float MariaStrength,
-        Vector3D<float> SeedOffset, float GasGiant, float BandFreq)
+        Vector3D<float> SeedOffset, float GasGiant, float BandFreq, float SpecStrength, float SpecPower)
     {
-        public static readonly SurfaceParams None = new(0f, 0f, 0f, 0f, 0f, default, 0f, 0f);
+        public static readonly SurfaceParams None = new(0f, 0f, 0f, 0f, 0f, default, 0f, 0f, 0f, 1f);
     }
 
     private static SurfaceParams ParamsFor(CelestialBody b)
@@ -382,15 +411,18 @@ void main() { FragColor = uColor; }";
         var rng = new DeterministicRng(Hashing.Combine(b.Seed, 0xB0DEu));
         var off = new Vector3D<float>((float)rng.Range(0, 128), (float)rng.Range(0, 128), (float)rng.Range(0, 128));
         if (!b.HasSurface) // gas/ice giants → zonal cloud bands + storms
-            return new SurfaceParams(0f, 0f, 0f, 0f, 0f, off, GasGiant: 1f, BandFreq: (float)rng.Range(10.0, 22.0));
+            return new SurfaceParams(0f, 0f, 0f, 0f, 0f, off, GasGiant: 1f, BandFreq: (float)rng.Range(10.0, 22.0),
+                SpecStrength: 0f, SpecPower: 8f);
         bool airless = !b.HasAtmosphere;
         return new SurfaceParams(
             ReliefAmp: (float)(b.RadiusMeters * (airless ? 0.020 : 0.012)),
             ReliefFreq: 6f,
             CraterStrength: airless ? 1f : 0f,
-            CraterFreq: 18f,
+            CraterFreq: 22f,
             MariaStrength: airless ? 0.6f : 0f,
-            SeedOffset: off, GasGiant: 0f, BandFreq: 0f);
+            SeedOffset: off, GasGiant: 0f, BandFreq: 0f,
+            SpecStrength: airless ? 0.03f : 0.06f,   // matte rock vs a faint mineral/damp sheen
+            SpecPower: airless ? 24f : 30f);
     }
 
     /// <summary>Near/far planes from the most recent <see cref="FitProjection"/> (for depth reconstruction).</summary>
