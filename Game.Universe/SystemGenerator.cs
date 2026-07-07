@@ -151,11 +151,17 @@ public static class SystemGenerator
         return c * 0.6f + grey * 0.4f;
     }
 
-    /// <summary>Record the mean albedo the body's surface actually shows, so the distant sphere matches
-    /// the terrain/baked map instead of popping colour when they load. Surfaceless gas/ice giants keep
-    /// their flat seeded tint. Builds a throwaway <see cref="PlanetTerrain"/> (cheap, pure RNG reads).</summary>
+    /// <summary>Record the mean albedo the body's surface actually shows (and whether it's genuinely
+    /// cratered), so the distant sphere matches the terrain/baked map instead of popping colour when they
+    /// load. Surfaceless gas/ice giants keep their flat seeded tint. Builds a throwaway
+    /// <see cref="PlanetTerrain"/> once (cheap, pure RNG reads) and reads both facts off it.</summary>
     private static void AssignSurfaceAlbedo(CelestialBody b)
-        => b.SurfaceAlbedo = b.HasSurface ? new PlanetTerrain(b).AverageAlbedo() : b.Color;
+    {
+        if (!b.HasSurface) { b.SurfaceAlbedo = b.Color; b.IsCratered = false; return; }
+        var terrain = new PlanetTerrain(b);
+        b.SurfaceAlbedo = terrain.AverageAlbedo();
+        b.IsCratered = terrain.IsCratered;
+    }
 
     /// <summary>Most moons are airless. Only the larger ones have a chance at a thin atmosphere
     /// (think Titan), at a lower pressure than a planet's. The optical look is derived from the

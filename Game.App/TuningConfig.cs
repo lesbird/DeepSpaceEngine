@@ -45,7 +45,7 @@ public sealed class TuningConfig
     public float MountainScale { get; set; } = 1.0f;
     public float FrequencyScale { get; set; } = 1.0f;
     public float CraterScale { get; set; } = 1.0f;
-    public float CraterDensity { get; set; } = 1.0f;
+    public float CraterDensity { get; set; } = 0.5f;
 
     // Biome / colour.
     public float SnowLine { get; set; } = 0.55f;

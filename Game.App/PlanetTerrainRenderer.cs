@@ -1193,9 +1193,11 @@ void main() {
         }
     }
 
-    public void Render(Camera camera, Vector3D<float> sunDir, float time = 0f, PlanetSurfaceMap? map = null)
+    public void Render(Camera camera, Vector3D<float> sunDir, float time = 0f, PlanetSurfaceMapCache? maps = null)
     {
         if (_body == null || _roots == null) return;
+        // Only the active body's map matters here (the terrain renderer draws one body); pull it from the set.
+        PlanetSurfaceMap? map = maps?.Get(_body.Seed);
 
         // Snapshot the live LOD aggressiveness once so split, merge and morph all agree this frame.
         _lodFactor = Math.Clamp(TerrainTuning.LodDistanceFactor, 1.0, 32.0);
@@ -1242,7 +1244,7 @@ void main() {
 
         // Baked surface map for this body (if ready): coarse far patches sample it instead of the
         // procedural orbital relief, so the orbital view matches the surface exactly.
-        bool useMap = map is { Ready: true } && _body != null && map.BodyId == _body.Seed;
+        bool useMap = map is { Ready: true }; // Get() already returned only this body's ready map
         _shader.SetFloat("uHasMap", useMap ? 1f : 0f);
         if (useMap)
         {

@@ -46,7 +46,7 @@ public static class TerrainTuning
     public static float CraterScale = 1.0f;
 
     /// <summary>Scales how many craters appear (the fraction of cells that bear one); 0 = none.</summary>
-    public static float CraterDensity = 1.0f;
+    public static float CraterDensity = 0.5f;
 
     /// <summary>Airless-body albedo from the crater cascade: dark floors + bright rims/ejecta; 0 = off.
     /// Baked into the surface colour, so a change needs a terrain rebuild.</summary>

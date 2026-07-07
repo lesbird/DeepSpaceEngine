@@ -41,6 +41,12 @@ public abstract class CelestialBody
     /// for surfaced worlds; equals <see cref="Color"/> for gas/ice giants.</summary>
     public Vector3D<float> SurfaceAlbedo;
 
+    /// <summary>True when the body's terrain actually rolled a cratered style (impact-scarred crust with
+    /// dark maria) — NOT merely "airless". The distant sphere gates its procedural craters + maria on this
+    /// so a non-cratered airless world (e.g. a dune/plains moon) doesn't read grey-and-pocked from orbit and
+    /// then snap to its true tan surface when the baked map loads. Set by the generator with SurfaceAlbedo.</summary>
+    public bool IsCratered;
+
     // Atmosphere (a volumetric single-scattering shell; see AtmosphereRenderer). The optical fields
     // below are DERIVED from the scanned composition + temperature + gravity + surface pressure by
     // AtmosphereModel.Derive, so the look reflects the chemistry rather than a per-type constant.

@@ -62,6 +62,17 @@ const float PI_M = 3.14159265359;
 vec2 dirToUv(vec3 d) {
     return vec2(atan(d.z, d.x) / (2.0 * PI_M) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI_M + 0.5);
 }
+// Screen-space uv derivatives for the equirect lookup, computed ANALYTICALLY from the direction gradients so
+// they stay continuous across the ±180° seam. A plain texture() there sees uv.x jump 1→0 between adjacent
+// pixels, spikes its derivative, and picks the coarsest (dark) mip → a black meridian. Jacobian of dirToUv:
+// du = (x·dz - z·dx)/(x²+z²)/2π,  dv = dy/(π·√(1-y²)).
+void mapGrad(vec3 d, out vec2 gx, out vec2 gy) {
+    vec3 dx = dFdx(d), dy = dFdy(d);
+    float r2 = max(d.x * d.x + d.z * d.z, 1e-8);
+    float ay = PI_M * sqrt(max(1.0 - d.y * d.y, 1e-4));
+    gx = vec2((d.x * dx.z - d.z * dx.x) / r2 / (2.0 * PI_M), dx.y / ay);
+    gy = vec2((d.x * dy.z - d.z * dy.x) / r2 / (2.0 * PI_M), dy.y / ay);
+}
 
 float h13(vec3 p) { p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }
 float vn(vec3 x) {
@@ -160,8 +171,9 @@ void main() {
         // the sphere resolves into the exact surface you'll land on with no visible switch.
         if (uMapBlend > 0.001) {
             vec2 uv = dirToUv(Ngeo);
-            col = mix(col, texture(uAlbedoMap, uv).rgb, uMapBlend);
-            N = normalize(mix(N, normalize(texture(uNormalMap, uv).rgb * 2.0 - 1.0), uMapBlend));
+            vec2 gx, gy; mapGrad(Ngeo, gx, gy);   // seam-safe mip selection (no dark meridian at ±180°)
+            col = mix(col, textureGrad(uAlbedoMap, uv, gx, gy).rgb, uMapBlend);
+            N = normalize(mix(N, normalize(textureGrad(uNormalMap, uv, gx, gy).rgb * 2.0 - 1.0), uMapBlend));
         }
     }
 
@@ -248,10 +260,14 @@ out vec4 FragColor;
 void main() { FragColor = uColor; }";
 
     // Distance band (in body radii) over which the baked surface map cross-fades in over the procedural
-    // sphere: fully procedural beyond Far, fully baked within Near (which sits above the terrain-activation
-    // radius, so procedural → baked → terrain overlap). Kept in sync with Program's MapActivateRadii.
-    private const double MapFadeNearRadii = 80.0;
-    private const double MapFadeFarRadii = 200.0;
+    // sphere: fully procedural beyond Far, fully baked within Near. Near sits WELL above the terrain-activation
+    // radius (Program.TerrainActivateRadii = 150), so the sphere shows the full baked map — the real, tan,
+    // spatially-varying surface — across the whole 250→150 approach and matches the quadtree terrain it hands
+    // to at 150. (A tight Near just above 150 would instead leave the flat grey procedural showing until the
+    // last moment, then snap to tan terrain.) The fade itself happens far out where the body is a small disc.
+    // Kept below Program's MapActivateRadii (360) so a map is baked and resident before it starts easing in.
+    private const double MapFadeNearRadii = 250.0;
+    private const double MapFadeFarRadii = 320.0;
 
     private readonly GL _gl;
     private readonly Shader _planetShader;
@@ -290,11 +306,10 @@ void main() { FragColor = uColor; }";
     }
 
     public void Render(Camera camera, SolarSystem system, CelestialBody? terrainBody = null,
-        PlanetSurfaceMap? map = null)
+        PlanetSurfaceMapCache? maps = null)
     {
         UniversePosition cam = camera.Position;
         Vector3D<float> sunRel = system.Sun.Position.ToCameraRelative(cam);
-        ulong mapId = map is { Ready: true } ? map.BodyId : ulong.MaxValue;
 
         Matrix4X4<float> proj = FitProjection(camera, system);
         Matrix4X4<float> viewProj = camera.ViewMatrix * proj;
@@ -305,18 +320,15 @@ void main() { FragColor = uColor; }";
         // --- Sun (emissive) ---
         _planetShader.Use();
         _planetShader.SetVector3("uSunCenter", sunRel);
-        // Bind the surface map (focused body) or a complete 1×1 placeholder to the map sampler units, so the
-        // samplers always reference a valid texture even when a body draws with uMapBlend = 0 (no warning).
-        uint albedoTex = map is { Ready: true } ? map.AlbedoTex : _dummyTex;
-        uint normalTex = map is { Ready: true } ? map.NormalTex : _dummyTex;
-        _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, albedoTex);
-        _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, normalTex);
+        // The map sampler units are fixed (0 = albedo, 1 = normal); DrawBody binds each body's own map (or a
+        // complete 1×1 placeholder) to them, so a body drawn with uMapBlend = 0 still references valid textures.
         _planetShader.SetInt("uAlbedoMap", 0);
         _planetShader.SetInt("uNormalMap", 1);
-        _gl.ActiveTexture(TextureUnit.Texture0);
-        DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f, SurfaceParams.None, useMap: false);
+        DrawBody(viewProj, sunRel, system.Sun.RadiusMeters, system.Sun.Color, sunRel, emissive: 1f, SurfaceParams.None, map: null);
 
         // --- Planets + moons (lit) ---
+        // Each body binds its OWN baked map, if one is resident, so a planet and its moon(s) can each show
+        // their exact surface in the same frame; bodies with no map read from the procedural model.
         foreach (Planet p in system.Planets)
         {
             // The terrain renderer draws the active body as a detailed cube-sphere instead — skip
@@ -324,14 +336,14 @@ void main() { FragColor = uColor; }";
             if (!ReferenceEquals(p, terrainBody))
             {
                 Vector3D<float> rel = p.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, rel, p.RadiusMeters, p.SurfaceAlbedo, sunRel, emissive: 0f, ParamsFor(p), p.Seed == mapId);
+                DrawBody(viewProj, rel, p.RadiusMeters, p.SurfaceAlbedo, sunRel, emissive: 0f, ParamsFor(p), maps?.Get(p.Seed));
             }
 
             foreach (Moon mn in p.Moons)
             {
                 if (ReferenceEquals(mn, terrainBody)) continue;
                 Vector3D<float> mrel = mn.CurrentPosition.ToCameraRelative(cam);
-                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.SurfaceAlbedo, sunRel, emissive: 0f, ParamsFor(mn), mn.Seed == mapId);
+                DrawBody(viewProj, mrel, mn.RadiusMeters, mn.SurfaceAlbedo, sunRel, emissive: 0f, ParamsFor(mn), maps?.Get(mn.Seed));
             }
         }
 
@@ -385,7 +397,7 @@ void main() { FragColor = uColor; }";
     }
 
     private void DrawBody(in Matrix4X4<float> viewProj, Vector3D<float> rel, double radius,
-        Vector3D<float> color, Vector3D<float> sunRel, float emissive, in SurfaceParams sp, bool useMap)
+        Vector3D<float> color, Vector3D<float> sunRel, float emissive, in SurfaceParams sp, PlanetSurfaceMap? map)
     {
         Matrix4X4<float> model = Matrix4X4.CreateScale((float)radius) * Matrix4X4.CreateTranslation(rel);
         _planetShader.SetMatrix("uModel", model);
@@ -405,11 +417,16 @@ void main() { FragColor = uColor; }";
         _planetShader.SetVector3("uSeedOffset", sp.SeedOffset);
         _planetShader.SetFloat("uSpecStrength", sp.SpecStrength);
         _planetShader.SetFloat("uSpecPower", sp.SpecPower);
-        // Ease the baked map in only for the body it was baked for, and only as you close in — so distant
-        // bodies always read from the procedural model (no popping as 'nearest' moves between them) and the
-        // one you approach dissolves smoothly into its real surface.
+        // Bind this body's baked map (or the complete 1×1 placeholder when it has none) to the fixed sampler
+        // units, then ease it in as you close on this body — so distant bodies read from the procedural model
+        // (no popping as you move between them) and the one(s) you approach dissolve into their real surface.
+        uint albedoTex = map is { Ready: true } ? map.AlbedoTex : _dummyTex;
+        uint normalTex = map is { Ready: true } ? map.NormalTex : _dummyTex;
+        _gl.ActiveTexture(TextureUnit.Texture0); _gl.BindTexture(TextureTarget.Texture2D, albedoTex);
+        _gl.ActiveTexture(TextureUnit.Texture1); _gl.BindTexture(TextureTarget.Texture2D, normalTex);
+        _gl.ActiveTexture(TextureUnit.Texture0);
         float mapBlend = 0f;
-        if (useMap)
+        if (map is { Ready: true })
         {
             double dist = rel.Length;
             double near = radius * MapFadeNearRadii, far = radius * MapFadeFarRadii;
@@ -438,12 +455,16 @@ void main() { FragColor = uColor; }";
             return new SurfaceParams(0f, 0f, 0f, 0f, 0f, off, GasGiant: 1f, BandFreq: (float)rng.Range(10.0, 22.0),
                 SpecStrength: 0f, SpecPower: 8f);
         bool airless = !b.HasAtmosphere;
+        // Craters + maria only on worlds whose terrain actually rolled a cratered style (mirrors
+        // PlanetTerrain.IsCratered) — NOT every airless body. A dune/plains airless moon must read as its
+        // true tan surface from orbit, so it doesn't snap grey→tan when its baked map loads.
+        bool cratered = b.IsCratered;
         return new SurfaceParams(
             ReliefAmp: (float)(b.RadiusMeters * (airless ? 0.020 : 0.012)),
             ReliefFreq: 6f,
-            CraterStrength: airless ? 1f : 0f,
+            CraterStrength: cratered ? 1f : 0f,
             CraterFreq: 22f,
-            MariaStrength: airless ? 0.6f : 0f,
+            MariaStrength: cratered ? 0.6f : 0f,
             SeedOffset: off, GasGiant: 0f, BandFreq: 0f,
             SpecStrength: airless ? 0.03f : 0.06f,   // matte rock vs a faint mineral/damp sheen
             SpecPower: airless ? 24f : 30f);

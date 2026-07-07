@@ -56,8 +56,8 @@ internal static class Program
     private static double _cityHeight;
     private static ulong _cityBodyId = ulong.MaxValue;
     private static int _cityRecalc;
-    private static PlanetSurfaceMap _surfaceMap = null!;
-    private static ulong _mapBodyId = ulong.MaxValue;
+    private static PlanetSurfaceMapCache _surfaceMaps = null!;
+    private static readonly List<(double Dist, CelestialBody Body)> _mapCandidates = new();
     private static RoverController _rover = null!;
     private static RoverRenderer _roverRenderer = null!;
     private static SceneFramebuffer _sceneFbo = null!;
@@ -87,8 +87,9 @@ internal static class Program
     private static ulong _prevEnvBodySeed;       // edge-track: body whose environment we're inside
     private const double AirlessEnvShell = 0.05; // notional environment shell (× radius) for airless worlds
 
-    private const double TerrainActivateRadii = 40.0; // switch to terrain LOD within N planet radii (~50,000 km for a small world)
-    private const double MapActivateRadii = 240.0;    // bake/keep the surface map only within N radii — above the sphere's fade band (SystemRenderer.MapFadeFarRadii) so it's resident before it eases in; distant bodies stay procedural
+    private const double TerrainActivateRadii = 80.0; // switch to the quadtree terrain LOD within N planet radii (~100,000 km for a small world). The distant sphere samples the SAME GPU-baked surface (albedo + normal) the quadtree draws from, so the sphere→quadtree handoff is seamless at any distance — no need to engage terrain early to hide a mismatch. Kept well below the sphere's full-map radius (SystemRenderer.MapFadeNearRadii) so the sphere shows the real map for the whole approach, then hands to the quadtree only once genuinely close.
+    private const double MapActivateRadii = 360.0;    // bake/keep a surface map only within N radii — above the sphere's fade band (SystemRenderer.MapFadeFarRadii = 320) so it's baked and resident before it eases in; distant bodies stay procedural
+    private const int SurfaceMapCount = 8;            // how many bodies can hold a baked surface map at once (a planet + its moons in one frame); the nearest few are kept, ~17 MB GPU each
     private const double ScanRangeRadii = 80.0;       // scanner reaches a body within N of its radii
     private const string TuningPath = "tuning.json";
     private static string _tuningStatus = "";
@@ -260,7 +261,7 @@ internal static class Program
         _eruptions = new VolcanoEruptionRenderer(_gl);
         _scatter = new ScatterRenderer(_gl);
         _city = new CityRenderer(_gl);
-        _surfaceMap = new PlanetSurfaceMap(_gl);
+        _surfaceMaps = new PlanetSurfaceMapCache(_gl, SurfaceMapCount);
         _rover = new RoverController(_camera, _window.Keyboard, _window.Mouse, _terrainRenderer);
         _roverRenderer = new RoverRenderer(_gl);
         _sceneFbo = new SceneFramebuffer(_gl);
@@ -686,25 +687,28 @@ internal static class Program
 
         if (_systemManager.HasActive)
         {
-            // Keep an albedo+normal surface map baked for the nearest surfaced body you're APPROACHING, so
-            // its distant sphere and its near terrain sample one source (a crater seen from orbit is the one
-            // you land in). Gated to approach range: a body far across the system never gets a map, so the
-            // sphere renderer shows every distant body from its one consistent procedural model instead of
-            // popping one to the baked look as the 'nearest' title moves between them. Re-baked only when the
-            // approached body changes; uploaded on this thread. (The bake radius sits above the shader's
-            // cross-fade band so the map is resident before it starts easing in — see MapFadeFarRadii.)
-            CelestialBody? mapBody = NearestSurfacedBody();
-            if (mapBody != null &&
-                mapBody.CurrentPosition.DistanceTo(_camera.Position) > mapBody.RadiusMeters * MapActivateRadii)
-                mapBody = null; // too far to matter — leave it (and every other distant body) procedural
-            if (mapBody != null && mapBody.Seed != _mapBodyId)
+            // Keep albedo+normal surface maps baked for the nearest FEW surfaced bodies you're APPROACHING, so
+            // their distant spheres and their near terrain sample one source (a crater seen from orbit is the
+            // one you land in) — and so a planet and its moon(s) can each show their real surface in the same
+            // frame, not just the single nearest. Gated to approach range: a body far across the system never
+            // gets a map, so the sphere renderer shows every distant body from its one consistent procedural
+            // model instead of popping to the baked look. Capped to the map set's size, nearest kept; each
+            // body's map is baked once and uploaded on this thread. (The bake radius sits above the shader's
+            // cross-fade band so a map is resident before it starts easing in — see MapFadeFarRadii.)
+            _mapCandidates.Clear();
+            foreach (CelestialBody b in _systemManager.Active!.AllBodies())
             {
-                _mapBodyId = mapBody.Seed;
-                _surfaceMap.Request(new PlanetTerrain(mapBody), mapBody.Seed);
+                if (!b.HasSurface) continue;
+                double d = b.CurrentPosition.DistanceTo(_camera.Position);
+                if (d <= b.RadiusMeters * MapActivateRadii) _mapCandidates.Add((d, b));
             }
-            _surfaceMap.Update();
+            _mapCandidates.Sort((a, c) => a.Dist.CompareTo(c.Dist));
+            int keep = Math.Min(_mapCandidates.Count, SurfaceMapCount);
+            // Request farthest-of-the-kept first so the nearest end up most-recently-used and never evicted.
+            for (int i = keep - 1; i >= 0; i--) _surfaceMaps.Request(_mapCandidates[i].Body);
+            _surfaceMaps.Update();
 
-            _systemRenderer.Render(_camera, _systemManager.Active!, _terrainTarget, _surfaceMap);
+            _systemRenderer.Render(_camera, _systemManager.Active!, _terrainTarget, _surfaceMaps);
             // Distance-scaled glow dots that mark each body from afar and fade as its sphere grows.
             _planetGlow.Render(_camera, _systemManager.Active!, _sceneFbo.Height, _terrainTarget);
             // A brighter glow on the sun itself — its catalog dot is suppressed while the system is
@@ -761,7 +765,7 @@ internal static class Program
             // while the terrain writes fresh, correctly-linearisable depth. Their depth was only needed
             // to self-occlude during their own pass; when landed they never sit in front of the terrain.
             _gl.Clear((uint)ClearBufferMask.DepthBufferBit);
-            _terrainRenderer.Render(_camera, sunDir, (float)_renderClock, _surfaceMap);
+            _terrainRenderer.Render(_camera, sunDir, (float)_renderClock, _surfaceMaps);
 
             // Rover over the terrain it just drew — same near/far so it shares the depth buffer and
             // the depth-aware atmosphere composites over it correctly.

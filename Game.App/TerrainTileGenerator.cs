@@ -762,9 +762,111 @@ void main() {
     private const string SurfaceSource =
         GenHeaderGlsl + ColorUniformsGlsl + GenFieldGlsl + FieldGlsl + ColorHelpersGlsl + SurfaceMainGlsl;
 
+    // EQUIRECT map pass (MRT albedo + object-space normal): the distant sphere's baked surface, rendered
+    // straight from the SAME field + biome/regolith GLSL the quadtree tiles use — so the sphere and the
+    // quadtree it hands off to are the one surface, not two divergent CPU/GPU ports. Direction comes from the
+    // equirect UV (inverse of the sphere shader's dirToUv), and the shape is sampled in DIRECT coordinates:
+    // the tile pass's split-coordinate precision only matters at the sub-metre octaves a whole-sphere map
+    // never resolves, and fine layers (micro / dune / lineae GEOMETRY) are sub-texel here (their ALBEDO
+    // tints still apply). Band-limited to one texel arc, so it matches the coarse orbital look.
+    private const string EquirectMainGlsl = @"
+uniform int uMapW;
+uniform int uMapH;
+uniform float uHasOcean;
+uniform float uSeaLevel;
+uniform vec3 uOctMap;         // continent / mountain / detail octave counts at the map band-limit
+uniform float uCraterOctMap;  // crater cascade octaves at the map band-limit
+
+vec3 mapDir(vec2 uv) {
+    float lon = (uv.x - 0.5) * 6.28318530718;
+    float lat = (uv.y - 0.5) * 3.14159265359;
+    float cl = cos(lat);
+    return vec3(cl * cos(lon), sin(lat), cl * sin(lon));
+}
+float shapeMap(vec3 dir) {
+    float cont = fbm(dir, uFreq.x, uOctMap.x, uGain.x);
+    float rugged = ruggedness(dir);
+    float mask = smoothstep(-0.2, 0.4, cont);
+    vec3 warped = dir + domainWarp(dir);
+    float mtn = ridged(warped, uFreq.y, uOctMap.y, uGain.y);
+    float det = erodedFbm(dir, uFreq.z, uOctMap.z, uGain.z);
+    float detailGate = uDetailFloor + (1.0 - uDetailFloor) * rugged;
+    float strata = uStrataWeight > 0.0
+        ? terrace(fbm(dir + vec3(8.2, 71.5, 3.6), uStrataFreq, 4.0, 0.5), uStrataSteps, uStrataSharp) : 0.0;
+    return uWeight.x * cont + uWeight.y * mtn * mask * rugged + uWeight.z * det * detailGate
+         + uStrataWeight * strata;
+}
+float heightMap(vec3 dir) {
+    float craterF = uCraterWeight > 0.0 ? craterField(dir, uCraterFreq, uCraterOctMap, uCraterDensity) : 0.0;
+    float volcano = uVolcanoWeight > 0.0 ? volcanoField(dir, uVolcanoFreq, uVolcanoDensity).x : 0.0;
+    return uScale * (shapeMap(dir) + uCraterWeight * craterF + uVolcanoWeight * volcano);
+}
+layout(location = 0) out vec4 oAlbedo;
+layout(location = 1) out vec4 oNormal;
+void main() {
+    vec3 dir = mapDir(vUV);
+    // Object-space normal from a central height difference along two surface tangents, one texel-arc wide.
+    vec3 upRef = abs(dir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 east = normalize(cross(upRef, dir));
+    vec3 north = cross(dir, east);
+    float d = 6.28318530718 / float(uMapW);            // angular texel step (radians)
+    vec3 dE = normalize(dir + east * d),  dW = normalize(dir - east * d);
+    vec3 dN = normalize(dir + north * d), dS = normalize(dir - north * d);
+    float h0 = heightMap(dir);
+    if (uHasOcean > 0.5 && h0 < uSeaLevel) {
+        // Below the waterline the sphere (no separate water pass) must show the WATER surface, flat + blue.
+        float f = clamp((uSeaLevel - h0) / (uAmplitude * 0.12 + 1.0), 0.0, 1.0);
+        oAlbedo = vec4(mix(vec3(0.20, 0.55, 0.62), vec3(0.02, 0.10, 0.26), f), 1.0);
+        oNormal = vec4(dir * 0.5 + 0.5, 1.0);
+        return;
+    }
+    float R = uRadiusM;
+    vec3 pE = dE * (R + heightMap(dE)), pW = dW * (R + heightMap(dW));
+    vec3 pN = dN * (R + heightMap(dN)), pS = dS * (R + heightMap(dS));
+    vec3 nrm = cross(pE - pW, pN - pS);
+    if (dot(nrm, dir) < 0.0) nrm = -nrm;
+    nrm = length(nrm) > 0.0 ? normalize(nrm) : dir;
+
+    float slope = clamp(dot(nrm, dir), 0.0, 1.0);
+    vec3 up = dir;
+    float vCrater = uCraterWeight > 0.0 ? craterField(dir, uCraterFreq, uCraterOctMap, uCraterDensity) : 0.0;
+    vec3 col = biomeColor(up, h0, slope);
+    if (uIsCratered > 0.5) {
+        if (uCraterAlbedo > 0.0) {
+            float dark   = max(0.0, -vCrater);
+            float bright = max(0.0,  vCrater) / 0.28;
+            col *= 1.0 - 0.45 * uCraterAlbedo * dark;
+            col *= 1.0 + 0.30 * uCraterAlbedo * bright;
+        }
+        if (uMariaStrength > 0.0) {
+            float m = fbm3(up + vec3(23.7, 88.1, 4.3), uMariaFreq);
+            float maria = smoothstep(0.08, 0.5, m);
+            vec3 mare = vec3(col.r * 0.55, col.g * 0.56, col.b * 0.60);
+            col = mix(col, mare, maria * uMariaStrength);
+        }
+    }
+    if (uIsIcy > 0.5 && uCrackWeightR > 0.0) {
+        float vA = 1.0 - abs(tfFbm(up + vec3(2.7, 33.1, 8.9), uCrackFreqR, 4.0, 0.5, uSeedR));
+        float vB = 1.0 - abs(tfFbm(up + vec3(19.3, 4.7, 27.7), uCrackFreqR, 4.0, 0.5, uSeedR));
+        float lin = max(smoothstep(0.88, 0.97, vA), 0.7 * smoothstep(0.88, 0.97, vB));
+        col = mix(col, vec3(0.48, 0.30, 0.20), 0.55 * lin);
+    }
+    if (uIsDesert > 0.5 && uDuneWeightR > 0.0) {
+        float erg = smoothstep(0.05, 0.40, tfFbm(up + vec3(91.7, 23.3, 55.1), uErgFreqR, 3.0, 0.5, uSeedR));
+        col = mix(col, col * vec3(1.06, 0.82, 0.55), 0.5 * erg);
+    }
+    oAlbedo = vec4(col, 1.0);
+    oNormal = vec4(nrm * 0.5 + 0.5, 1.0);
+}";
+
+    private const string EquirectSource =
+        GenHeaderGlsl + ColorUniformsGlsl + GenFieldGlsl + FieldGlsl + ColorHelpersGlsl + EquirectMainGlsl;
+
     private readonly GL _gl;
     private readonly Shader _shader;       // height pass (RG=height, BA=crater), at the mesh vertex resolution
     private readonly Shader _surfShader;   // surface pass (MRT normal + color), at the finer surface-tile res
+    private readonly Shader _equirectShader; // equirect albedo+normal map pass (distant sphere's baked surface)
+    private uint _equirectFbo;             // FBO for the equirect pass (attaches the caller's two map textures)
     private readonly uint _emptyVao; // attributeless fullscreen-triangle draws need a bound VAO in core
 
     public TerrainTileGenerator(GL gl)
@@ -772,7 +874,86 @@ void main() {
         _gl = gl;
         _shader = new Shader(gl, VertexSource, FragmentSource);
         _surfShader = new Shader(gl, VertexSource, SurfaceSource);
+        _equirectShader = new Shader(gl, VertexSource, EquirectSource);
         _emptyVao = gl.GenVertexArray();
+    }
+
+    /// <summary>Bake a body's equirectangular albedo (attachment0) + object-space normal (attachment1) map
+    /// into the two provided <paramref name="width"/>×<paramref name="height"/> RGB textures — the distant
+    /// sphere's surface, from the SAME field/biome GLSL the quadtree bakes, so the two can't diverge. Runs on
+    /// the render thread in a few ms (vs seconds for the old CPU bake). The caller owns the textures (must be
+    /// allocated at width×height) and sets their filtering/mipmaps after.</summary>
+    public unsafe void BakeEquirect(uint albedoTex, uint normalTex, int width, int height,
+        in PlanetTerrain.GpuTerrainParams p, PlanetTerrain terrain, float craterAlbedo, float mariaStrength)
+    {
+        if (_equirectFbo == 0) _equirectFbo = _gl.GenFramebuffer();
+
+        Span<int> prevFbo = stackalloc int[1];
+        Span<int> prevVp = stackalloc int[4];
+        _gl.GetInteger(GetPName.DrawFramebufferBinding, prevFbo);
+        _gl.GetInteger(GetPName.Viewport, prevVp);
+        bool depth = _gl.IsEnabled(EnableCap.DepthTest);
+        if (depth) _gl.Disable(EnableCap.DepthTest);
+
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _equirectFbo);
+        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, albedoTex, 0);
+        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment1,
+            TextureTarget.Texture2D, normalTex, 0);
+        Span<GLEnum> bufs = stackalloc GLEnum[] { GLEnum.ColorAttachment0, GLEnum.ColorAttachment1 };
+        fixed (GLEnum* pb = bufs) _gl.DrawBuffers(2, pb);
+        _gl.Viewport(0, 0, (uint)width, (uint)height);
+
+        _equirectShader.Use();
+        SetEquirectUniforms(_equirectShader, p, terrain, craterAlbedo, mariaStrength, width, height);
+        _gl.BindVertexArray(_emptyVao);
+        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        _gl.BindVertexArray(0);
+
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, (uint)prevFbo[0]);
+        _gl.Viewport(prevVp[0], prevVp[1], (uint)prevVp[2], (uint)prevVp[3]);
+        if (depth) _gl.Enable(EnableCap.DepthTest);
+    }
+
+    private static void SetEquirectUniforms(Shader sh, in PlanetTerrain.GpuTerrainParams p, PlanetTerrain terrain,
+        float craterAlbedo, float mariaStrength, int width, int height)
+    {
+        double texArc = 2.0 * Math.PI * terrain.Radius / width; // metres across one texel at the equator
+        // Field uniforms the direct-coordinate shapeMap/heightMap read (a subset of SetGenUniforms — the
+        // split-coordinate bases aren't used by the equirect main).
+        sh.SetVector3("uSeed", SeedOffset(p.Seed));
+        sh.SetVector3("uFreq", new Vector3D<float>((float)p.ContinentFreq, (float)p.MountainFreq, (float)p.DetailFreq));
+        sh.SetVector3("uWeight", new Vector3D<float>((float)p.ContinentWeight, (float)p.MountainWeight, (float)p.DetailWeight));
+        sh.SetVector3("uGain", new Vector3D<float>((float)p.ContinentGain, (float)p.MountainGain, (float)p.DetailGain));
+        sh.SetFloat("uScale", (float)p.Scale);
+        sh.SetFloat("uWarpFreq", (float)p.WarpFreq);
+        sh.SetFloat("uWarpStrength", (float)p.WarpStrength);
+        sh.SetFloat("uRuggedFreq", (float)p.RuggedFreq);
+        sh.SetFloat("uRuggedLo", (float)p.RuggedLo);
+        sh.SetFloat("uRuggedHi", (float)p.RuggedHi);
+        sh.SetFloat("uDetailFloor", (float)p.DetailFloor);
+        sh.SetFloat("uCraterWeight", (float)p.CraterWeight);
+        sh.SetFloat("uCraterDensity", (float)p.CraterDensity);
+        sh.SetFloat("uCraterFreq", (float)p.CraterFreq);
+        sh.SetFloat("uVolcanoWeight", (float)p.VolcanoWeight);
+        sh.SetFloat("uVolcanoFreq", (float)p.VolcanoFreq);
+        sh.SetFloat("uVolcanoDensity", (float)p.VolcanoDensity);
+        sh.SetFloat("uStrataWeight", (float)p.StrataWeight);
+        sh.SetFloat("uStrataFreq", (float)p.StrataFreq);
+        sh.SetFloat("uStrataSteps", p.StrataSteps);
+        sh.SetFloat("uStrataSharp", (float)p.StrataSharp);
+        sh.SetFloat("uRadiusM", (float)terrain.Radius);
+        sh.SetVector3("uOctMap", new Vector3D<float>(
+            (float)OctClamp(terrain, p.ContinentFreq, texArc, p.MaxContinentOctaves),
+            (float)OctClamp(terrain, p.MountainFreq, texArc, p.MaxMountainOctaves),
+            (float)OctClamp(terrain, p.DetailFreq, texArc, p.MaxDetailOctaves)));
+        sh.SetFloat("uCraterOctMap", (float)(p.CraterWeight > 0.0 ? terrain.CraterOctavesForSpacing(texArc) : 0.0));
+        sh.SetInt("uMapW", width);
+        sh.SetInt("uMapH", height);
+        sh.SetFloat("uHasOcean", terrain.HasOcean ? 1f : 0f);
+        sh.SetFloat("uSeaLevel", (float)terrain.SeaLevelMeters);
+        // Biome / regolith colour block (identical to the surface tile pass).
+        SetColorUniforms(sh, p, craterAlbedo, mariaStrength);
     }
 
     /// <summary>
@@ -1002,7 +1183,9 @@ void main() {
     public void Dispose()
     {
         _gl.DeleteVertexArray(_emptyVao);
+        if (_equirectFbo != 0) _gl.DeleteFramebuffer(_equirectFbo);
         _shader.Dispose();
         _surfShader.Dispose();
+        _equirectShader.Dispose();
     }
 }
