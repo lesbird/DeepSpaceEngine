@@ -55,6 +55,15 @@ uniform vec3  uWind, uSunColor, uAmbient;
 uniform float uG;
 uniform sampler2D uDepth;              // scene depth (full-res) for occlusion
 uniform float uNear, uFar, uRpMeters;
+// Temporal reprojection: only 1-in-16 pixels march each frame; the rest reproject last frame's result.
+// uHistory = last frame's half-res cloud buffer; uPrevViewProj maps a camera-relative point (rp units)
+// into last frame's NDC; uPlanetPrev is last frame's planet centre (camera-relative, rp units) so a
+// planet-anchored point can be turned back into last frame's camera-relative space.
+uniform sampler2D uHistory;
+uniform mat4  uPrevViewProj;
+uniform vec3  uPlanetPrev;
+uniform int   uFrameIndex;             // 0..15, which 4x4 slot marches fresh this frame
+uniform float uHasHistory;             // 0 = no valid history (first frame / teleport) -> march all
 out vec4 FragColor;
 
 const int PRIMARY = 24;
@@ -133,11 +142,11 @@ float lightTau(vec3 P) {
 }
 // Ordered 4x4 Bayer dither in [0,1) — a stable march-start offset that upscales far cleaner than
 // per-pixel random noise (which created the speckle).
-float bayer(vec2 p) {
+int bayerIndex(vec2 p) {
     int M[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
-    int i = int(mod(p.x, 4.0)) + int(mod(p.y, 4.0)) * 4;
-    return float(M[i]) / 16.0;
+    return M[int(mod(p.x, 4.0)) + int(mod(p.y, 4.0)) * 4];
 }
+float bayer(vec2 p) { return float(bayerIndex(p)) / 16.0; }
 
 void main() {
     const vec4 CLEAR = vec4(0.0, 0.0, 0.0, 1.0);
@@ -161,6 +170,23 @@ void main() {
         tEnd = min(tEnd, geom);
     }
     if (tEnd <= tStart) { FragColor = CLEAR; return; }
+
+    // Temporal amortisation. This pixel only marches fresh if it owns this frame's 4x4 slot; otherwise
+    // it reprojects last frame's colour. Anchor at the mid-march depth, convert to a planet-relative
+    // point (stable across camera motion), shift into last frame's camera space and project. If that
+    // lands off-screen (disocclusion at a screen edge) we fall through and march it this frame instead.
+    if (bayerIndex(gl_FragCoord.xy) != uFrameIndex && uHasHistory > 0.5) {
+        float tAnchor = 0.5 * (tStart + tEnd);
+        vec3 q = rd * tAnchor - uPlanet;                 // planet-relative (rp units)
+        vec4 pc = uPrevViewProj * vec4(q + uPlanetPrev, 1.0);
+        if (pc.w > 0.0) {
+            vec2 puv = (pc.xy / pc.w) * 0.5 + 0.5;
+            if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
+                FragColor = texture(uHistory, puv);
+                return;
+            }
+        }
+    }
 
     float seg = (tEnd - tStart) / float(PRIMARY);
     float segM = seg * uRpMeters;
@@ -277,8 +303,18 @@ void main() {
     private readonly Shader _composite;
     private readonly Shader _shell;
     private readonly uint _vao;
-    private readonly ColorTarget _half;   // half-resolution cloud buffer (volumetric only)
+    // Half-res cloud buffers, ping-ponged for temporal reprojection: one holds last frame's result
+    // (read as history), the other receives this frame's mix of freshly-marched + reprojected pixels.
+    private readonly ColorTarget _accumA;
+    private readonly ColorTarget _accumB;
+    private bool _readIsA = true;         // which buffer is last frame's history this frame
     private int _fullW, _fullH;
+
+    // Previous-frame state feeding the reprojection (see the march shader's uPrev* uniforms).
+    private Matrix4X4<float> _prevViewProj = Matrix4X4<float>.Identity;
+    private Vector3D<float> _prevPlanetScaled;
+    private bool _hasHistory;
+    private int _frameIndex;              // cycles 0..15 across volumetric frames
 
     public CloudRenderer(GL gl)
     {
@@ -287,14 +323,18 @@ void main() {
         _composite = new Shader(gl, VertexSource, CompositeFragment);
         _shell = new Shader(gl, VertexSource, ShellFragment);
         _vao = gl.GenVertexArray();
-        _half = new ColorTarget(gl);
+        _accumA = new ColorTarget(gl);
+        _accumB = new ColorTarget(gl);
     }
 
     /// <summary>Match the half-res buffer to the (full) framebuffer size.</summary>
     public void Resize(int fullWidth, int fullHeight)
     {
         _fullW = fullWidth; _fullH = fullHeight;
-        _half.Resize(Math.Max(1, fullWidth / 2), Math.Max(1, fullHeight / 2));
+        int hw = Math.Max(1, fullWidth / 2), hh = Math.Max(1, fullHeight / 2);
+        _accumA.Resize(hw, hh);
+        _accumB.Resize(hw, hh);
+        _hasHistory = false;              // buffers were reallocated — last frame's data is gone
     }
 
     /// <summary>
@@ -337,14 +377,32 @@ void main() {
         if (Volumetric)
         {
             // #3: raymarch the shell into the half-res buffer (writes every pixel; no clear/blend),
-            // then upscale-composite over the scene.
+            // then upscale-composite over the scene. Temporal reprojection: this frame marches only the
+            // 4x4 slot uFrameIndex fresh and reprojects the rest from last frame's buffer (~1/16 march
+            // cost in steady state). read = last frame's result (history), write = this frame's output.
+            ColorTarget read = _readIsA ? _accumA : _accumB;
+            ColorTarget write = _readIsA ? _accumB : _accumA;
+
+            // History is only valid if it exists AND the planet didn't jump (a fly-to teleport would make
+            // last frame's reprojection anchors meaningless — force a full march that frame instead).
+            bool historyValid = _hasHistory &&
+                Vector3D.Distance(planetScaled, _prevPlanetScaled) < 0.15f;
+
             float rin = 1.0f + baseAlt;
             float rout = rin + atmH * 0.20f;
-            _half.Bind();
+            write.Bind();
             _gl.Disable(EnableCap.Blend);
             _march.Use();
+            _gl.ActiveTexture(TextureUnit.Texture0);
             _gl.BindTexture(TextureTarget.Texture2D, depthTexture);
             _march.SetInt("uDepth", 0);
+            _gl.ActiveTexture(TextureUnit.Texture1);
+            _gl.BindTexture(TextureTarget.Texture2D, read.ColorTexture);
+            _march.SetInt("uHistory", 1);
+            _march.SetMatrix("uPrevViewProj", _prevViewProj);
+            _march.SetVector3("uPlanetPrev", _prevPlanetScaled);
+            _march.SetInt("uFrameIndex", _frameIndex);
+            _march.SetFloat("uHasHistory", historyValid ? 1f : 0f);
             _march.SetFloat("uNear", near);
             _march.SetFloat("uFar", far);
             _march.SetFloat("uRpMeters", (float)rp);
@@ -370,9 +428,18 @@ void main() {
             _gl.Enable(EnableCap.Blend);
             _gl.BlendFunc(BlendingFactor.One, BlendingFactor.SrcAlpha);
             _composite.Use();
-            _gl.BindTexture(TextureTarget.Texture2D, _half.ColorTexture);
+            _gl.ActiveTexture(TextureUnit.Texture0);
+            _gl.BindTexture(TextureTarget.Texture2D, write.ColorTexture);
             _composite.SetInt("uCloud", 0);
             _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+
+            // Remember this frame's view + planet anchor for next frame's reprojection, flip the
+            // ping-pong so this output becomes next frame's history, and step the 4x4 march slot.
+            _prevViewProj = camera.ViewMatrix * camera.ProjectionMatrix;
+            _prevPlanetScaled = planetScaled;
+            _hasHistory = true;
+            _readIsA = !_readIsA;
+            _frameIndex = (_frameIndex + 1) & 15;
         }
         else
         {
@@ -430,7 +497,8 @@ void main() {
         _march.Dispose();
         _composite.Dispose();
         _shell.Dispose();
-        _half.Dispose();
+        _accumA.Dispose();
+        _accumB.Dispose();
         _gl.DeleteVertexArray(_vao);
     }
 }

@@ -1391,7 +1391,7 @@ internal static class Program
                 cr.Enabled = true; cr.Volumetric = false; cr.Coverage = 0.5f; cr.Density = 1.0f; cr.WindSpeed = 0.004f;
             }
             ImGui.TextDisabled(cr.Volumetric
-                ? "(volumetric raymarch — expensive)"
+                ? "(volumetric raymarch — temporally amortised, ~1/16 pixels/frame)"
                 : "(cheap analytic shell layer)");
         }
 
