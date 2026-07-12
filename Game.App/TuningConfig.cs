@@ -31,6 +31,14 @@ public sealed class TuningConfig
     public float GalaxyCloudBrightness { get; set; } = 1.0f;
     public float GalaxyCloudPointScale { get; set; } = 2.5f;
 
+    // High-speed motion streaks (defaults mirror MotionStreak's so an older tuning.json without this
+    // section deserializes to the same values it would use anyway).
+    public StreakMode StreakMode { get; set; } = StreakMode.Streaks;
+    public float StreakExposure { get; set; } = 0.05f;
+    public float StreakMaxLength { get; set; } = 0.2f;
+    public float StreakMinSpeed { get; set; } = 5.0e6f;
+    public float StreakScreenBlurStrength { get; set; } = 0.25f;
+
     // Atmosphere.
     public bool RenderAtmosphere { get; set; } = true;
     public float SunIntensity { get; set; } = 20f;
@@ -116,6 +124,11 @@ public sealed class TuningConfig
         GalaxyImpostorBrightness = g.ImpostorBrightness,
         GalaxyCloudBrightness = g.CloudBrightness,
         GalaxyCloudPointScale = g.CloudPointScale,
+        StreakMode = MotionStreak.Mode,
+        StreakExposure = MotionStreak.ExposureSeconds,
+        StreakMaxLength = MotionStreak.MaxStreakNdc,
+        StreakMinSpeed = MotionStreak.MinSpeedMps,
+        StreakScreenBlurStrength = MotionStreak.ScreenBlurStrength,
         RenderBackdrop = b.Enabled,
         BandBrightness = b.BandBrightness,
         BackdropStarBrightness = b.StarBrightness,
@@ -206,6 +219,11 @@ public sealed class TuningConfig
         g.ImpostorBrightness = GalaxyImpostorBrightness;
         g.CloudBrightness = GalaxyCloudBrightness;
         g.CloudPointScale = GalaxyCloudPointScale;
+        MotionStreak.Mode = StreakMode;
+        MotionStreak.ExposureSeconds = StreakExposure;
+        MotionStreak.MaxStreakNdc = StreakMaxLength;
+        MotionStreak.MinSpeedMps = StreakMinSpeed;
+        MotionStreak.ScreenBlurStrength = StreakScreenBlurStrength;
         b.Enabled = RenderBackdrop;
         b.BandBrightness = BandBrightness;
         b.StarBrightness = BackdropStarBrightness;

@@ -62,6 +62,7 @@ internal static class Program
     private static RoverRenderer _roverRenderer = null!;
     private static SceneFramebuffer _sceneFbo = null!;
     private static ColorTarget _postFbo = null!;
+    private static VelocityBlurRenderer _velocityBlur = null!;
     private static BloomRenderer _bloom = null!;
     private static SsaoRenderer _ssao = null!;
     private static LensFlareRenderer _lensFlare = null!;
@@ -174,6 +175,10 @@ internal static class Program
     private static string _starSearch = "";
     private static Star _searchTarget;
     private static bool _hasSearchTarget;
+    // Cache the nearest star's system summary so the HUD body-count readout doesn't re-roll every
+    // frame — only when the nearest star changes. (Describe is cheap, but this keeps it free.)
+    private static SystemInfo? _hudNearestSystem;
+    private static ulong _hudNearestSystemStarId;
     private static string _searchStatus = "";
     private static bool _galacticGridVisible;
     private static bool _paused;
@@ -203,6 +208,7 @@ internal static class Program
             _camera.AspectRatio = size.Y == 0 ? 1f : (float)size.X / size.Y;
             _sceneFbo.Resize(size.X, size.Y);
             _postFbo.Resize(size.X, size.Y);
+            _velocityBlur.Resize(size.X, size.Y);
             _bloom.Resize(size.X, size.Y);
             _ssao.Resize(size.X, size.Y);
             _cloudRenderer.Resize(size.X, size.Y);
@@ -266,12 +272,14 @@ internal static class Program
         _roverRenderer = new RoverRenderer(_gl);
         _sceneFbo = new SceneFramebuffer(_gl);
         _postFbo = new ColorTarget(_gl);
+        _velocityBlur = new VelocityBlurRenderer(_gl);
         _bloom = new BloomRenderer(_gl);
         _ssao = new SsaoRenderer(_gl);
         _lensFlare = new LensFlareRenderer(_gl);
         var fb = _window.Window.FramebufferSize;
         _sceneFbo.Resize(fb.X, fb.Y);
         _postFbo.Resize(fb.X, fb.Y);
+        _velocityBlur.Resize(fb.X, fb.Y);
         _bloom.Resize(fb.X, fb.Y);
         _ssao.Resize(fb.X, fb.Y);
         _cloudRenderer.Resize(fb.X, fb.Y);
@@ -520,6 +528,8 @@ internal static class Program
         UniversePosition? ridePrev = _terrainTarget?.CurrentPosition;
 
         if (!_driving && !_galaxy3DVisible) _controller.Update(dt); // ship is frozen while orbiting the 3D map
+        // Feed the flight velocity to the camera so the renderers can stretch stars/galaxies along it.
+        _camera.WorldVelocity = (_driving || _galaxy3DVisible) ? default : _controller.Velocity;
         _starPager.Update(_camera.Position, TrackRadiusLy * MathUtil.LightYear);
         _asteroidFields.Update(_camera.Position, AsteroidFieldRadiusCells);
         _systemManager.Update(dt, _camera.Position, _starPager);
@@ -655,7 +665,7 @@ internal static class Program
         // sun (the system pass renders it precisely; its catalog dot would otherwise sit slightly off
         // when viewed up close).
         _starRenderer.SyncBlocks(_starPager.LoadedBlocks, _renderClock);
-        _starRenderer.RenderCatalog(_camera, _systemManager.ActiveStarId);
+        _starRenderer.RenderCatalog(_camera, _sceneFbo.Width, _sceneFbo.Height, _systemManager.ActiveStarId);
 
         // Globular clusters in the host galaxy's halo: a fuzzy sprite from far, resolving into stars up close.
         _globularRenderer.Render(_camera, _sceneFbo.Height);
@@ -817,10 +827,16 @@ internal static class Program
             }
         }
 
-        // Post-process bloom: bright-pass + blur off _postFbo (scene + atmosphere), then composite
+        // Optional full-screen radial velocity blur (the streak backup mode), applied to the finished
+        // scene before bloom so the smear blooms too. In Off/Streaks modes this is a no-op passthrough.
+        uint sceneColor = _postFbo.ColorTexture;
+        if (MotionStreak.Mode == StreakMode.ScreenBlur)
+            sceneColor = _velocityBlur.Render(_postFbo.ColorTexture, _camera);
+
+        // Post-process bloom: bright-pass + blur off the scene (+ atmosphere), then composite
         // scene·ao + bloom to the screen. When disabled the composite is a straight copy (intensity 0).
-        uint bloomTex = _bloom.Enabled ? _bloom.Render(_postFbo.ColorTexture) : _postFbo.ColorTexture;
-        _bloom.Composite(_postFbo.ColorTexture, bloomTex, aoTex, aoStrength);
+        uint bloomTex = _bloom.Enabled ? _bloom.Render(sceneColor) : sceneColor;
+        _bloom.Composite(sceneColor, bloomTex, aoTex, aoStrength);
 
         // Lens flare for the active star, additive over the final image (inherits the composite's
         // full-res viewport on framebuffer 0). Occlusion-faded, so a planet's limb eclipses it.
@@ -898,6 +914,18 @@ internal static class Program
         dl.AddText(pos, color, line);
     }
 
+    /// <summary>The lightweight system summary for <paramref name="s"/>, cached so the HUD body-count
+    /// readout re-rolls only when the nearest star changes (Describe is deterministic per star).</summary>
+    private static SystemInfo NearestSystem(in Star s)
+    {
+        if (_hudNearestSystem == null || _hudNearestSystemStarId != s.Id)
+        {
+            _hudNearestSystem = SystemGenerator.Describe(s);
+            _hudNearestSystemStarId = s.Id;
+        }
+        return _hudNearestSystem;
+    }
+
     private static void DrawHud()
     {
         ImGui.SetNextWindowPos(new System.Numerics.Vector2(10, 10), ImGuiCond.Always);
@@ -936,6 +964,8 @@ internal static class Program
             ImGui.Text($"Nearest star: {s.Name}  ({s.ClassLetter}, #{s.Id})");
             ImGui.Text($"  {s.Temperature:0} K   lum {s.Luminosity:0.00} Lsun");
             ImGui.Text($"  Distance: {nLy:0.0000} ly");
+            SystemInfo nsys = NearestSystem(s);
+            ImGui.Text($"  G:{nsys.GiantCount}/P:{nsys.PlanetCount}/M:{nsys.MoonCount}/R:{nsys.RingedCount}");
             double nAu = _starPager.NearestDistanceMeters / MathUtil.AstronomicalUnit;
             if (nAu < _systemManager.SpawnAu)
                 ImGui.TextColored(new System.Numerics.Vector4(0.4f, 1f, 0.5f, 1f),
@@ -944,6 +974,12 @@ internal static class Program
         else
         {
             ImGui.Text("Nearest star: (none in range)");
+        }
+
+        if (_globularRenderer.TryGetNearest(_camera.Position, out GlobularCluster gc2, out double gcDistM))
+        {
+            double gcLy = gcDistM / MathUtil.LightYear;
+            ImGui.Text($"Nearest globular: {gcLy:0.0} ly  (Ø {gc2.RadiusLy * 2.0:0} ly)");
         }
 
         ImGui.Separator();
@@ -1003,12 +1039,25 @@ internal static class Program
             double fastestC = sys.MaxOrbitalSpeedMps * _systemManager.TimeScale / MathUtil.SpeedOfLight;
             ImGui.Text($"Time x{appScale:0} {(_paused ? "(PAUSED)" : "")} — fastest orbit {fastestC:0.000} c  [',' '.' Space]");
             ImGui.Text($"Sim time: {_systemManager.SimTime / 86400.0:0.0} days");
+            int ringed = 0;
+            double nearestRingedM = double.MaxValue;
             foreach (Planet pl in sys.Planets)
             {
                 double dist = pl.CurrentPosition.DistanceTo(_camera.Position);
                 string moons = pl.Moons.Length > 0 ? $"  ({pl.Moons.Length} moons)" : "";
-                ImGui.Text($"  {pl.Designation}  {pl.Type,-9} a={pl.SemiMajorAxis / MathUtil.AstronomicalUnit:0.00} AU  {FormatDistance(dist)}{moons}");
+                string rings = pl.HasRings ? "  ◉ rings" : "";
+                ImGui.Text($"  {pl.Designation}  {pl.Type,-9} a={pl.SemiMajorAxis / MathUtil.AstronomicalUnit:0.00} AU  {FormatDistance(dist)}{moons}{rings}");
+                if (pl.HasRings)
+                {
+                    ringed++;
+                    if (dist < nearestRingedM) nearestRingedM = dist;
+                }
             }
+            if (ringed > 0)
+                ImGui.TextColored(new System.Numerics.Vector4(0.85f, 0.8f, 0.6f, 1f),
+                    $"  Ringed worlds: {ringed}  —  nearest {FormatDistance(nearestRingedM)}");
+            else
+                ImGui.TextDisabled("  Ringed worlds: none");
 
             if (_terrainTarget != null)
             {
@@ -1333,6 +1382,20 @@ internal static class Program
             ImGui.SliderFloat("Falloff (gamma)", ref _starRenderer.CatGamma, 0.12f, 0.6f);
             ImGui.SliderFloat("Star size", ref _starRenderer.CatSizeScale, 1f, 20f);
             ImGui.SliderFloat("Max size", ref _starRenderer.CatMaxSize, 20f, 300f);
+        }
+
+        if (ImGui.CollapsingHeader("Motion streaks", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            // Primary = per-point geometry-shader streaks (stars + galaxy sprites); backup = a full-screen
+            // radial velocity blur. Both only kick in above the speed threshold.
+            int mode = (int)MotionStreak.Mode;
+            string[] modes = { "Off", "Per-point streaks", "Screen blur (backup)" };
+            if (ImGui.Combo("Mode", ref mode, modes, modes.Length)) MotionStreak.Mode = (StreakMode)mode;
+            ImGui.SliderFloat("Exposure (length)", ref MotionStreak.ExposureSeconds, 0.005f, 1f);
+            ImGui.SliderFloat("Max streak", ref MotionStreak.MaxStreakNdc, 0.02f, 2f);
+            ImGui.SliderFloat("Screen-blur strength", ref MotionStreak.ScreenBlurStrength, 0f, 0.6f);
+            bool on = MotionStreak.Mode != StreakMode.Off && _controller.Velocity.Length >= MotionStreak.MinSpeedMps;
+            ImGui.TextDisabled($"speed {FormatSpeed(_controller.ActualSpeed)}  ·  threshold {FormatSpeed(MotionStreak.MinSpeedMps)}  ·  {(on ? "ACTIVE" : "idle")}");
         }
 
         if (ImGui.CollapsingHeader("Galaxies (LOD)", ImGuiTreeNodeFlags.DefaultOpen))

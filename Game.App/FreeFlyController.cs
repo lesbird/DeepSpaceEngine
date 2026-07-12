@@ -76,6 +76,10 @@ public sealed class FreeFlyController
     /// <summary>Actual ground speed (m/s) measured from the distance moved last frame; 0 when coasting/idle.</summary>
     public double ActualSpeed { get; private set; }
 
+    /// <summary>World-space velocity (m/s): the current heading scaled by the actual ground speed. Zero
+    /// when idle. Feeds <see cref="Camera.WorldVelocity"/> for the motion-streak effect.</summary>
+    public Vector3D<double> Velocity => _moveDir * ActualSpeed;
+
     public FreeFlyController(Camera camera, IKeyboard keyboard, IMouse mouse)
     {
         _camera = camera;

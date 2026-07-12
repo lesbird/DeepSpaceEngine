@@ -38,10 +38,17 @@ public class RingTests
     }
 
     [Fact]
-    public void OnlyGiants_HaveRings()
+    public void OnlyGiantsOrLargeRockyWorlds_HaveRings()
     {
         foreach (Planet p in RingedPlanets())
-            Assert.True(p.Type is PlanetType.GasGiant or PlanetType.IceGiant);
+        {
+            bool giant = p.Type is PlanetType.GasGiant or PlanetType.IceGiant;
+            // Rocky/desert rings are the only non-giant case, and only above the size threshold.
+            bool largeRocky = p.Type is PlanetType.Rocky or PlanetType.Desert
+                && p.RadiusMeters > 1.3 * MathUtil.EarthRadiusM;
+            Assert.True(giant || largeRocky,
+                $"unexpected ringed planet type {p.Type} (r={p.RadiusMeters / MathUtil.EarthRadiusM:0.00} R⊕)");
+        }
     }
 
     [Fact]

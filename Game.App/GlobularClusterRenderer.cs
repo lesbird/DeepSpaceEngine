@@ -153,6 +153,21 @@ void main() {
     /// <summary>Swap in the clusters of the galaxy you've entered (empty array in intergalactic space).</summary>
     public void SetClusters(GlobularCluster[] clusters) => _clusters = clusters ?? Array.Empty<GlobularCluster>();
 
+    /// <summary>The globular cluster of the current galaxy whose centre is nearest <paramref name="pos"/>,
+    /// with that centre distance in metres. False in intergalactic space (no resident clusters). Scans the
+    /// full halo set, independent of the render range, so the Navigation readout is always meaningful.</summary>
+    public bool TryGetNearest(in UniversePosition pos, out GlobularCluster nearest, out double distMeters)
+    {
+        nearest = default;
+        distMeters = double.MaxValue;
+        foreach (GlobularCluster c in _clusters)
+        {
+            double d = c.Center.DistanceTo(pos);
+            if (d < distMeters) { distMeters = d; nearest = c; }
+        }
+        return _clusters.Length > 0;
+    }
+
     public unsafe void Render(Camera camera, float viewportHeight)
     {
         LastSprites = LastResolved = 0;

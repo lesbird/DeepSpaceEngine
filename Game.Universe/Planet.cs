@@ -14,8 +14,9 @@ public sealed class Planet : CelestialBody
     public double AxialTilt;
     public Moon[] Moons = Array.Empty<Moon>();
 
-    // Rings — a flat annulus in the planet's (tilted) equatorial plane. Only some giants
-    // have them; when <see cref="HasRings"/> is false the radii are zero. Radii are absolute
+    // Rings — a flat annulus in the planet's (tilted) equatorial plane. Common on giants, and a
+    // rare thin debris ring on large rocky/desert worlds; when <see cref="HasRings"/> is false the
+    // radii are zero. Radii are absolute
     // metres from the planet centre; the plane is tilted by <see cref="RingTilt"/> about the
     // axis at <see cref="RingTiltAzimuth"/>. <see cref="RingSeed"/> seeds the procedural banding.
     public bool HasRings;

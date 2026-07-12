@@ -15,6 +15,10 @@ public sealed class Camera
     public UniversePosition Position;
     public Quaternion<float> Orientation = Quaternion<float>.Identity;
 
+    /// <summary>Current world-space velocity in metres/second, refreshed each frame from the flight
+    /// controller. Drives the motion-streak effect (stars/galaxies stretch along it at high speed).</summary>
+    public Vector3D<double> WorldVelocity;
+
     public float FovRadians = MathF.PI / 3f; // 60°
     public float AspectRatio = 16f / 9f;
 

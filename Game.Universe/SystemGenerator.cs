@@ -13,13 +13,84 @@ public static class SystemGenerator
 {
     public static SolarSystem Generate(Star star)
     {
-        var rng = new DeterministicRng(Hashing.Combine(star.Id, 0x50A1u));
-
-        double au = MathUtil.AstronomicalUnit;
         double starMassKg = star.MassSolar * MathUtil.SolarMassKg;
-
         // Snow line scales with the square root of luminosity (~2.7 AU for the Sun).
         double snowLineAu = 2.7 * Math.Sqrt(Math.Max(star.Luminosity, 0.01));
+
+        // Roll the whole system from the main stream (types, orbits, rings, moons). This is the ONLY
+        // part <see cref="Describe"/> re-runs, so the summary always matches what actually spawns.
+        var rng = new DeterministicRng(Hashing.Combine(star.Id, 0x50A1u));
+        Planet[] planets = BuildPlanets(ref rng, star, snowLineAu, starMassKg);
+
+        // Heavy per-body detail — ring particles, scanner composition, atmosphere optics and the
+        // surface-albedo terrain probe. Every piece is seeded independently of the main stream above,
+        // so applying it here (rather than inline in the walk) leaves that stream byte-identical and
+        // lets Describe skip all of it.
+        foreach (Planet p in planets)
+        {
+            if (p.HasRings) AssignRings(p);
+            FinalizeBody(p);
+            foreach (Moon m in p.Moons) FinalizeBody(m);
+        }
+
+        // A main belt near the snow line (independent RNG, so it never perturbs the stream above).
+        AsteroidBelt? belt = AsteroidBelt.Generate(star, snowLineAu, starMassKg);
+
+        return new SolarSystem(star, planets, belt);
+    }
+
+    /// <summary>
+    /// Roll a lightweight snapshot of the system around <paramref name="star"/> — every planet and
+    /// moon with its type, orbit, size and ring/atmosphere flags — WITHOUT spawning it. It walks the
+    /// exact same main RNG stream as <see cref="Generate"/> but skips the expensive per-body detail
+    /// (ring particles, terrain albedo, composition), so it's cheap enough to call every frame for the
+    /// stars on the HUD. The result is guaranteed consistent with the full system that would spawn.
+    /// </summary>
+    public static SystemInfo Describe(in Star star)
+    {
+        double starMassKg = star.MassSolar * MathUtil.SolarMassKg;
+        double snowLineAu = 2.7 * Math.Sqrt(Math.Max(star.Luminosity, 0.01));
+
+        var rng = new DeterministicRng(Hashing.Combine(star.Id, 0x50A1u));
+        Planet[] planets = BuildPlanets(ref rng, star, snowLineAu, starMassKg);
+
+        var infos = new PlanetInfo[planets.Length];
+        int gas = 0, ice = 0, moons = 0, ringed = 0;
+        for (int i = 0; i < planets.Length; i++)
+        {
+            infos[i] = PlanetInfo.From(planets[i], i);
+            switch (planets[i].Type)
+            {
+                case PlanetType.GasGiant: gas++; break;
+                case PlanetType.IceGiant: ice++; break;
+            }
+            moons += planets[i].Moons.Length;
+            if (planets[i].HasRings) ringed++;
+        }
+        return new SystemInfo(star.Id, star.Designation, infos, gas, ice, moons, ringed);
+    }
+
+    /// <summary>Find the planet with <paramref name="planetId"/> (its <see cref="PlanetInfo.Id"/>) in an
+    /// already-described system. IDs are sequential per star, so reaching a planet always means walking
+    /// the whole system — describe it once, then look planets up from the snapshot.</summary>
+    public static bool TryGetPlanet(in SystemInfo system, ulong planetId, out PlanetInfo planet)
+    {
+        foreach (PlanetInfo p in system.Planets)
+            if (p.Id == planetId) { planet = p; return true; }
+        planet = null!;
+        return false;
+    }
+
+    /// <summary>Convenience: describe <paramref name="star"/>'s system and pull one planet by id.</summary>
+    public static bool TryDescribePlanet(in Star star, ulong planetId, out PlanetInfo planet)
+        => TryGetPlanet(Describe(star), planetId, out planet);
+
+    /// <summary>The main-stream walk shared by <see cref="Generate"/> and <see cref="Describe"/>: rolls
+    /// each planet's type, orbit, size, ring flag, atmosphere and moons. Deliberately leaves the heavy,
+    /// independently-seeded detail (see <see cref="FinalizeBody"/>, <see cref="AssignRings"/>) untouched.</summary>
+    private static Planet[] BuildPlanets(ref DeterministicRng rng, Star star, double snowLineAu, double starMassKg)
+    {
+        double au = MathUtil.AstronomicalUnit;
 
         int count = rng.NextDouble() < 0.12 ? 0 : Math.Clamp(rng.Poisson(3.2) + 1, 1, 9);
         var planets = new Planet[count];
@@ -50,23 +121,30 @@ public static class SystemGenerator
                 MassKg = mass,
                 AxialTilt = rng.Range(0, 0.5),
                 Color = ColorFor(type),
-                HasRings = (type is PlanetType.GasGiant or PlanetType.IceGiant) && rng.NextDouble() < 0.35,
+                // Giants ring often; a big rocky/desert world occasionally holds a thin debris ring
+                // (a shattered moon or captured belt). Small worlds never do.
+                HasRings = (type is PlanetType.GasGiant or PlanetType.IceGiant)
+                    ? rng.NextDouble() < 0.35
+                    : (type is PlanetType.Rocky or PlanetType.Desert
+                        && radius > 1.3 * MathUtil.EarthRadiusM && rng.NextDouble() < 0.04),
             };
-            if (planet.HasRings) AssignRings(planet);
             AssignAtmosphere(ref rng, planet);
             planet.SurfaceTempK = (float)EquilibriumTempK(star.Luminosity, aAu);
-            ApplyScanData(planet);
-            AtmosphereModel.Derive(planet); // composition + T + g + pressure → atmosphere look
-            AssignSurfaceAlbedo(planet);
             // Moons share the parent's distance from the star, so they inherit its temperature.
             planet.Moons = GenerateMoons(ref rng, planet, star.Designation, i + 1, planet.SurfaceTempK);
             planets[i] = planet;
         }
+        return planets;
+    }
 
-        // A main belt near the snow line (independent RNG, so it never perturbs the stream above).
-        AsteroidBelt? belt = AsteroidBelt.Generate(star, snowLineAu, starMassKg);
-
-        return new SolarSystem(star, planets, belt);
+    /// <summary>Apply the per-body detail that lives off the main RNG stream: scanner composition,
+    /// atmosphere optics and the surface-albedo terrain probe. Called for every planet and moon when a
+    /// system is actually spawned; skipped entirely by <see cref="Describe"/>.</summary>
+    private static void FinalizeBody(CelestialBody b)
+    {
+        ApplyScanData(b);
+        AtmosphereModel.Derive(b); // composition + T + g + pressure → atmosphere look
+        AssignSurfaceAlbedo(b);
     }
 
     private static Moon[] GenerateMoons(ref DeterministicRng rng, Planet planet, string starDesignation, int planetIndex, double tempK)
@@ -116,9 +194,8 @@ public static class SystemGenerator
                 SurfaceTempK = (float)moonTemp,
             };
             AssignMoonAtmosphere(ref rng, moon);
-            ApplyScanData(moon);
-            AtmosphereModel.Derive(moon); // composition + T + g + pressure → atmosphere look
-            AssignSurfaceAlbedo(moon);
+            // Scan data, atmosphere optics and surface albedo are applied later by FinalizeBody — all
+            // seeded off the main stream, so Describe can walk the same stream and skip this heavy work.
             moons[j] = moon;
         }
         return moons;
@@ -193,18 +270,24 @@ public static class SystemGenerator
     private static void AssignRings(Planet p)
     {
         var r = new DeterministicRng(Hashing.Combine(p.Seed, 0x21A6u));
+        bool rocky = p.Type is not (PlanetType.GasGiant or PlanetType.IceGiant);
 
         double inner = p.RadiusMeters * r.Range(1.4, 1.9);
-        double outer = inner * r.Range(1.5, 2.4);
+        // Rocky debris rings sit in a tighter, narrower annulus than a giant's broad ice ring.
+        double outer = inner * (rocky ? r.Range(1.2, 1.6) : r.Range(1.5, 2.4));
         p.RingInnerRadius = inner;
         p.RingOuterRadius = outer;
 
         float shade = (float)r.Range(0.55, 0.9);
-        Vector3D<float> tint = p.Type == PlanetType.IceGiant
-            ? new Vector3D<float>(0.72f, 0.80f, 0.90f)
-            : new Vector3D<float>(0.86f, 0.78f, 0.60f);
+        Vector3D<float> tint = p.Type switch
+        {
+            PlanetType.IceGiant => new Vector3D<float>(0.72f, 0.80f, 0.90f),
+            PlanetType.GasGiant => new Vector3D<float>(0.86f, 0.78f, 0.60f),
+            _ => new Vector3D<float>(0.60f, 0.55f, 0.50f),   // rocky debris: dusty grey-brown
+        };
         p.RingColor = tint * shade;
-        p.RingOpacity = (float)r.Range(0.45, 0.8);
+        // Rock/dust rings are thin and faint next to a giant's dense ice bands.
+        p.RingOpacity = (float)(rocky ? r.Range(0.25, 0.5) : r.Range(0.45, 0.8));
         p.RingTilt = (float)(p.AxialTilt + r.Range(-0.12, 0.12));
         p.RingTiltAzimuth = (float)r.Range(0, 2 * Math.PI);
         p.RingSeed = r.NextULong();

@@ -31,6 +31,22 @@ public sealed class StarOverlay
 
     private readonly List<(double DistSq, Star Star)> _scratch = new();
 
+    /// <summary>Per-star system summaries, memoised so the nearby-star labels don't re-roll every
+    /// star's system every frame. Describe is cheap, but caching keeps it allocation-free; the cache
+    /// is bounded so a long flight can't grow it without limit.</summary>
+    private readonly Dictionary<ulong, SystemInfo> _systemCache = new();
+
+    private SystemInfo SystemFor(in Star s)
+    {
+        if (!_systemCache.TryGetValue(s.Id, out SystemInfo? info))
+        {
+            if (_systemCache.Count > 256) _systemCache.Clear();
+            info = SystemGenerator.Describe(s);
+            _systemCache[s.Id] = info;
+        }
+        return info;
+    }
+
     // Set for the duration of one Draw call so the label helpers can credit discovered objects.
     private DiscoveryService? _discovery;
 
@@ -226,6 +242,11 @@ public sealed class StarOverlay
             dl.AddCircle(screen, 9f, col, 16, 1.5f);
             dl.AddText(screen + new Vector2(12, -8), col, $"{s.Name}{StarCredit(s)}");
             dl.AddText(screen + new Vector2(12, 6), Col(170, 190, 220, 200), $"{s.ClassLetter}  {distLy:0.00} ly");
+            SystemInfo sys = SystemFor(s);
+            string sysLine = sys.PlanetCount == 0
+                ? "no planets"
+                : $"G:{sys.GiantCount}/P:{sys.PlanetCount}/M:{sys.MoonCount}/R:{sys.RingedCount}";
+            dl.AddText(screen + new Vector2(12, 20), Col(150, 170, 200, 180), sysLine);
         }
     }
 

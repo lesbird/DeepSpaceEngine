@@ -104,7 +104,37 @@ void main() {
     FragColor = vec4(vColor, 1.0) * a;
 }";
 
+    // Streak variant of the catalog vertex stage: same inputs/brightness maths, but instead of a point
+    // size it emits the V2G interface block (clip now + clip one exposure ago) that MotionStreak's shared
+    // geometry stage expands into a velocity-aligned capsule. Used only above the speed threshold.
+    private const string CatStreakVert = @"#version 410 core
+layout(location = 0) in vec3 aPosHi;
+layout(location = 1) in vec3 aPosLo;
+layout(location = 2) in vec3 aColor;
+layout(location = 3) in float aLum;
+uniform mat4 uViewProj;
+uniform vec3 uCamRelHi; uniform vec3 uCamRelLo;
+uniform float uBrightScale; uniform float uGamma; uniform float uSizeScale;
+uniform float uMinSize; uniform float uMaxSize; uniform float uBlockFade;
+uniform vec3 uCamVel; uniform float uTau;
+out V2G { vec3 color; float bright; float size; vec4 clipPrev; } o;
+const float LY = 9.4607e15;
+void main() {
+    vec3 rel = (aPosHi - uCamRelHi) + (aPosLo - uCamRelLo);
+    gl_Position = uViewProj * vec4(rel, 1.0);
+    // The star sat at rel + camVel·tau one exposure ago (camera was that much behind); streak between.
+    o.clipPrev = uViewProj * vec4(rel + uCamVel * uTau, 1.0);
+    float distLy = max(length(rel) / LY, 1.0e-4);
+    float flux = aLum / (distLy * distLy);
+    float bright = uBrightScale * pow(flux, uGamma);
+    o.color = aColor;
+    o.bright = clamp(bright * uBlockFade, 0.0, 1.0);
+    o.size = clamp(uSizeScale * sqrt(bright), uMinSize, uMaxSize);
+}";
+
     private Shader? _catShader;
+    private Shader? _catStreakShader;
+    private bool _streakUnavailable;            // set if the streak program fails to compile/link (fallback: plain points)
     private double _now;                        // current time (s), for the per-block streaming fade-in
     private const double CatFadeInSeconds = 0.7; // how long a freshly-streamed block takes to ramp in
 
@@ -260,6 +290,13 @@ void main() {
     private void EnsureCatShader()
     {
         _catShader ??= new Shader(_gl, CatVertexSource, CatFragmentSource);
+        if (_catStreakShader == null && !_streakUnavailable)
+        {
+            // Compile the geometry-shader streak variant lazily and defensively: if the driver rejects
+            // it, disable streaks permanently rather than crash — plain points keep working.
+            try { _catStreakShader = new Shader(_gl, CatStreakVert, MotionStreak.GeometrySource, MotionStreak.FragmentSource); }
+            catch (Exception e) { _streakUnavailable = true; Console.Error.WriteLine($"[streaks] catalog streak shader unavailable: {e.Message}"); }
+        }
     }
 
     /// <summary>Bake one block's stars (position relative to its own origin + colour + luminosity)
@@ -315,7 +352,7 @@ void main() {
     /// frame. The active system's sun (by global id) is skipped in its own block: up close, single-
     /// precision relative-to-camera puts its dot visibly off from its precisely-rendered sphere, so the
     /// system pass owns it (that block is always near, so it's never culled or thinned).</summary>
-    public void RenderCatalog(Camera camera, ulong? excludeId = null)
+    public void RenderCatalog(Camera camera, int viewportW, int viewportH, ulong? excludeId = null)
     {
         if (_catShader == null || _catBlocks.Count == 0) return;
 
@@ -329,14 +366,26 @@ void main() {
         _gl.DepthMask(false);
         _gl.Disable(EnableCap.DepthTest);
 
-        _catShader.Use();
+        // Above the speed threshold, draw the same per-block point buffers through the streak program,
+        // which expands each star into a velocity-aligned capsule. Both programs share every uniform
+        // below (plus the streak program's own uCamVel/uTau/viewport), so the per-block loop is identical.
+        bool streak = _catStreakShader != null && MotionStreak.StreaksActive(camera.WorldVelocity);
+        Shader active = streak ? _catStreakShader! : _catShader;
+
+        active.Use();
         Matrix4X4<float> viewProj = camera.ViewMatrix * camera.ProjectionMatrix;
-        _catShader.SetMatrix("uViewProj", viewProj);
-        _catShader.SetFloat("uBrightScale", CatBrightScale);
-        _catShader.SetFloat("uGamma", CatGamma);
-        _catShader.SetFloat("uSizeScale", CatSizeScale);
-        _catShader.SetFloat("uMinSize", CatMinSize);
-        _catShader.SetFloat("uMaxSize", CatMaxSize);
+        active.SetMatrix("uViewProj", viewProj);
+        active.SetFloat("uBrightScale", CatBrightScale);
+        active.SetFloat("uGamma", CatGamma);
+        active.SetFloat("uSizeScale", CatSizeScale);
+        active.SetFloat("uMinSize", CatMinSize);
+        active.SetFloat("uMaxSize", CatMaxSize);
+        if (streak)
+        {
+            active.SetVector3("uCamVel", MotionStreak.VelocityF(camera.WorldVelocity));
+            active.SetFloat("uTau", MotionStreak.ExposureSeconds);
+            MotionStreak.SetGeomUniforms(active, viewportW, viewportH);
+        }
 
         BuildFrustum(viewProj);
         double ly = MathUtil.LightYear;
@@ -357,11 +406,11 @@ void main() {
 
             var camHi = new Vector3D<float>((float)dcam.X, (float)dcam.Y, (float)dcam.Z);
             var camLo = new Vector3D<float>((float)(dcam.X - camHi.X), (float)(dcam.Y - camHi.Y), (float)(dcam.Z - camHi.Z));
-            _catShader.SetVector3("uCamRelHi", camHi);
-            _catShader.SetVector3("uCamRelLo", camLo);
+            active.SetVector3("uCamRelHi", camHi);
+            active.SetVector3("uCamRelLo", camLo);
             // Temporal fade-in: ramp this block's stars up over CatFadeInSeconds after it streamed in.
             float t = (float)Math.Clamp((_now - b.UploadTime) / CatFadeInSeconds, 0.0, 1.0);
-            _catShader.SetFloat("uBlockFade", t * t * (3f - 2f * t)); // smoothstep
+            active.SetFloat("uBlockFade", t * t * (3f - 2f * t)); // smoothstep
 
             // Distance thinning: draw the front prefix of the block's stars.
             double distLy = dcam.Length / ly;
@@ -433,6 +482,7 @@ void main() {
         _shader.Dispose();
         _gl.DeleteBuffer(_vbo);
         _gl.DeleteVertexArray(_vao);
+        _catStreakShader?.Dispose();
         if (_catShader != null)
         {
             _catShader.Dispose();

@@ -98,7 +98,7 @@ public sealed class GalaxyRenderer : IDisposable
 
     private const double RefStarCount = 2.0e11;
     private const double RefDistLy = 1.0e6;
-    private const int FloatsPerPoint = 8; // dir(3) + color(3) + size(1) + brightness(1)
+    private const int FloatsPerPoint = 11; // dir(3) + color(3) + size(1) + brightness(1) + dirPrev(3)
 
     private const string PointVert = @"#version 410 core
 layout(location = 0) in vec3 aDir;
@@ -127,6 +127,27 @@ void main() {
     // single saturated pixel (which is what made it look like a sharp point), spreading the light out.
     float a = exp(-r2 * 1.7) * smoothstep(1.0, 0.0, r2);
     FragColor = vec4(vColor * (vBright * uBrightness), 1.0) * a;
+}";
+
+    // Streak variant of the galaxy point sprite. Galaxies are billboarded on a fixed-radius dome (a
+    // direction, not a parallaxing position), so their apparent motion is the change in DIRECTION as you
+    // fly — computed on the CPU (aDirPrev = the dome direction one exposure ago) and streaked between.
+    private const string PointStreakVert = @"#version 410 core
+layout(location = 0) in vec3 aDir;
+layout(location = 1) in vec3 aColor;
+layout(location = 2) in float aSize;
+layout(location = 3) in float aBright;
+layout(location = 4) in vec3 aDirPrev;
+uniform mat4 uViewProj;
+uniform float uRadius;
+uniform float uBrightness;
+out V2G { vec3 color; float bright; float size; vec4 clipPrev; } o;
+void main() {
+    gl_Position = uViewProj * vec4(aDir * uRadius, 1.0);
+    o.clipPrev = uViewProj * vec4(aDirPrev * uRadius, 1.0);
+    o.color = aColor;
+    o.bright = aBright * uBrightness;
+    o.size = aSize;
 }";
 
     private const string ImpostorVert = @"#version 410 core
@@ -278,6 +299,8 @@ void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend
 
     private readonly GL _gl;
     private readonly Shader _pointShader;
+    private Shader? _pointStreakShader;      // geometry-shader streak variant (lazy; null if unsupported)
+    private bool _streakUnavailable;
     private readonly Shader _impostorShader;
     private readonly Shader _cloudShader;
     private readonly Shader _glowShader;
@@ -345,6 +368,8 @@ void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend
         gl.EnableVertexAttribArray(2);
         gl.VertexAttribPointer(3, 1, VertexAttribPointerType.Float, false, stride, (void*)(7 * sizeof(float)));
         gl.EnableVertexAttribArray(3);
+        gl.VertexAttribPointer(4, 3, VertexAttribPointerType.Float, false, stride, (void*)(8 * sizeof(float)));
+        gl.EnableVertexAttribArray(4);
         gl.BindVertexArray(0);
 
         _impostorVao = gl.GenVertexArray(); // empty; vertices from gl_VertexID
@@ -368,6 +393,17 @@ void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend
             double d = galaxies.Containing.Center.DeltaMeters(camera.Position).Length;
             insideAmount = Smoothstep(1.0f, 0.55f, (float)(d / galaxies.Containing.RadiusMeters));
         }
+
+        // Motion streaks: expand each galaxy dome point into a capsule spanning its direction now → one
+        // exposure ago. Compile the streak program lazily/defensively the first time it's needed.
+        bool gStreak = MotionStreak.StreaksActive(camera.WorldVelocity);
+        if (gStreak && _pointStreakShader == null && !_streakUnavailable)
+        {
+            try { _pointStreakShader = new Shader(_gl, PointStreakVert, MotionStreak.GeometrySource, MotionStreak.FragmentSource); }
+            catch (Exception e) { _streakUnavailable = true; Console.Error.WriteLine($"[streaks] galaxy streak shader unavailable: {e.Message}"); }
+        }
+        gStreak = gStreak && _pointStreakShader != null;
+        Vector3D<double> camVelTau = camera.WorldVelocity * MotionStreak.ExposureSeconds;
 
         int n = 0;
         _impostors.Clear();
@@ -421,6 +457,13 @@ void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend
                     _data[o + 0] = dir.X; _data[o + 1] = dir.Y; _data[o + 2] = dir.Z;
                     _data[o + 3] = g.Color.X; _data[o + 4] = g.Color.Y; _data[o + 5] = g.Color.Z;
                     _data[o + 6] = size; _data[o + 7] = bright;
+                    // Dome direction one exposure ago (rel + camVel·tau, normalised). Equals dir when not
+                    // streaking, so the geometry stage collapses to a plain round dot.
+                    Vector3D<double> relPrev = gStreak ? rel + camVelTau : rel;
+                    double lp = relPrev.Length; if (lp < 1.0) lp = 1.0;
+                    _data[o + 8] = (float)(relPrev.X / lp);
+                    _data[o + 9] = (float)(relPrev.Y / lp);
+                    _data[o + 10] = (float)(relPrev.Z / lp);
                     n++;
                 }
 
@@ -461,10 +504,12 @@ void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend
             _gl.BindBuffer(BufferTargetARB.ArrayBuffer, _pointVbo);
             _gl.BufferData<float>(BufferTargetARB.ArrayBuffer,
                 new ReadOnlySpan<float>(_data, 0, n * FloatsPerPoint), BufferUsageARB.StreamDraw);
-            _pointShader.Use();
-            _pointShader.SetMatrix("uViewProj", vp);
-            _pointShader.SetFloat("uRadius", PointDomeRadius);
-            _pointShader.SetFloat("uBrightness", Brightness);
+            Shader ap = gStreak ? _pointStreakShader! : _pointShader;
+            ap.Use();
+            ap.SetMatrix("uViewProj", vp);
+            ap.SetFloat("uRadius", PointDomeRadius);
+            ap.SetFloat("uBrightness", Brightness);
+            if (gStreak) MotionStreak.SetGeomUniforms(ap, sceneW, sceneH);
             _gl.DrawArrays(PrimitiveType.Points, 0, (uint)n);
             LastDrawn = n;
         }
@@ -708,6 +753,7 @@ void main() { FragColor = vec4(texture(uTex, vUv).rgb, 1.0); } // additive blend
     public void Dispose()
     {
         _pointShader.Dispose();
+        _pointStreakShader?.Dispose();
         _impostorShader.Dispose();
         _cloudShader.Dispose();
         _glowShader.Dispose();

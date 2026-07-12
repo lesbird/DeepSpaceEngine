@@ -12,13 +12,20 @@ public sealed class Shader : IDisposable
     public uint Handle { get; }
 
     public Shader(GL gl, string vertexSource, string fragmentSource)
+        : this(gl, vertexSource, null, fragmentSource) { }
+
+    /// <summary>Build a program with an optional geometry stage (pass null to skip it). The geometry
+    /// stage is used by the motion-streak effect to expand each point sprite into an elongated quad.</summary>
+    public Shader(GL gl, string vertexSource, string? geometrySource, string fragmentSource)
     {
         _gl = gl;
         uint vs = Compile(ShaderType.VertexShader, vertexSource);
+        uint gs = geometrySource != null ? Compile(ShaderType.GeometryShader, geometrySource) : 0;
         uint fs = Compile(ShaderType.FragmentShader, fragmentSource);
 
         Handle = _gl.CreateProgram();
         _gl.AttachShader(Handle, vs);
+        if (gs != 0) _gl.AttachShader(Handle, gs);
         _gl.AttachShader(Handle, fs);
         _gl.LinkProgram(Handle);
         _gl.GetProgram(Handle, ProgramPropertyARB.LinkStatus, out int status);
@@ -26,8 +33,10 @@ public sealed class Shader : IDisposable
             throw new Exception($"Program link failed: {_gl.GetProgramInfoLog(Handle)}");
 
         _gl.DetachShader(Handle, vs);
+        if (gs != 0) _gl.DetachShader(Handle, gs);
         _gl.DetachShader(Handle, fs);
         _gl.DeleteShader(vs);
+        if (gs != 0) _gl.DeleteShader(gs);
         _gl.DeleteShader(fs);
     }
 
