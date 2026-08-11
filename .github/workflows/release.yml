@@ -1,0 +1,78 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+# This builds self-contained bundles for each platform and attaches the
+# zips to a GitHub Release. No .NET install required on the user's machine.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: # lets you trigger a build manually from the Actions tab
+
+permissions:
+  contents: write # required to create the Release and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            label: windows-x64
+          - rid: osx-arm64
+            label: macos-arm64
+          - rid: linux-x64
+            label: linux-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish ${{ matrix.rid }}
+        run: |
+          dotnet publish Game.App/Game.App.csproj \
+            -c Release \
+            -r ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:DebugType=none \
+            -p:DebugSymbols=false \
+            -o dist/DeepSpaceEngine
+
+      - name: Stage docs
+        run: cp README.md LICENSE.txt dist/DeepSpaceEngine/ || true
+
+      - name: Zip
+        run: |
+          cd dist
+          zip -r ../DeepSpaceEngine-${{ matrix.label }}.zip DeepSpaceEngine
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSpaceEngine-${{ matrix.label }}
+          path: DeepSpaceEngine-${{ matrix.label }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          generate_release_notes: true
