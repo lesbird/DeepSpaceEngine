@@ -171,6 +171,11 @@ dotnet test                        # run the coordinate/hashing test suite
 dotnet run --project Game.App      # launch the engine
 ```
 
+**Prebuilt releases.** Each [GitHub Release](../../releases) has self-contained zips for Windows x64,
+macOS arm64 and Linux x64 (no .NET install needed). Unzip it and run `DeepSpaceEngine`. The macOS build
+isn't notarized, so if Gatekeeper blocks a browser-downloaded copy, clear the quarantine flag once:
+`xattr -dr com.apple.quarantine DeepSpaceEngine`
+
 ## Controls
 
 | Input | Action |
