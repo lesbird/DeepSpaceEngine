@@ -66,7 +66,7 @@ server/            PHP + MySQL discovery API + HTML log         (standalone)
 ```
 
 Dependency arrows point downward only — generation never references rendering.
-Targets `net7.0`, **Silk.NET 2.23.0**, **OpenGL 4.1 core** (the macOS-safe
+Targets `net8.0`, **Silk.NET 2.23.0**, **OpenGL 4.1 core** (the macOS-safe
 baseline; terrain is baked via fragment passes, no compute shaders).
 
 ---

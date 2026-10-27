@@ -14,8 +14,7 @@ is organized around solving that, plus rendering/streaming billions of procedura
 objects without storing them.
 
 **Decisions locked in with the user:**
-- Language/runtime: **C# on .NET** — currently targets **net7.0** (the plan called for net8 LTS;
-  it's a one-line `<TargetFramework>` change in `Directory.Build.props` once that SDK is installed)
+- Language/runtime: **C# on .NET** — targets **net8.0** (LTS), set once as `<TargetFramework>` in `Directory.Build.props`
 - GL bindings: **Silk.NET 2.23.0** (GL + GLFW windowing + input + Silk.NET.Maths)
 - Target: **cross-platform, OpenGL 4.1 baseline** (runs on the user's Mac; no compute shaders).
   Procedural generation runs CPU-side with `Parallel.For` + a background worker pool **and**, for

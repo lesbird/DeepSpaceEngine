@@ -115,8 +115,7 @@ interstellar flight down to standing on a planet. See the full design in
 
 ## Tech stack
 
-- **.NET 7** (targets `net7.0`; the plan calls for net8 LTS — a one-line change in
-  `Directory.Build.props` once that SDK is installed)
+- **.NET 8 LTS** (targets `net8.0`, set once in `Directory.Build.props`)
 - **Silk.NET 2.23.0** — OpenGL, windowing (GLFW), input, and `Vector3D<double>` math
 - **OpenGL 4.1 core** — the cross-platform baseline that also runs on macOS (no compute
   shaders; terrain is generated GPU-side by default via fragment-shader passes baked into texture
@@ -155,15 +154,15 @@ same sub-mm precision — which is what lets the galaxy hierarchy share one coor
 
 ## Build & run
 
-**Prerequisites — the [.NET 7 SDK](https://dotnet.microsoft.com/download/dotnet/7.0).** If you downloaded
+**Prerequisites — the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).** If you downloaded
 this repo as a ZIP and `dotnet build` / `dotnet run` does nothing — or you see `dotnet: command not found` —
 you just need the SDK. Download it free from Microsoft's official page and pick the **SDK** installer for your
 platform:
 
-- **[.NET 7.0 downloads (all platforms)](https://dotnet.microsoft.com/download/dotnet/7.0)** — e.g. macOS
+- **[.NET 8.0 downloads (all platforms)](https://dotnet.microsoft.com/download/dotnet/8.0)** — e.g. macOS
   Arm64 (`.pkg`), Windows x64 (`.exe`), or Linux.
 
-Confirm it's installed with `dotnet --version` (should print `7.x`), then:
+Confirm it's installed with `dotnet --version` (should print `8.x`), then:
 
 ```sh
 dotnet build                       # build everything
